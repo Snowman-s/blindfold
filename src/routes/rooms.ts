@@ -126,7 +126,7 @@ routes.openapi(
       404: errors[404],
     },
   }),
-  async (c) => withRules(c, c.req.valid("param").id, (r) => c.json(r, 200)) as never,
+  async (c) => withRules(c, c.req.valid("param").id, (r) => c.json(r, 200)),
 );
 
 routes.openapi(
@@ -146,7 +146,7 @@ routes.openapi(
   async (c) =>
     withRules(c, c.req.valid("param").id, (r) =>
       c.body(rulesMarkdown(r), 200, { "Content-Type": "text/markdown; charset=utf-8" }),
-    ) as never,
+    ),
 );
 
 routes.openapi(

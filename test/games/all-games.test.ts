@@ -3,6 +3,7 @@ import { games } from "../../src/games/registry";
 import { highcard, ROUNDS } from "../../src/games/highcard";
 import { GameError } from "../../src/games/types";
 import { createRng, rngForTurn } from "../../src/lib/rng";
+import { gameRules, rulesMarkdown } from "../../src/lib/rules";
 import { applyTimeout, replay, type LogEntry } from "../../src/lib/replay";
 
 const PLAYERS = ["p1", "p2"];
@@ -49,6 +50,17 @@ describe.each(Object.keys(games))("%s", (gameId) => {
       expect(r.state).toEqual(state);
       expect(r.result).toEqual(game.result(state));
     }
+  });
+
+  it("説明（docs）が揃っていて、行動の例は actionSchema を満たす", async () => {
+    expect(game.docs.summary.length).toBeGreaterThan(0);
+    expect(game.docs.rules.length).toBeGreaterThan(0);
+    expect(game.docs.view.length).toBeGreaterThan(0);
+    expect(game.docs.examples.length).toBeGreaterThan(0);
+    for (const e of game.docs.examples) expect(game.actionSchema.safeParse(e.action).success).toBe(true);
+    const r = await gameRules(game);
+    expect(r.actionSchema).toHaveProperty("type", "object");
+    expect(rulesMarkdown(r)).toContain(game.docs.rules);
   });
 
   it("状態は JSON 往復で変わらず、apply は入力を変更しない", () => {

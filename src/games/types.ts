@@ -18,12 +18,25 @@ export interface GameResult {
   scores?: Record<string, number>;
 }
 
+/** ゲームの説明。Bot 上の LLM がプロンプトに入れて読むことを想定する（GET /games/:id/rules）。 */
+export interface GameDocs {
+  /** 1〜2文の概要。/games の一覧に出す。 */
+  summary: string;
+  /** Markdown。目的・手番・勝敗の決まり方・時間切れの扱い。 */
+  rules: string;
+  /** Markdown。view の各フィールドの意味と、視点（プレイヤー／観戦者）による違い。 */
+  view: string;
+  /** 行動の例。actionSchema を満たすこと（テストで検証する）。 */
+  examples: { action: unknown; meaning: string }[];
+}
+
 /** すべてのゲームが実装する。副作用なしの純粋関数にすること。 */
 export interface GameDefinition<S, A> {
   id: string;
   minPlayers: number;
   maxPlayers: number;
   actionSchema: z.ZodType<A>;
+  docs: GameDocs;
   /** seed は文字列（サーバーは 128 ビットの乱数を発行する）。乱数は createRng(seed) で作る。 */
   init(players: string[], seed: Seed): S;
   currentPlayers(s: S): string[];

@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { GameError, type GameDefinition } from "../types";
+import { docs } from "./docs";
 
 type Mark = "X" | "O";
 type Cell = Mark | null;
@@ -35,6 +36,7 @@ export const tictactoe: GameDefinition<TicTacToeState, TicTacToeAction> = {
   minPlayers: 2,
   maxPlayers: 2,
   actionSchema,
+  docs,
 
   init(players) {
     if (players.length !== 2 || players[0] === players[1]) {

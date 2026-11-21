@@ -30,9 +30,40 @@ describe("REST: ルーム", () => {
     const r = await call("GET", "/games");
     expect(r.status).toBe(200);
     expect(r.json).toEqual([
-      { id: "tictactoe", minPlayers: 2, maxPlayers: 2 },
-      { id: "highcard", minPlayers: 2, maxPlayers: 2 },
+      expect.objectContaining({ id: "tictactoe", minPlayers: 2, maxPlayers: 2, rulesUrl: "/games/tictactoe/rules" }),
+      expect.objectContaining({ id: "highcard", minPlayers: 2, maxPlayers: 2, rulesUrl: "/games/highcard/rules" }),
     ]);
+    for (const g of r.json) expect(g.summary.length).toBeGreaterThan(0);
+  });
+
+  it("GET /games/:id/rules は説明と action の JSON Schema を返し、ETag で 304 になる", async () => {
+    const r = await call("GET", "/games/tictactoe/rules");
+    expect(r.status).toBe(200);
+    expect(r.json.id).toBe("tictactoe");
+    expect(r.json.version).toMatch(/^[0-9a-f]{12}$/);
+    expect(r.json.rules).toContain("cell");
+    expect(r.json.common).toContain("legal");
+    expect(r.json.actionSchema).toMatchObject({ type: "object", properties: { cell: { type: "integer" } } });
+    const res = await SELF.fetch(BASE + "/games/tictactoe/rules");
+    const etag = res.headers.get("ETag");
+    expect(etag).toBe(`"${r.json.version}"`);
+    expect(res.headers.get("Cache-Control")).toContain("max-age");
+
+    const again = await SELF.fetch(BASE + "/games/tictactoe/rules", { headers: { "If-None-Match": etag! } });
+    expect(again.status).toBe(304);
+
+    expect((await call("GET", "/games/nope/rules")).status).toBe(404);
+    expect((await SELF.fetch(BASE + "/games/nope/rules.md")).status).toBe(404);
+  });
+
+  it("GET /games/:id/rules.md はプロンプトに貼れる Markdown を返す", async () => {
+    const res = await SELF.fetch(BASE + "/games/highcard/rules.md");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Type")).toContain("text/markdown");
+    const md = await res.text();
+    expect(md).toMatch(/^# highcard/);
+    for (const h of ["## Rules", "## Reading `view`", "## Action format", "## How to play"]) expect(md).toContain(h);
+    expect(md).toContain('"card"');
   });
 
   it("未知のゲーム・不正なボディは 400", async () => {

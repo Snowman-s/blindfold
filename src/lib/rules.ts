@@ -1,0 +1,90 @@
+import { z } from "zod";
+import type { AnyGame } from "../games/registry";
+
+/**
+ * ゲームの説明（GET /games/:id/rules）を組み立てる。Bot 上の LLM がプロンプトに入れて読むことを想定する。
+ * 全ゲームに共通の遊び方（ターン・合法手・エラー）は COMMON に書き、各ゲームの docs には書かない。
+ */
+
+// LLM 向けの文面は英語で書く（Bot 側で必要なら翻訳される）。
+const COMMON = [
+  "## How to play (all games)",
+  "- State arrives as a WebSocket `state` message (or from `GET /rooms/{id}/state`). `view` is the board as you see it; `currentPlayers` lists who may act now.",
+  "- **Legal moves are listed in `legal`. Pick one and send it unchanged as `action`; it is always accepted.** `legal` is present only when you may act now.",
+  '- To act, send `{ "type": "action", "turn": <turn from the latest state>, "action": <one of legal> }` (REST: `POST /rooms/{id}/action` with `{ turn, action }`).',
+  "- If `turn` does not match the current turn, the action is rejected with `STALE_TURN`. Wait for the next `state` and retry.",
+  "- Each turn has a `deadline` (epoch ms). Missing it is a timeout.",
+  "- Error codes: `ILLEGAL_ACTION` (illegal move), `NOT_YOUR_TURN` (you may not act now), `STALE_TURN` (outdated turn), `BAD_REQUEST` (malformed message).",
+  "- When the game ends you receive an `end` message with `winners` (empty for a draw) and `scores`.",
+].join("\n");
+
+export interface GameRules {
+  id: string;
+  version: string;
+  minPlayers: number;
+  maxPlayers: number;
+  summary: string;
+  rules: string;
+  view: string;
+  actionSchema: unknown;
+  examples: { action: unknown; meaning: string }[];
+  common: string;
+}
+
+async function shortHash(text: string): Promise<string> {
+  const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(d).slice(0, 6), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+const cache = new Map<string, Promise<GameRules>>();
+
+/** 説明は静的なので、ゲームごとに1回だけ組み立てて使い回す。version は内容のハッシュ。 */
+export function gameRules(game: AnyGame): Promise<GameRules> {
+  let p = cache.get(game.id);
+  if (!p) {
+    p = (async () => {
+      const body = {
+        id: game.id,
+        minPlayers: game.minPlayers,
+        maxPlayers: game.maxPlayers,
+        summary: game.docs.summary,
+        rules: game.docs.rules,
+        view: game.docs.view,
+        actionSchema: z.toJSONSchema(game.actionSchema),
+        examples: game.docs.examples,
+        common: COMMON,
+      };
+      return { ...body, version: await shortHash(JSON.stringify(body)) };
+    })();
+    cache.set(game.id, p);
+  }
+  return p;
+}
+
+/** プロンプトにそのまま貼れる Markdown 1枚。 */
+export function rulesMarkdown(r: GameRules): string {
+  const examples = r.examples.map((e) => `- \`${JSON.stringify(e.action)}\` : ${e.meaning}`).join("\n");
+  return [
+    `# ${r.id} (${r.minPlayers === r.maxPlayers ? r.minPlayers : `${r.minPlayers}-${r.maxPlayers}`} players, version ${r.version})`,
+    "",
+    r.summary,
+    "",
+    "## Rules",
+    r.rules,
+    "",
+    "## Reading `view`",
+    r.view,
+    "",
+    "## Action format",
+    "`action` is an object matching this JSON Schema:",
+    "```json",
+    JSON.stringify(r.actionSchema, null, 2),
+    "```",
+    "",
+    "Examples:",
+    examples,
+    "",
+    r.common,
+    "",
+  ].join("\n");
+}

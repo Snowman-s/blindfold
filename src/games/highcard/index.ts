@@ -1,14 +1,16 @@
 import { z } from "zod";
 import { GameError, type GameDefinition } from "../types";
 import { createRng } from "../../lib/rng";
+import { DECK_SIZE, ROUNDS } from "./constants";
+import { docs } from "./docs";
 
 /**
  * ハイカード: 隠し情報（手札・伏せた札）と同時手番を持つ2人用カードゲーム。
  * 1〜13 の札から各自5枚配られ、毎ラウンド両者が1枚ずつ同時に伏せて出す。
  * 大きい札が1勝。5ラウンド終了時に勝ち数が多い方が勝ち。
+ * ルールの説明（LLM 向け・英語）は docs.ts。
  */
-export const ROUNDS = 5;
-export const DECK_SIZE = 13;
+export { DECK_SIZE, ROUNDS };
 
 export interface HighCardState {
   players: [string, string];
@@ -29,6 +31,7 @@ export const highcard: GameDefinition<HighCardState, HighCardAction> = {
   minPlayers: 2,
   maxPlayers: 2,
   actionSchema,
+  docs,
 
   init(players, seed) {
     if (players.length !== 2 || players[0] === players[1]) {

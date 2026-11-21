@@ -634,7 +634,7 @@ describe("OpenAPI", () => {
     expect(r.json.openapi).toBe("3.1.0");
     const paths = Object.keys(r.json.paths);
     for (const p of [
-      "/games", "/rooms", "/rooms/{id}/join", "/rooms/{id}/start", "/rooms/{id}/state", "/rooms/{id}/action",
+      "/games", "/games/{id}/rules", "/games/{id}/rules.md", "/rooms", "/rooms/{id}/join", "/rooms/{id}/start", "/rooms/{id}/state", "/rooms/{id}/action",
       "/rooms/{id}/log", "/rooms/{id}/replay", "/rooms/{id}/ws", "/users", "/matches",
     ]) {
       expect(paths).toContain(p);

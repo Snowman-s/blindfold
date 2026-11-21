@@ -4,6 +4,7 @@ import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { games, getGame } from "../games/registry";
 import { extractToken, newRoomId, sha256Hex, WS_PROTOCOL, WS_TOKEN_PROTOCOL_PREFIX } from "../lib/auth";
 import { roomOptions } from "../lib/options";
+import { gameRules, rulesMarkdown } from "../lib/rules";
 import type { RoomResult } from "../room/GameRoom";
 import { bearerSecurity, errBody, errors, ResultSchema, RoomIdParam, RoomStateSchema } from "./schemas";
 
@@ -46,7 +47,13 @@ function respond<T>(c: Context<AppEnv>, r: RoomResult<T>, okStatus: ContentfulSt
 const room = (c: Context<AppEnv>) => c.env.GAME_ROOM.getByName(c.req.param("id") ?? "");
 
 const GameInfo = z
-  .object({ id: z.string(), minPlayers: z.number().int(), maxPlayers: z.number().int() })
+  .object({
+    id: z.string(),
+    minPlayers: z.number().int(),
+    maxPlayers: z.number().int(),
+    summary: z.string(),
+    rulesUrl: z.string().describe("ルールの詳細（JSON）。Markdown は末尾に .md を付ける"),
+  })
   .openapi("GameInfo");
 
 routes.openapi(
@@ -58,7 +65,93 @@ routes.openapi(
     summary: "利用できるゲームの一覧",
     responses: { 200: { description: "ゲーム一覧", content: { "application/json": { schema: z.array(GameInfo) } } } },
   }),
-  (c) => c.json(Object.values(games).map((g) => ({ id: g.id, minPlayers: g.minPlayers, maxPlayers: g.maxPlayers })), 200),
+  (c) =>
+    c.json(
+      Object.values(games).map((g) => ({
+        id: g.id,
+        minPlayers: g.minPlayers,
+        maxPlayers: g.maxPlayers,
+        summary: g.docs.summary,
+        rulesUrl: `/games/${g.id}/rules`,
+      })),
+      200,
+    ),
+);
+
+const GameIdParam = z.object({
+  id: z.string().openapi({ param: { name: "id", in: "path" }, example: "tictactoe" }),
+});
+
+const GameRulesSchema = z
+  .object({
+    id: z.string(),
+    version: z.string().describe("説明の内容のハッシュ。キャッシュした説明が古いか判定できる"),
+    minPlayers: z.number().int(),
+    maxPlayers: z.number().int(),
+    summary: z.string(),
+    rules: z.string().describe("Markdown。目的・手番・勝敗・時間切れ"),
+    view: z.string().describe("Markdown。view の各フィールドの意味"),
+    actionSchema: z.unknown().describe("action の JSON Schema"),
+    examples: z.array(z.object({ action: z.unknown(), meaning: z.string() })),
+    common: z.string().describe("Markdown。全ゲーム共通の遊び方（turn・legal・エラー）"),
+  })
+  .openapi("GameRules");
+
+/** 説明は静的なので長めにキャッシュさせる。version を ETag にして、変わっていなければ 304 を返す。 */
+function rulesCacheHeaders(c: Context<AppEnv>, version: string): boolean {
+  const etag = `"${version}"`;
+  c.header("ETag", etag);
+  c.header("Cache-Control", "public, max-age=3600");
+  return c.req.header("If-None-Match") === etag;
+}
+
+routes.openapi(
+  createRoute({
+    method: "get",
+    path: "/games/{id}/rules",
+    tags: ["games"],
+    operationId: "getGameRules",
+    summary: "ゲームの説明（LLM 向け）",
+    description:
+      "ルール・view の読み方・行動の JSON Schema・全ゲーム共通の遊び方を返す。Bot 上の LLM のプロンプトに入れることを想定。" +
+      "プロンプトにそのまま貼れる Markdown 版は `/games/{id}/rules.md`。",
+    request: { params: GameIdParam },
+    responses: {
+      200: { description: "ゲームの説明", content: { "application/json": { schema: GameRulesSchema } } },
+      304: { description: "If-None-Match の version から変わっていない" },
+      404: errors[404],
+    },
+  }),
+  async (c) => {
+    const game = getGame(c.req.valid("param").id);
+    if (!game) return c.json(errBody("NOT_FOUND", "unknown game"), 404);
+    const r = await gameRules(game);
+    if (rulesCacheHeaders(c, r.version)) return c.body(null, 304);
+    return c.json(r, 200);
+  },
+);
+
+routes.openapi(
+  createRoute({
+    method: "get",
+    path: "/games/{id}/rules.md",
+    tags: ["games"],
+    operationId: "getGameRulesMarkdown",
+    summary: "ゲームの説明（Markdown 1枚）",
+    request: { params: GameIdParam },
+    responses: {
+      200: { description: "Markdown", content: { "text/markdown": { schema: z.string() } } },
+      304: { description: "If-None-Match の version から変わっていない" },
+      404: errors[404],
+    },
+  }),
+  async (c) => {
+    const game = getGame(c.req.valid("param").id);
+    if (!game) return c.json(errBody("NOT_FOUND", "unknown game"), 404);
+    const r = await gameRules(game);
+    if (rulesCacheHeaders(c, r.version)) return c.body(null, 304);
+    return c.body(rulesMarkdown(r), 200, { "Content-Type": "text/markdown; charset=utf-8" });
+  },
 );
 
 routes.openapi(

@@ -51,7 +51,7 @@ src/
   games/
     types.ts          # GameDefinition インターフェース
     registry.ts       # gameId -> GameDefinition
-    tictactoe/        # 最初のサンプルゲーム
+    tictactoe/        # 最初のサンプルゲーム（index.ts = GameDefinition、docs.ts = LLM 向けの説明）
     highcard/         # 隠し情報 + 同時手番のカードゲーム
   lib/
     rng.ts            # シード付き疑似乱数（文字列シード → cyrb128 → sfc32。状態 128 ビット）
@@ -59,6 +59,7 @@ src/
     protocol.ts       # WS メッセージの zod スキーマ
     replay.ts         # 行動ログからの再現・時間切れ解決（純粋関数）
     options.ts        # ルームオプション（turnTimeMs）
+    rules.ts          # ゲームの説明（/games/:id/rules）の組み立て
 bots/
   random-bot.ts       # 合法手からランダムに選ぶ Bot（Node で実行）
   bot-core.ts         # WS ループ（CLI とテストで共有）
@@ -77,6 +78,7 @@ export interface GameDefinition<S, A> {
   minPlayers: number;
   maxPlayers: number;
   actionSchema: z.ZodType<A>;                  // 受信した行動の検証用
+  docs: GameDocs;                              // { summary, rules, view, examples }。Bot 上の LLM が読む説明
   init(players: string[], seed: Seed): S;     // Seed = string（サーバーは 128 ビットの乱数を 16 進 32 文字で発行）
   currentPlayers(s: S): string[];              // 今行動できるプレイヤー（同時手番も可）
   legalActions(s: S, pid: string): A[];        // Bot 向けに API で返す
@@ -97,7 +99,9 @@ export interface GameDefinition<S, A> {
 
 | メソッド | パス | 内容 |
 |---|---|---|
-| GET | `/games` | 利用できるゲームの一覧 |
+| GET | `/games` | 利用できるゲームの一覧（`summary`、`rulesUrl` 付き） |
+| GET | `/games/:id/rules` | ゲームの説明（LLM 向け）。ルール・view の読み方・action の JSON Schema・共通の遊び方。`version` を ETag にする |
+| GET | `/games/:id/rules.md` | 同じ内容を Markdown 1枚で。プロンプトにそのまま貼れる |
 | POST | `/rooms` | `{ game: string, options?: {...} }` → `{ roomId, hostToken }`。未知のオプションは 400 |
 | POST | `/rooms/:id/join` | → `{ playerId, token }` |
 | POST | `/rooms/:id/start` | 試合開始（作成者のみ。`hostToken` を Bearer で渡す） |
@@ -190,5 +194,6 @@ pnpm tsx bots/random-bot.ts --url http://localhost:8787 --room <roomId> [--host-
 - TypeScript strict。`any` は使わない（外部入力は zod で `unknown` から検証する）。
 - ゲームロジック（`src/games/`）は Cloudflare の API に依存させない。Node 単体でテストできる状態に保つ。
 - エラーは `GameError(code, message)` で投げ、ルーム側で `error` メッセージに変換する。
-- 新しいゲームを追加するときは、次の3つを必ず用意する：(1) `GameDefinition` の実装、(2) `registry.ts` への登録、(3) ランダム Bot で 100 試合が例外なく終わるテスト。
+- 新しいゲームを追加するときは、次の3つを必ず用意する：(1) `GameDefinition` の実装（`docs` を含む）、(2) `registry.ts` への登録、(3) ランダム Bot で 100 試合が例外なく終わるテスト。
+- `docs` はゲームのディレクトリの `docs.ts` に置き、**英語**で書く（LLM が読む前提。翻訳は Bot 側に任せる）。特に `view` の各フィールドの意味と、視点による違いを省略しない。全ゲーム共通の遊び方（turn・legal・エラー）は `src/lib/rules.ts` の `COMMON` にあるので、各ゲームには書かない。
 - 秘密情報（トークンの署名鍵など）は `wrangler secret` で管理し、コミットしない。ローカルでは `.dev.vars` を使う（gitignore 済みにする）。

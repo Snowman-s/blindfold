@@ -66,11 +66,16 @@ class Conn implements SocketLike {
   }
 }
 
+/** ブラウザと同じく、トークンはサブプロトコルで渡す。 */
+const wsHeaders = (token?: string): Record<string, string> => ({
+  Upgrade: "websocket",
+  ...(token ? { "Sec-WebSocket-Protocol": `apigames, apigames.token.${token}` } : {}),
+});
+
 async function connect(roomId: string, token?: string): Promise<Conn> {
-  const res = await SELF.fetch(`${BASE}/rooms/${roomId}/ws${token ? `?token=${token}` : ""}`, {
-    headers: { Upgrade: "websocket" },
-  });
+  const res = await SELF.fetch(`${BASE}/rooms/${roomId}/ws`, { headers: wsHeaders(token) });
   expect(res.status).toBe(101);
+  if (token) expect(res.headers.get("Sec-WebSocket-Protocol")).toBe("apigames"); // トークンは応答に載せない
   const ws = res.webSocket!;
   ws.accept(); // クライアント側の accept（DO 側は Hibernation API）
   open.push(ws);
@@ -92,7 +97,7 @@ describe("WebSocket", () => {
   it("アップグレード要求がなければ 426、不正トークンは 401、存在しないルームは 404", async () => {
     const { roomId } = await newRoom("tictactoe");
     expect((await call("GET", `/rooms/${roomId}/ws`)).status).toBe(426);
-    const bad = await SELF.fetch(`${BASE}/rooms/${roomId}/ws?token=nope`, { headers: { Upgrade: "websocket" } });
+    const bad = await SELF.fetch(`${BASE}/rooms/${roomId}/ws`, { headers: wsHeaders("nope") });
     expect(bad.status).toBe(401);
     const none = await SELF.fetch(`${BASE}/rooms/zzz/ws`, { headers: { Upgrade: "websocket" } });
     expect(none.status).toBe(404);
@@ -344,6 +349,60 @@ describe("持ち時間（Alarm）", () => {
     expect(s2.deadline).toBeGreaterThan(d0);
   });
 
+  /** 締め切りだけ過去にずらす（alarm は発火させない = 発火が遅れている状況）。 */
+  async function pastDeadline(roomId: string) {
+    await runInDurableObject(stub(roomId), (_i, state) => {
+      state.storage.sql.exec("UPDATE meta SET value = ? WHERE key = 'deadline'", String(Date.now() - 1));
+    });
+  }
+
+  it("締め切り後に届いた REST の行動は拒否され、その場で時間切れが確定する", async () => {
+    const { roomId, host, a } = await newRoom("tictactoe");
+    await call("POST", `/rooms/${roomId}/start`, { token: host });
+    await pastDeadline(roomId); // p1 の手番で締め切りを過ぎた
+    const r = await call("POST", `/rooms/${roomId}/action`, { token: a.token, body: { turn: 0, action: { cell: 0 } } });
+    expect(r.status).toBe(409);
+    expect(r.json.error.code).toBe("STALE_TURN");
+
+    const state = (await call("GET", `/rooms/${roomId}/state`)).json;
+    expect(state).toMatchObject({ status: "finished", turn: 1, deadline: null });
+    expect(state.result.winners).toEqual(["p2"]); // 遅れた p1 の手は盤面に入らず、p1 の負け
+    expect(state.view.board.every((c: unknown) => c === null)).toBe(true);
+    const log = (await call("GET", `/rooms/${roomId}/log`)).json;
+    expect(log.actions).toEqual([expect.objectContaining({ turn: 0, player: null, timeout: ["p1"] })]);
+
+    // 後から古い alarm が発火しても二重に処理されない
+    await runDurableObjectAlarm(stub(roomId));
+    expect((await call("GET", `/rooms/${roomId}/log`)).json.actions).toHaveLength(1);
+  });
+
+  it("締め切り後に届いた WS の行動は STALE_TURN になり、全員に end が届く", async () => {
+    const { roomId, host, a, b } = await newRoom("tictactoe");
+    const wa = await connect(roomId, a.token);
+    const wb = await connect(roomId, b.token);
+    await call("POST", `/rooms/${roomId}/start`, { token: host });
+    await wa.next((m) => m.status === "playing");
+    await pastDeadline(roomId);
+    wa.send(JSON.stringify({ type: "action", turn: 0, action: { cell: 4 } }));
+    expect((await wa.next((m) => m.type === "error")).code).toBe("STALE_TURN");
+    expect((await wa.next((m) => m.type === "end")).winners).toEqual(["p2"]);
+    expect((await wb.next((m) => m.type === "end")).winners).toEqual(["p2"]);
+  });
+
+  it("同時手番でも締め切り後の手は受け付けず、出していなかったプレイヤーが負ける", async () => {
+    const { roomId, host, a, b } = await newRoom("highcard");
+    await call("POST", `/rooms/${roomId}/start`, { token: host });
+    const sa = (await call("GET", `/rooms/${roomId}/state`, { token: a.token })).json;
+    await call("POST", `/rooms/${roomId}/action`, { token: a.token, body: { turn: 0, action: sa.legal[0] } });
+    await pastDeadline(roomId);
+    const sb = (await call("GET", `/rooms/${roomId}/state`, { token: b.token })).json;
+    const r = await call("POST", `/rooms/${roomId}/action`, { token: b.token, body: { turn: 1, action: sb.legal[0] } });
+    expect(r.json.error.code).toBe("STALE_TURN");
+    const state = (await call("GET", `/rooms/${roomId}/state`)).json;
+    expect(state.status).toBe("finished");
+    expect(state.result.winners).toEqual(["p1"]);
+  });
+
   /** DO インスタンスの ctx.storage.setAlarm を、最初の n 回だけ失敗させる。 */
   async function failSetAlarm(roomId: string, n: number) {
     await runInDurableObject(stub(roomId), (i) => {
@@ -445,13 +504,36 @@ describe("ルームの存在確認・入力の制限", () => {
     expect(r.status).toBe(400);
   });
 
-  it("WS も REST と同じく Bearer を ?token= より優先する", async () => {
-    const { roomId, host, a, b } = await newRoom("tictactoe");
+  it("WS のトークンは URL に載せられない（?token= は 400）", async () => {
+    const { roomId, a } = await newRoom("tictactoe");
+    const res = await SELF.fetch(`${BASE}/rooms/${roomId}/ws?token=${a.token}`, { headers: { Upgrade: "websocket" } });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as any).error.code).toBe("BAD_REQUEST");
+  });
+
+  it("サブプロトコルに apigames が無い・トークンが複数あるなら 400", async () => {
+    const { roomId, a, b } = await newRoom("tictactoe");
+    const only = await SELF.fetch(`${BASE}/rooms/${roomId}/ws`, {
+      headers: { Upgrade: "websocket", "Sec-WebSocket-Protocol": `apigames.token.${a.token}` },
+    });
+    expect(only.status).toBe(400);
+    const two = await SELF.fetch(`${BASE}/rooms/${roomId}/ws`, {
+      headers: {
+        Upgrade: "websocket",
+        "Sec-WebSocket-Protocol": `apigames, apigames.token.${a.token}, apigames.token.${b.token}`,
+      },
+    });
+    expect(two.status).toBe(400);
+  });
+
+  it("ヘッダーを付けられるクライアントは Authorization: Bearer でも WS に接続できる", async () => {
+    const { roomId, host, b } = await newRoom("tictactoe");
     await call("POST", `/rooms/${roomId}/start`, { token: host });
-    const res = await SELF.fetch(`${BASE}/rooms/${roomId}/ws?token=${a.token}`, {
+    const res = await SELF.fetch(`${BASE}/rooms/${roomId}/ws`, {
       headers: { Upgrade: "websocket", Authorization: `Bearer ${b.token}` },
     });
     expect(res.status).toBe(101);
+    expect(res.headers.get("Sec-WebSocket-Protocol")).toBeNull(); // 提示されていないので選ばない
     const ws = res.webSocket!;
     ws.accept();
     open.push(ws);
@@ -521,6 +603,29 @@ describe("OpenAPI", () => {
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("text/html");
     expect(await res.text()).toContain("/openapi.json");
+  });
+
+  it("/docs の外部ファイルはバージョン固定 + SRI、CSP はインラインの初期化スクリプトだけを許可する", async () => {
+    const res = await SELF.fetch(BASE + "/docs");
+    const html = await res.text();
+    const external = [...html.matchAll(/<(?:script|link)\b[^>]*(?:src|href)="(https:[^"]+)"[^>]*>/g)];
+    expect(external).toHaveLength(2);
+    for (const [tag, url] of external) {
+      expect(url).toMatch(/swagger-ui-dist@\d+\.\d+\.\d+\//); // @5 のような範囲指定ではない
+      expect(tag).toMatch(/integrity="sha384-[A-Za-z0-9+/=]+"/);
+      expect(tag).toContain('crossorigin="anonymous"');
+    }
+
+    const csp = res.headers.get("Content-Security-Policy")!;
+    expect(csp).toContain("default-src 'none'");
+    expect(csp).toContain("frame-ancestors 'none'");
+    expect(csp).not.toMatch(/script-src[^;]*'unsafe-inline'/);
+    const inline = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]!);
+    expect(inline).toHaveLength(1);
+    const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(inline[0]!));
+    const hash = btoa(String.fromCharCode(...new Uint8Array(d)));
+    expect(csp).toContain(`'sha256-${hash}'`);
+    expect(res.headers.get("X-Content-Type-Options")).toBe("nosniff");
   });
 
   it("/openapi.json に主要パスが含まれる", async () => {

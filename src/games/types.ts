@@ -1,5 +1,5 @@
 import type { z } from "zod";
-import type { Rng } from "../lib/rng";
+import type { Rng, Seed } from "../lib/rng";
 
 export type GameErrorCode = "ILLEGAL_ACTION" | "NOT_YOUR_TURN" | "BAD_REQUEST";
 
@@ -24,7 +24,8 @@ export interface GameDefinition<S, A> {
   minPlayers: number;
   maxPlayers: number;
   actionSchema: z.ZodType<A>;
-  init(players: string[], seed: number): S;
+  /** seed は文字列（サーバーは 128 ビットの乱数を発行する）。乱数は createRng(seed) で作る。 */
+  init(players: string[], seed: Seed): S;
   currentPlayers(s: S): string[];
   legalActions(s: S, pid: string): A[];
   /** 不正な手は GameError を throw。s は変更せず新しい状態を返す。 */

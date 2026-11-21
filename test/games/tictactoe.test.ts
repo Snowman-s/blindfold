@@ -4,11 +4,11 @@ import { GameError } from "../../src/games/types";
 import { createRng } from "../../src/lib/rng";
 import { games } from "../../src/games/registry";
 
-const rng = createRng(1);
+const rng = createRng("1");
 const P = ["a", "b"];
 
 function play(cells: number[]) {
-  let s = g.init(P, 1);
+  let s = g.init(P, "1");
   cells.forEach((cell, i) => {
     s = g.apply(s, P[i % 2]!, { cell }, rng);
   });
@@ -17,7 +17,7 @@ function play(cells: number[]) {
 
 describe("tictactoe", () => {
   it("初期状態: 先手のみ行動でき、合法手は9個", () => {
-    const s = g.init(P, 1);
+    const s = g.init(P, "1");
     expect(g.currentPlayers(s)).toEqual(["a"]);
     expect(g.legalActions(s, "a")).toHaveLength(9);
     expect(g.legalActions(s, "b")).toEqual([]);
@@ -25,7 +25,7 @@ describe("tictactoe", () => {
   });
 
   it("apply は元の状態を変更しない", () => {
-    const s = g.init(P, 1);
+    const s = g.init(P, "1");
     const before = JSON.stringify(s);
     g.apply(s, "a", { cell: 4 }, rng);
     expect(JSON.stringify(s)).toBe(before);
@@ -75,13 +75,13 @@ describe("tictactoe", () => {
   });
 
   it("同じ人数でない／重複プレイヤーは init で拒否", () => {
-    expect(() => g.init(["a"], 1)).toThrow(GameError);
-    expect(() => g.init(["a", "a"], 1)).toThrow(GameError);
+    expect(() => g.init(["a"], "1")).toThrow(GameError);
+    expect(() => g.init(["a", "a"], "1")).toThrow(GameError);
   });
 });
 
 describe("ランダム Bot で 100 試合", () => {
-  function run(seed: number) {
+  function run(seed: string) {
     const game = games["tictactoe"]!;
     const r = createRng(seed);
     let s = game.init(P, seed);
@@ -99,7 +99,7 @@ describe("ランダム Bot で 100 試合", () => {
 
   it("全試合が例外なく終了する", () => {
     for (let seed = 0; seed < 100; seed++) {
-      const { s, log } = run(seed);
+      const { s, log } = run(String(seed));
       expect(games["tictactoe"]!.result(s)).not.toBeNull();
       expect(log.length).toBeLessThanOrEqual(9);
     }
@@ -108,9 +108,9 @@ describe("ランダム Bot で 100 試合", () => {
   it("初期シード + 行動ログで完全に再現できる", () => {
     const game = games["tictactoe"]!;
     for (let seed = 0; seed < 100; seed++) {
-      const { s, log } = run(seed);
-      let replay = game.init(P, seed);
-      const r = createRng(seed); // apply に渡す rng もシードから作る
+      const { s, log } = run(String(seed));
+      let replay = game.init(P, String(seed));
+      const r = createRng(String(seed)); // apply に渡す rng もシードから作る
       for (const { pid, action } of log) replay = game.apply(replay, pid, action, r);
       expect(replay).toEqual(s);
     }

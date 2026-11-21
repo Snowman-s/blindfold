@@ -45,8 +45,4 @@ export const RoomIdParam = z.object({
   id: z.string().openapi({ param: { name: "id", in: "path" }, example: "a1b2c3d4e5f6" }),
 });
 
-export const TokenQuery = z.object({
-  token: z.string().optional().openapi({ param: { name: "token", in: "query" } }),
-});
-
 export const bearerSecurity = [{ bearerAuth: [] }];

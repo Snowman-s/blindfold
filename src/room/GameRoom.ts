@@ -1,11 +1,11 @@
 import { DurableObject } from "cloudflare:workers";
 import { getGame, type AnyGame } from "../games/registry";
 import { GameError, type GameResult } from "../games/types";
-import { extractToken, newToken } from "../lib/auth";
+import { extractWsAuth, newToken, randomHex } from "../lib/auth";
 import { DEFAULT_TURN_TIME_MS, roomOptions } from "../lib/options";
 import { clientMessage, toWsErrorCode, type ServerMessage } from "../lib/protocol";
 import { applyTimeout, replayFrames, type LogEntry, type ReplayLog } from "../lib/replay";
-import { rngForTurn } from "../lib/rng";
+import { rngForTurn, type Seed } from "../lib/rng";
 
 export type { ReplayLog } from "../lib/replay";
 
@@ -43,7 +43,7 @@ export interface RoomState {
 
 export interface ReplayFrames {
   game: string;
-  seed: number;
+  seed: Seed;
   players: string[];
   /** frames[i] は turn=i の観戦視点。action はそのターンに適用された行動（最初のフレームは null）。 */
   frames: { turn: number; view: unknown; action: LogEntry | null }[];
@@ -137,8 +137,8 @@ export class GameRoom extends DurableObject<Env> {
     );
   }
 
-  private seed(): number {
-    return Number(this.getMeta("seed"));
+  private seed(): Seed {
+    return this.getMeta("seed")!;
   }
 
   private status(): RoomStatus {
@@ -469,7 +469,7 @@ export class GameRoom extends DurableObject<Env> {
     if (players.length < game.minPlayers) {
       return fail(409, "NOT_ENOUGH_PLAYERS", `need at least ${game.minPlayers} players`);
     }
-    const seed = crypto.getRandomValues(new Uint32Array(1))[0]!;
+    const seed: Seed = randomHex(16); // 128 ビット。総当たりで特定されないように
     const state = game.init(players, seed);
     await this.commit(() => {
       this.setMeta("seed", String(seed));
@@ -508,6 +508,12 @@ export class GameRoom extends DurableObject<Env> {
     if (!pid) return fail(401, "UNAUTHORIZED", "valid player token required");
     await this.ensureAlarm(); // 行動が拒否される場合（STALE_TURN など）でも締め切りを取り戻す
     if (this.status() !== "playing") return fail(409, "NOT_PLAYING", "game is not in progress");
+    // 締め切りを過ぎた手は受け付けない。Alarm の発火を待たずにこの場で時間切れを確定させる
+    // （ここから commit まで await を挟まないので、時間切れ処理と行動が入れ替わることはない）。
+    if (this.deadlinePassed()) {
+      await this.resolveTimeout();
+      return fail(409, "STALE_TURN", "time is up; the turn was resolved by timeout");
+    }
 
     const snap = this.loadSnapshot();
     if (turn !== snap.turn) return fail(409, "STALE_TURN", `current turn is ${snap.turn}`);
@@ -587,7 +593,7 @@ export class GameRoom extends DurableObject<Env> {
 
   // ---- WebSocket（Hibernation API） ----
 
-  /** Worker から転送された WebSocket アップグレード。token が無ければ観戦。 */
+  /** Worker から転送された WebSocket アップグレード。トークン（サブプロトコルか Bearer）が無ければ観戦。 */
   async fetch(request: Request): Promise<Response> {
     if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
       return Response.json({ error: { code: "UPGRADE_REQUIRED", message: "expected WebSocket upgrade" } }, { status: 426 });
@@ -596,10 +602,11 @@ export class GameRoom extends DurableObject<Env> {
       return Response.json({ error: { code: "ROOM_NOT_FOUND", message: "room not found" } }, { status: 404 });
     }
     await this.ensureAlarm();
-    const token = extractToken(request);
+    const auth = extractWsAuth(request);
+    if (!auth.ok) return Response.json({ error: { code: "BAD_REQUEST", message: auth.message } }, { status: 400 });
     let pid: string | null = null;
-    if (token) {
-      pid = this.playerByToken(token);
+    if (auth.token) {
+      pid = this.playerByToken(auth.token);
       if (!pid) return Response.json({ error: { code: "UNAUTHORIZED", message: "invalid token" } }, { status: 401 });
     }
 
@@ -611,7 +618,9 @@ export class GameRoom extends DurableObject<Env> {
     const s = this.buildState(pid);
     this.send(server, this.stateMessage(s));
     if (s.status === "finished" && s.result) this.send(server, this.endMessage(s.result));
-    return new Response(null, { status: 101, webSocket: client });
+    // 応答で選ぶのはトークンを含まない "apigames"（トークンを応答ヘッダーに載せない）
+    const headers: HeadersInit = auth.protocol ? { "Sec-WebSocket-Protocol": auth.protocol } : {};
+    return new Response(null, { status: 101, webSocket: client, headers });
   }
 
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
@@ -670,6 +679,17 @@ export class GameRoom extends DurableObject<Env> {
       await this.ctx.storage.setAlarm(Number(deadline));
       return;
     }
+    await this.resolveTimeout();
+  }
+
+  /** playing で、現在の手番の締め切りを過ぎているか。 */
+  private deadlinePassed(): boolean {
+    const d = this.getMeta("deadline");
+    return d !== null && Date.now() >= Number(d);
+  }
+
+  /** 現在の手番を時間切れとして確定する（alarm と、締め切り後に届いた行動の両方から呼ぶ）。 */
+  private async resolveTimeout(): Promise<void> {
     const game = this.game();
     const snap = this.loadSnapshot();
     const pending = game.currentPlayers(snap.state);

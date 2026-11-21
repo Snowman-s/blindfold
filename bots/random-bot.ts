@@ -50,7 +50,8 @@ const state = await api<{ game: string }>("GET", `/rooms/${roomId}/state`);
 const games = await api<{ id: string; minPlayers: number }[]>("GET", "/games");
 const minPlayers = games.find((g) => g.id === state.game)?.minPlayers ?? 2;
 
-const ws = new WebSocket(`${base.replace(/^http/, "ws")}/rooms/${roomId}/ws?token=${token}`);
+// トークンは URL ではなくサブプロトコルで渡す（URL はログや履歴に残るため）
+const ws = new WebSocket(`${base.replace(/^http/, "ws")}/rooms/${roomId}/ws`, ["apigames", `apigames.token.${token}`]);
 await new Promise<void>((resolve, reject) => {
   ws.addEventListener("open", () => resolve());
   ws.addEventListener("error", () => reject(new Error("websocket connection failed")));

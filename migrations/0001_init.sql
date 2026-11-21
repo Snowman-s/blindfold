@@ -10,7 +10,7 @@ CREATE TABLE users (
 CREATE TABLE matches (
   id TEXT PRIMARY KEY,
   game TEXT NOT NULL,
-  seed INTEGER NOT NULL,
+  seed TEXT NOT NULL, -- 128 ビット（16 進 32 文字）。INTEGER だと数字だけのシードが数値に変換される
   players TEXT NOT NULL, -- JSON 配列
   started_at INTEGER NOT NULL,
   finished_at INTEGER NOT NULL,

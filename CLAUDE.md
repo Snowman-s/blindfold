@@ -54,7 +54,7 @@ src/
     tictactoe/        # 最初のサンプルゲーム
     highcard/         # 隠し情報 + 同時手番のカードゲーム
   lib/
-    rng.ts            # シード付き疑似乱数（mulberry32 等）
+    rng.ts            # シード付き疑似乱数（文字列シード → cyrb128 → sfc32。状態 128 ビット）
     auth.ts           # プレイヤートークン発行・検証
     protocol.ts       # WS メッセージの zod スキーマ
     replay.ts         # 行動ログからの再現・時間切れ解決（純粋関数）
@@ -77,7 +77,7 @@ export interface GameDefinition<S, A> {
   minPlayers: number;
   maxPlayers: number;
   actionSchema: z.ZodType<A>;                  // 受信した行動の検証用
-  init(players: string[], seed: number): S;
+  init(players: string[], seed: Seed): S;     // Seed = string（サーバーは 128 ビットの乱数を 16 進 32 文字で発行）
   currentPlayers(s: S): string[];              // 今行動できるプレイヤー（同時手番も可）
   legalActions(s: S, pid: string): A[];        // Bot 向けに API で返す
   apply(s: S, pid: string, a: A, rng: Rng): S; // 不正な手は GameError を throw
@@ -87,7 +87,7 @@ export interface GameDefinition<S, A> {
 }
 ```
 
-- 乱数は必ず渡された `seed` / `rng` から作る。**「初期シード + 行動ログ」だけで試合を完全に再現できること**を保証する（リプレイ・デバッグ・不正検証のため）。
+- 乱数は必ず渡された `seed` / `rng` から作る（`createRng(seed)`）。シードは 128 ビット。32 ビットだと観測した乱数から総当たりでシードを特定され、隠し情報が漏れる。**「初期シード + 行動ログ」だけで試合を完全に再現できること**を保証する（リプレイ・デバッグ・不正検証のため）。
 - 状態 `S` は JSON シリアライズ可能に保つ（Map、Set、クラスインスタンスは使わない）。
 - 隠し情報（手札など）は `view` の中だけで除去する。サーバーが送るのは常に `view` の結果だけ。
 
@@ -101,7 +101,7 @@ export interface GameDefinition<S, A> {
 | POST | `/rooms` | `{ game: string, options?: {...} }` → `{ roomId, hostToken }`。未知のオプションは 400 |
 | POST | `/rooms/:id/join` | → `{ playerId, token }` |
 | POST | `/rooms/:id/start` | 試合開始（作成者のみ。`hostToken` を Bearer で渡す） |
-| GET | `/rooms/:id/state` | `?token=` があればそのプレイヤー視点、なければ観戦視点 |
+| GET | `/rooms/:id/state` | `Authorization: Bearer <token>` があればそのプレイヤー視点、なければ観戦視点 |
 | POST | `/rooms/:id/action` | WS を使わない簡易 Bot 向け。`{ turn, action }` |
 | GET | `/rooms/:id/log` | 行動ログ（リプレイ用。終了後のみ） |
 | GET | `/rooms/:id/replay` | ログから再現した各ターンの観戦視点（終了後のみ） |
@@ -109,7 +109,10 @@ export interface GameDefinition<S, A> {
 | GET | `/users/:id` | ユーザーと戦績 |
 | GET | `/matches` | 終了した試合の一覧（`?game=&limit=`） |
 | GET | `/openapi.json` | 生成された OpenAPI 仕様 |
-| GET | `/rooms/:id/ws` | WebSocket へのアップグレード（`?token=`。無ければ観戦） |
+| GET | `/rooms/:id/ws` | WebSocket へのアップグレード（サブプロトコル `["apigames", "apigames.token.<token>"]` か Bearer。無ければ観戦） |
+
+- トークンは URL に載せない（アクセスログ・ブラウザ履歴に残るため）。`?token=` は 400 で拒否する。
+- REST は `Authorization: Bearer`。WS はブラウザがヘッダーを付けられないのでサブプロトコルで渡し、サーバーはトークンを含まない `apigames` を選んで応答する。
 
 ### WebSocket メッセージ（JSON）
 
@@ -127,6 +130,7 @@ export interface GameDefinition<S, A> {
 ```
 
 - `turn` が現在のターンと一致しない行動は `STALE_TURN` で拒否する（二重送信・古い手の防止）。
+- 締め切りを過ぎてから届いた行動も、Alarm を待たずにその場で時間切れを確定させてから `STALE_TURN` で拒否する。
 - `legal` は、受け取るプレイヤーが今行動できる場合にだけ付ける。
 
 ## 無料枠の制約（設計時に必ず守る）

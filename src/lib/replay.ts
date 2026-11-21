@@ -1,5 +1,5 @@
 import type { GameDefinition, GameResult } from "../games/types";
-import { rngForTurn } from "./rng";
+import { rngForTurn, type Seed } from "./rng";
 
 type AnyGame = GameDefinition<unknown, unknown>;
 
@@ -14,7 +14,7 @@ export interface LogEntry {
 
 export interface ReplayLog {
   game: string;
-  seed: number;
+  seed: Seed;
   players: string[];
   actions: LogEntry[];
 }
@@ -29,7 +29,7 @@ export function applyTimeout(
   state: unknown,
   pids: string[],
   players: string[],
-  seed: number,
+  seed: Seed,
   turn: number,
 ): { state: unknown; forfeit: GameResult | null } {
   if (game.onTimeout) {

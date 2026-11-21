@@ -89,7 +89,10 @@ describe("REST: 対戦", () => {
     expect(spectator.legal).toBeUndefined();
     expect(spectator.currentPlayers).toEqual(["p1"]);
     expect(spectator.status).toBe("playing");
-    expect((await call("GET", `/rooms/${roomId}/state?token=${a.token}`)).json.legal).toHaveLength(9);
+    // URL にトークンを載せる方式は廃止（ログ・履歴に残るため）。黙って観戦扱いにせず 400 にする
+    const q = await call("GET", `/rooms/${roomId}/state?token=${a.token}`);
+    expect(q.status).toBe(400);
+    expect(q.json.error.code).toBe("BAD_REQUEST");
     expect((await call("GET", `/rooms/${roomId}/state`, { token: "bogus" })).status).toBe(401);
   });
 
@@ -144,6 +147,7 @@ describe("REST: 対戦", () => {
     const log = (await call("GET", `/rooms/${roomId}/log`)).json;
     expect(log.game).toBe("tictactoe");
     expect(log.players).toEqual(["p1", "p2"]);
+    expect(log.seed).toMatch(/^[0-9a-f]{32}$/); // 128 ビット
     expect(log.actions.map((x: { turn: number }) => x.turn)).toEqual(log.actions.map((_: unknown, i: number) => i));
 
     let s = tictactoe.init(log.players, log.seed);

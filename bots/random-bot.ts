@@ -3,6 +3,7 @@
  *
  *   pnpm tsx bots/random-bot.ts --url http://localhost:8787 --room <roomId> [--host-token <hostToken>]
  *   pnpm tsx bots/random-bot.ts --url http://localhost:8787 --game tictactoe   # ルームを作って参加
+ *   pnpm tsx bots/random-bot.ts --url http://localhost:8787 --quickmatch tictactoe   # 空いている部屋に入る（無ければ作る）
  *
  * 自分でルームを作った場合か --host-token を渡した場合は、人数が揃ったら自動で開始する。
  */
@@ -17,6 +18,7 @@ const { values } = parseArgs({
     game: { type: "string", default: "tictactoe" },
     "api-key": { type: "string" },
     "host-token": { type: "string" },
+    quickmatch: { type: "string" },
   },
 });
 const base = values.url!.replace(/\/$/, "");
@@ -32,12 +34,24 @@ async function api<T>(method: string, path: string, init: { headers?: Record<str
   return json;
 }
 
+const apiKeyHeader: Record<string, string> = values["api-key"] ? { "X-Api-Key": values["api-key"] } : {};
 let roomId = values.room;
 /** ルームのゲーム。自分で作ったときは分かっているので、/state を引かずに済む。 */
 let gameId: string | null = null;
 /** 作成者用トークン（自分で作ったか --host-token で渡されたとき）。持っていれば人数が揃ったら開始する。 */
 let hostToken: string | null = values["host-token"] ?? null;
-if (!roomId) {
+/** クイックマッチで得た席（満席になればサーバーが自動で開始するので hostToken は要らない）。 */
+let seat: { playerId: string; token: string } | null = null;
+if (values.quickmatch) {
+  const m = await api<{ roomId: string; playerId: string; token: string; created: boolean }>("POST", "/quickmatch", {
+    headers: apiKeyHeader,
+    body: { game: values.quickmatch },
+  });
+  roomId = m.roomId;
+  gameId = values.quickmatch;
+  seat = m;
+  console.log(`${m.created ? "room created" : "matched into room"}: ${roomId}`);
+} else if (!roomId) {
   const created = await api<{ roomId: string; hostToken: string }>("POST", "/rooms", { body: { game: values.game } });
   roomId = created.roomId;
   hostToken = created.hostToken;
@@ -45,9 +59,8 @@ if (!roomId) {
   console.log(`room created: ${roomId}`);
 }
 
-const { playerId, token } = await api<{ playerId: string; token: string }>("POST", `/rooms/${roomId}/join`, {
-  headers: values["api-key"] ? { "X-Api-Key": values["api-key"] } : {},
-});
+const { playerId, token } =
+  seat ?? (await api<{ playerId: string; token: string }>("POST", `/rooms/${roomId}/join`, { headers: apiKeyHeader }));
 console.log(`joined as ${playerId}`);
 
 const [game, games] = await Promise.all([

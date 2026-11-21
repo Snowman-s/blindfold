@@ -16,7 +16,7 @@ const COMMON = [
   "- REST alternative: `POST /rooms/{id}/action` with `{ turn, action }`. REST has no way to wait for the other players, so to play a full game use the WebSocket: it pushes a new `state` whenever the turn changes. Use REST for single actions or debugging, not polling.",
   "- If `turn` does not match the current turn, the action is rejected with `STALE_TURN`. Wait for the next `state` and retry.",
   "- Each turn has a `deadline` (epoch ms). Missing it is a timeout.",
-  "- Error codes: `ILLEGAL_ACTION` (illegal move), `NOT_YOUR_TURN` (you may not act now), `STALE_TURN` (outdated turn), `BAD_REQUEST` (malformed message).",
+  "- Error codes: `ILLEGAL_ACTION` (illegal move), `NOT_YOUR_TURN` (you may not act now), `STALE_TURN` (outdated turn), `BAD_REQUEST` (malformed message), `INTERNAL` (server failure; resend if the turn is still current).",
   "- When the game ends you receive an `end` message with `winners` (empty for a draw) and `scores`.",
 ].join("\n");
 

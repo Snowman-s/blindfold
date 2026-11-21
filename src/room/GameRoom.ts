@@ -436,7 +436,9 @@ export class GameRoom extends DurableObject<Env> {
       const byTimeout = this.getMeta("forfeit") !== null;
       const outcome = (pid: string) =>
         result.winners.includes(pid) ? "win" : result.winners.length === 0 && !byTimeout ? "draw" : "loss";
+      const index = this.indexStatement();
       await this.env.DB.batch([
+        ...(index ? [index] : []),
         this.env.DB
           .prepare(
             "INSERT OR IGNORE INTO matches(id, game, seed, players, started_at, finished_at, reason) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -488,6 +490,49 @@ export class GameRoom extends DurableObject<Env> {
     if (!(await this.persistResult(result))) await this.schedulePersistRetry();
   }
 
+  /**
+   * 一覧用の索引（D1 の rooms）を今の状態で上書きする文。一覧に載せないルームや D1 が無いときは null。
+   * rev は呼ぶたびに増える（同期処理の中で状態と一緒に読むので、後の rev ほど新しい状態）。
+   * D1 側は rev が大きいときだけ上書きするので、await の間に追い越した古い書き込みが新しい状態を戻すことはない。
+   */
+  private indexStatement(): D1PreparedStatement | null {
+    const opts = this.options();
+    const id = this.getMeta("roomId");
+    if (!id || !this.env.DB || opts.unlisted || opts.practice) return null;
+    const rev = Number(this.getMeta("indexRev") ?? "0") + 1;
+    this.setMeta("indexRev", String(rev));
+    const game = this.game();
+    return this.env.DB.prepare(
+      `INSERT INTO rooms(id, game, status, players, max_players, auto_start, turn_time_ms, created_at, updated_at, rev)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         status = excluded.status, players = excluded.players, updated_at = excluded.updated_at, rev = excluded.rev
+       WHERE excluded.rev > rooms.rev`,
+    ).bind(
+      id,
+      game.id,
+      this.status(),
+      this.playerIds().length,
+      game.maxPlayers,
+      opts.autoStart ? 1 : 0,
+      opts.turnTimeMs ?? DEFAULT_TURN_TIME_MS,
+      Number(this.getMeta("createdAt") ?? Date.now()),
+      Date.now(),
+      rev,
+    );
+  }
+
+  /**
+   * 索引を更新する（作成・join・開始のとき）。失敗してもログに残すだけ（索引は best-effort。本物の状態は DO にある）。
+   * 終了時は persistResult の batch に含めるので、D1 の再試行に乗る。
+   */
+  private async syncIndex(): Promise<void> {
+    await this.attempt("syncIndex", async () => {
+      const st = this.indexStatement();
+      if (st) await st.run();
+    });
+  }
+
   private options() {
     const parsed = roomOptions.safeParse(JSON.parse(this.getMeta("options") ?? "{}"));
     return parsed.success ? parsed.data : {};
@@ -513,7 +558,9 @@ export class GameRoom extends DurableObject<Env> {
       this.setMeta("options", JSON.stringify(opts.data));
       this.setMeta("hostToken", hostToken);
       this.setMeta("status", "waiting");
+      this.setMeta("createdAt", String(Date.now()));
     });
+    await this.syncIndex();
     return ok({ game: gameId, hostToken });
   }
 
@@ -522,12 +569,16 @@ export class GameRoom extends DurableObject<Env> {
     if (!this.exists()) return NOT_FOUND;
     if (this.status() !== "waiting") return fail(409, "ALREADY_STARTED", "game already started");
     const n = this.playerIds().length;
-    if (n >= this.game().maxPlayers) return fail(409, "ROOM_FULL", "room is full");
+    const { maxPlayers } = this.game();
+    if (n >= maxPlayers) return fail(409, "ROOM_FULL", "room is full");
     const playerId = `p${n + 1}`;
     const token = newToken();
     await this.commit(() => {
       this.sql.exec("INSERT INTO players(id, token, seq, user_id) VALUES (?, ?, ?, ?)", playerId, token, n, userId);
     });
+    // autoStart：満席になったらその場で開始する（ホストの start と競合しても startGame が status を見て1回だけ開始する）
+    if (this.options().autoStart && n + 1 >= maxPlayers) await this.startGame();
+    else await this.syncIndex();
     return ok({ playerId, token });
   }
 
@@ -540,6 +591,11 @@ export class GameRoom extends DurableObject<Env> {
         ? fail(403, "NOT_HOST", "only the room creator can start the game")
         : fail(401, "UNAUTHORIZED", "invalid token");
     }
+    return this.startGame();
+  }
+
+  /** 開始処理の本体（認証済みの start と autoStart から呼ぶ）。返すのは観戦視点。 */
+  private async startGame(): Promise<RoomResult<RoomState>> {
     if (this.status() !== "waiting") return fail(409, "ALREADY_STARTED", "game already started");
 
     const game = this.game();
@@ -565,6 +621,7 @@ export class GameRoom extends DurableObject<Env> {
       this.saveSnapshot(0, state);
       this.setMeta("status", "playing");
     });
+    await this.syncIndex();
     return ok(this.buildState(null));
   }
 
@@ -736,7 +793,7 @@ export class GameRoom extends DurableObject<Env> {
       // 成功時の state は afterChange の broadcast で全員に届く
     } catch (e) {
       console.error("webSocketMessage failed", e);
-      this.send(ws, { type: "error", code: "BAD_REQUEST", message: "internal error" });
+      this.send(ws, { type: "error", code: "INTERNAL", message: "internal error" });
     }
   }
 

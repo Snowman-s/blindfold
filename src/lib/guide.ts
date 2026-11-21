@@ -2,7 +2,7 @@ import { z } from "zod";
 import { games } from "../games/registry";
 import type { AnyGame } from "../games/types";
 import { sha256Hex, WS_PROTOCOL, WS_TOKEN_PROTOCOL_PREFIX } from "./auth";
-import { DEFAULT_TURN_TIME_MS, roomOptions } from "./options";
+import { DEFAULT_TURN_TIME_MS, roomOptions, WAITING_LIST_TTL_MS } from "./options";
 import { WS_ERROR_CODES, type ServerMessage } from "./protocol";
 import { rngForTurn } from "./rng";
 
@@ -85,8 +85,15 @@ async function post(path, body, token) {
     },
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
-  const data = await res.json();
-  if (!res.ok) throw new Error(\`\${path}: \${data.error.code} \${data.error.message}\`);
+  const text = await res.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    // Not JSON: a platform error page (e.g. daily request limit reached). Retry later.
+    throw new Error(\`\${path}: HTTP \${res.status} (non-JSON response, retry later)\`);
+  }
+  if (!res.ok) throw new Error(\`\${path}: HTTP \${res.status} \${data.error?.code} \${data.error?.message}\`);
   return data;
 }
 
@@ -116,6 +123,12 @@ const { roomId, hostToken } = await post("/rooms", { game: "tictactoe", options:
 const me = await post(\`/rooms/\${roomId}/join\`); // you are p1; the bot takes p2 when the game starts
 await post(\`/rooms/\${roomId}/start\`, undefined, hostToken);
 const end = await play(roomId, me.token);
+console.log(end.winners.length === 0 ? "draw" : end.winners.includes(me.playerId) ? "you won" : "you lost", end.scores);`;
+
+const QUICKMATCH_CLIENT = `// Play one game against whoever else is looking for a tictactoe game.
+const me = await post("/quickmatch", { game: "tictactoe" }); // { roomId, playerId, token, created }
+console.log(me.created ? "waiting for an opponent..." : "joined an open room");
+const end = await play(me.roomId, me.token);
 console.log(end.winners.length === 0 ? "draw" : end.winners.includes(me.playerId) ? "you won" : "you lost", end.scores);`;
 
 const MESSAGE_TYPES = `// Client -> server (WebSocket text frames, JSON)
@@ -155,7 +168,9 @@ function buildGuide(): string {
       [
         `Base URL      ${BASE}            (WebSocket: same host, ws:// or wss://)`,
         `Games         ${gameList.map((g) => g.id).join(", ")}   (GET /games)`,
+        "Quick match   POST /quickmatch {game} -> { roomId, playerId, token } -> WS /rooms/{roomId}/ws -> wait -> loop (starts by itself)",
         "Flow          POST /rooms -> POST /rooms/{id}/join (once per seat) -> POST /rooms/{id}/start -> WS /rooms/{id}/ws -> loop",
+        "Open rooms    GET /rooms (waiting, has a free seat) · GET /rooms?status=playing (to spectate)",
         `WS auth       new WebSocket(url, ["${WS_PROTOCOL}", "${WS_TOKEN_PROTOCOL_PREFIX}" + token])   (no token = spectator)`,
         "REST auth     Authorization: Bearer <token>",
         "Never         put a token in the URL: ?token= is rejected with 400",
@@ -174,6 +189,31 @@ function buildGuide(): string {
     "",
     "## 1. Lifecycle, step by step",
     "",
+    "### 1.0 Finding an opponent",
+    "",
+    "Pick one of these. All of them end with a player `token` and a WebSocket connection (1.4).",
+    "",
+    "1. **Quick match (recommended for bots).** `POST /quickmatch` with `{\"game\":\"tictactoe\"}` joins the oldest open",
+    "   auto-start room of that game with the same `turnTimeMs`, or creates one if there is none. The game starts by itself",
+    "   as soon as the room is full, so nobody calls `start`.",
+    code("sh", `curl -X POST ${BASE}/quickmatch -H 'Content-Type: application/json' -d '{"game":"tictactoe"}'`),
+    code("json", json({ roomId: "3f9c0a1b2d4e5f60", playerId: "p1", token: "<token>", created: true })),
+    "   `created: true` means you made a new room and are waiting for someone else. Connect the WebSocket **right away**",
+    "   with your `token`: you receive `state` messages with `status: \"waiting\"` (and a growing `players`) until the room",
+    "   fills, then a `status: \"playing\"` state, with `legal` if you move first. Optional body `options.turnTimeMs`",
+    "   (matched exactly) and header `X-Api-Key` work as for `/rooms` and `/join`. Nobody gets a `hostToken`.",
+    `   A room you created stops being offered to others ${WAITING_LIST_TTL_MS / 60000} minutes after its last join. If nobody`,
+    "   has joined by then, close the socket and call `/quickmatch` again (the old seat is simply abandoned).",
+    "2. **Browse open rooms.** `GET /rooms` lists public waiting rooms that still have a free seat",
+    "   (`?game=&limit=`; each item has `roomId`, `game`, `players`, `maxPlayers`, `autoStart`, `turnTimeMs`). Join one",
+    "   with `POST /rooms/{roomId}/join`. The list is an index and can lag a little: if the join fails with `ROOM_FULL`,",
+    `   \`ALREADY_STARTED\` or \`ROOM_NOT_FOUND\`, try the next room. Rooms not updated for ${WAITING_LIST_TTL_MS / 60000} minutes are not listed.`,
+    "3. **Host your own room** (1.1). Rooms are listed in `GET /rooms` by default; pass `options.unlisted: true` to keep",
+    "   it private and share `roomId` yourself. Pass `options.autoStart: true` to start automatically when the room is",
+    "   full. Without it, the creator must call `start` (1.3) once enough players have joined.",
+    "",
+    "Practice rooms (`options.practice`) are never listed and never matched.",
+    "",
     "### 1.1 Create a room",
     code("sh", `curl -X POST ${BASE}/rooms -H 'Content-Type: application/json' -d '{"game":"tictactoe"}'`),
     code("json", json({ roomId: "3f9c0a1b2d4e5f60", hostToken: "<hostToken>" })),
@@ -187,6 +227,12 @@ function buildGuide(): string {
     "the bot is `p2`), play a simple legal move (random unless the game defines its own) as soon as it is their turn,",
     "and never time out. They are for checking your client's flow, not for strength. Use this to test your",
     "client alone: create, join once, start, connect. Practice games are not recorded in `/users/{id}` or `/matches`.",
+    "",
+    "**Auto start:** with `\"autoStart\": true` the game starts as soon as `maxPlayers` have joined (no `start` call;",
+    "a later `start` gets `ALREADY_STARTED`). It cannot be combined with `practice` (400).",
+    "",
+    "**Listing:** every room except practice rooms appears in `GET /rooms` while it waits for players and while it is",
+    "being played. `\"unlisted\": true` hides it from the list and from quick match; only people who know `roomId` can join.",
     "",
     "`hostToken` is only for starting the game. It is **not** a player token: the creator must also join to play.",
     "",
@@ -203,6 +249,12 @@ function buildGuide(): string {
     code("sh", `curl -X POST ${BASE}/rooms/{roomId}/start -H 'Authorization: Bearer <hostToken>'`),
     "Requires at least `minPlayers` players (`NOT_ENOUGH_PLAYERS`, 409), counting practice bots. A player token gets `NOT_HOST` (403).",
     "",
+    "**How the host knows when to start:** `hostToken` cannot open a WebSocket (401: it is not a player token). Connect",
+    "with your own player token (or as a spectator, without a token) before others join. Every join pushes a",
+    "`state` with `status: \"waiting\"` and the updated `players` list; once `players.length` reaches the number you",
+    "want (at least `minPlayers`), call `start`. Do not poll `/state` for this. Or simply create the room with",
+    "`options.autoStart` and skip this step.",
+    "",
     "### 1.4 Connect the WebSocket",
     code(
       "js",
@@ -217,6 +269,11 @@ function buildGuide(): string {
     "- You may connect before or after the game starts. Right after connecting you receive the current `state`",
     "  (`status` may be `waiting`), and if the game is already over, an `end` message right after it.",
     "- Reconnecting is always safe: the first `state` tells you everything. You do not need to keep local state.",
+    "- If the upgrade is refused (404 unknown room, 401 invalid token, 400 token in the URL or a malformed subprotocol),",
+    "  a browser `WebSocket` cannot read the status or the body: it only fires `error` and `close` (usually code 1006).",
+    "  To find out why, call `GET /rooms/{id}/state` with the same token in `Authorization: Bearer`: an unknown room (404)",
+    "  or an invalid token (401) fails there too, with a JSON error body. If `/state` succeeds, check the URL (no `?token=`)",
+    "  and the subprotocol list (exactly `[\"" + WS_PROTOCOL + "\", \"" + WS_TOKEN_PROTOCOL_PREFIX + "<token>\"]`).",
     "",
     "### 1.5 The game loop",
     "",
@@ -239,11 +296,24 @@ function buildGuide(): string {
     "| `NOT_YOUR_TURN` | you may not act now (or you are a spectator) | wait for a `state` with `legal` |",
     "| `ILLEGAL_ACTION` | the move breaks the rules, or the game is not in progress | send an element of `legal` |",
     "| `BAD_REQUEST` | malformed JSON / message / action shape | fix the message format |",
+    "| `INTERNAL` | server-side failure while handling the message | resend the same action if its `turn` is still current; otherwise wait for the next `state` (or reconnect) |",
+    "",
+    "The WebSocket uses only the codes above. Where the REST API has a more specific code, the WebSocket maps it:",
+    "`UNAUTHORIZED` (a spectator sent an action) becomes `NOT_YOUR_TURN`, and `NOT_PLAYING` (the game has not",
+    "started yet or is already over) becomes `ILLEGAL_ACTION`. So an action sent after `end` is answered with `ILLEGAL_ACTION`.",
     "",
     "REST errors use HTTP status codes with the body `{ \"error\": { \"code\": \"...\", \"message\": \"...\" } }`.",
     "Codes: `BAD_REQUEST` (400), `UNKNOWN_GAME` (400), `ILLEGAL_ACTION` (400), `UNAUTHORIZED` (401), `NOT_HOST` (403),",
-    "`NOT_YOUR_TURN` (403), `NOT_FINISHED` (403), `ROOM_NOT_FOUND` (404), `ALREADY_STARTED` / `ROOM_FULL` /",
-    "`NOT_ENOUGH_PLAYERS` / `NOT_PLAYING` / `STALE_TURN` (409), `UPGRADE_REQUIRED` (426).",
+    "`NOT_YOUR_TURN` (403), `NOT_FINISHED` (403), `ROOM_NOT_FOUND` (404, unknown room), `NOT_FOUND` (404: unknown",
+    "route, unknown game in `/games/{id}/rules`, unknown user in `/users/{id}`), `ALREADY_STARTED` / `ROOM_FULL` /",
+    "`NOT_ENOUGH_PLAYERS` / `NOT_PLAYING` / `STALE_TURN` (409), `UPGRADE_REQUIRED` (426), `INTERNAL` (500).",
+    "",
+    "- `GET /rooms/{id}/state` with an **invalid** token fails with 401 `UNAUTHORIZED`. It does not fall back to the",
+    "  spectator view; to spectate, send no `Authorization` header at all.",
+    "- **Not every error response is JSON.** When the service's daily request limit is used up (it resets at 00:00 UTC),",
+    "  or the platform itself fails, the response may be an HTML error page (typically 429 or 5xx) instead of the JSON body",
+    "  above. Read the body as text, parse it only if it is JSON, and retry later with backoff on a non-JSON response or",
+    "  any 5xx. The minimal client in section 6 does this.",
     "",
     "### 1.7 Deadlines",
     "",
@@ -267,6 +337,8 @@ function buildGuide(): string {
     "|---|---|---|---|",
     "| GET | `/games` | - | list games (`id`, `minPlayers`, `maxPlayers`, `summary`, `rulesUrl`) |",
     "| GET | `/games/{id}/rules` · `/games/{id}/rules.md` | - | rules, view fields, action schema (JSON / Markdown) |",
+    "| POST | `/quickmatch` | optional `X-Api-Key` | `{ game, options?: { turnTimeMs } }` -> `{ roomId, playerId, token, created }` |",
+    "| GET | `/rooms` | - | public rooms: `?status=waiting` (default, free seats) or `playing`; `&game=&limit=` |",
     "| POST | `/rooms` | - | `{ game, options? }` -> `{ roomId, hostToken }` |",
     "| POST | `/rooms/{id}/join` | optional `X-Api-Key` | -> `{ playerId, token }` |",
     "| POST | `/rooms/{id}/start` | Bearer hostToken | start the game |",
@@ -285,6 +357,7 @@ function buildGuide(): string {
     "",
     "## 4. Spectating and replays",
     "",
+    "- Find games in progress with `GET /rooms?status=playing` (public rooms only).",
     "- Connect to `/rooms/{id}/ws` with only the `" + WS_PROTOCOL + "` subprotocol (no token) to receive spectator `state` messages.",
     "- After the game ends, `GET /rooms/{id}/replay` returns `{ game, seed, players, frames: [{ turn, view, action }], result }`,",
     "  where `view` is the spectator view at each turn. Use it to build a replay viewer.",
@@ -298,10 +371,14 @@ function buildGuide(): string {
     "## 6. Minimal client (copy-paste)",
     "",
     "Creates a tictactoe room with a practice bot, joins once, and plays random legal moves until the game ends.",
-    "Replace `pick(legal, view)` with your own strategy. To play against another client instead, drop `practice`,",
-    "share `roomId`, and have the other client join before you start.",
+    "Replace `pick(legal, view)` with your own strategy.",
     "",
     code("js", MINIMAL_CLIENT),
+    "",
+    "To play against another client (or a person) instead, replace the last block with a quick match. Run the same",
+    "code twice and the two instances meet in one room; `play()` waits through the `waiting` states by itself:",
+    "",
+    code("js", QUICKMATCH_CLIENT),
     "",
     "## 7. Checklist for a correct client",
     "",
@@ -309,6 +386,7 @@ function buildGuide(): string {
     "- [ ] Every action carries the `turn` of the latest `state`, and at most one action is sent per `turn`.",
     "- [ ] Actions are taken from `legal` (or match the game's action schema exactly).",
     "- [ ] `STALE_TURN` and other errors do not crash the client; it waits for the next `state`.",
+    "- [ ] REST responses that are not JSON (or are 5xx) are retried later instead of crashing the JSON parser.",
     "- [ ] The UI handles `status: \"waiting\"` (before start) and `view` fields that only some viewers receive.",
     "- [ ] On `end`, the result is shown and the socket is closed.",
     "",

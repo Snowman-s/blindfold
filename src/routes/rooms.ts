@@ -3,7 +3,7 @@ import type { Context } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { games, getGame } from "../games/registry";
 import { extractToken, newRoomId, sha256Hex, WS_PROTOCOL, WS_TOKEN_PROTOCOL_PREFIX } from "../lib/auth";
-import { roomOptions } from "../lib/options";
+import { DEFAULT_TURN_TIME_MS, roomOptions, turnTimeMs, WAITING_LIST_TTL_MS } from "../lib/options";
 import { actionBody } from "../lib/protocol";
 import { gameRules, rulesMarkdown, type GameRules } from "../lib/rules";
 import type { RoomResult } from "../room/GameRoom";
@@ -42,6 +42,18 @@ function respond<T>(c: Context<AppEnv>, r: RoomResult<T>, okStatus: ContentfulSt
 }
 
 const room = (c: Context<AppEnv>) => c.env.GAME_ROOM.getByName(c.req.param("id") ?? "");
+
+/** X-Api-Key をユーザー ID に解決する。ヘッダーが無ければ null、キーが無効なら undefined。 */
+async function resolveUser(c: Context<AppEnv>): Promise<string | null | undefined> {
+  const key = c.req.header("x-api-key");
+  if (!key) return null;
+  const row = await c.env.DB.prepare("SELECT id FROM users WHERE key_hash = ?")
+    .bind(await sha256Hex(key))
+    .first<{ id: string }>();
+  return row?.id;
+}
+
+const ApiKeyHeader = z.object({ "x-api-key": z.string().optional() });
 
 const GameInfo = z
   .object({
@@ -159,6 +171,8 @@ routes.openapi(
     description:
       "`options.turnTimeMs`（1000〜86400000）で1手の持ち時間を指定できる。省略時は5分。時間切れは負け扱い。" +
       "`options.practice: true` を付けると、開始時に空席（minPlayers まで）をサーバー側の練習相手が埋める（打ち方はゲームごと。戦績には残らない）。" +
+      "`options.autoStart: true` なら満席（maxPlayers）になった時点で自動で開始する（practice とは併用不可）。" +
+      "ルームは既定で一覧（`GET /rooms`）に載る。載せたくなければ `options.unlisted: true`（練習ルームは常に載らない）。" +
       "未知のオプションは 400。返ってくる `hostToken` は試合開始（`/rooms/{id}/start`）に必要で、作成者だけが持つ。",
     request: {
       body: {
@@ -194,6 +208,152 @@ routes.openapi(
   },
 );
 
+const RoomSummary = z
+  .object({
+    roomId: z.string(),
+    game: z.string(),
+    status: z.enum(["waiting", "playing"]),
+    players: z.number().int().describe("参加人数"),
+    maxPlayers: z.number().int(),
+    autoStart: z.boolean().describe("true なら満席になった時点で自動で始まる"),
+    turnTimeMs: z.number().int(),
+    createdAt: z.number(),
+    updatedAt: z.number(),
+  })
+  .openapi("RoomSummary");
+
+routes.openapi(
+  createRoute({
+    method: "get",
+    path: "/rooms",
+    tags: ["rooms"],
+    operationId: "listRooms",
+    summary: "公開ルームの一覧（待機中・進行中）",
+    description:
+      "`status=waiting`（既定）は空席がある待機中のルーム。最後の更新から30分を過ぎたものは出さない。" +
+      "`status=playing` は進行中のルーム（観戦用）。終了した試合は `/matches`。" +
+      "`options.unlisted` と練習ルームは載らない。一覧は索引なので古いことがある（join が `ROOM_FULL` などで失敗したら次を試す）。",
+    request: {
+      query: z.object({
+        status: z.enum(["waiting", "playing"]).default("waiting").openapi({ param: { name: "status", in: "query" } }),
+        game: z.string().optional().openapi({ param: { name: "game", in: "query" } }),
+        limit: z.coerce.number().int().min(1).max(100).default(20).openapi({ param: { name: "limit", in: "query" } }),
+      }),
+    },
+    responses: {
+      200: { description: "ルーム一覧（新しく更新された順）", content: { "application/json": { schema: z.array(RoomSummary) } } },
+      400: errors[400],
+    },
+  }),
+  async (c) => {
+    const { status, game, limit } = c.req.valid("query");
+    const rows = await c.env.DB.prepare(
+      `SELECT id, game, status, players, max_players, auto_start, turn_time_ms, created_at, updated_at
+       FROM rooms
+       WHERE status = ?1 AND (?2 IS NULL OR game = ?2)
+         AND (?1 <> 'waiting' OR (players < max_players AND updated_at > ?3))
+       ORDER BY updated_at DESC, id LIMIT ?4`,
+    )
+      .bind(status, game ?? null, Date.now() - WAITING_LIST_TTL_MS, limit)
+      .all<{
+        id: string; game: string; status: "waiting" | "playing"; players: number; max_players: number;
+        auto_start: number; turn_time_ms: number; created_at: number; updated_at: number;
+      }>();
+    return c.json(
+      rows.results.map((r) => ({
+        roomId: r.id,
+        game: r.game,
+        status: r.status,
+        players: r.players,
+        maxPlayers: r.max_players,
+        autoStart: r.auto_start === 1,
+        turnTimeMs: r.turn_time_ms,
+        createdAt: r.created_at,
+        updatedAt: r.updated_at,
+      })),
+      200,
+    );
+  },
+);
+
+/** クイックマッチで試す既存ルームの数（1回の呼び出しで DO を何度も叩かないように）。 */
+const QUICKMATCH_CANDIDATES = 5;
+
+routes.openapi(
+  createRoute({
+    method: "post",
+    path: "/quickmatch",
+    tags: ["rooms"],
+    operationId: "quickMatch",
+    summary: "クイックマッチ（空いている部屋に入る。無ければ作る）",
+    description:
+      "同じゲーム・同じ持ち時間の、自動開始（`autoStart`）の公開ルームに空席があれば参加し、無ければ `autoStart: true` のルームを作って参加する。" +
+      "満席になった時点で自動で始まるので、返ってきた `token` ですぐ WebSocket に接続して待てばよい（`status: \"waiting\"` の state が届き、揃うと `playing` になる）。" +
+      "`created` は新しくルームを作ったかどうか。`hostToken` は返さない（誰も早めに開始できない）。`X-Api-Key` を付けると戦績が紐づく。",
+    request: {
+      headers: ApiKeyHeader,
+      body: {
+        required: true,
+        content: {
+          "application/json": {
+            schema: z.object({
+              game: z.string().openapi({ example: "tictactoe" }),
+              options: z.strictObject({ turnTimeMs: turnTimeMs.optional() }).optional(),
+            }),
+          },
+        },
+      },
+    },
+    responses: {
+      201: {
+        description: "参加済み",
+        content: {
+          "application/json": {
+            schema: z.object({
+              roomId: z.string(),
+              playerId: z.string(),
+              token: z.string(),
+              created: z.boolean().describe("true なら新しく作ったルーム（相手が来るまで待つ）"),
+            }),
+          },
+        },
+      },
+      400: errors[400],
+      401: errors[401],
+    },
+  }),
+  async (c) => {
+    const body = c.req.valid("json");
+    const game = getGame(body.game);
+    if (!game) return c.json(errBody("UNKNOWN_GAME", `unknown game: ${body.game}`), 400);
+    const userId = await resolveUser(c);
+    if (userId === undefined) return c.json(errBody("UNAUTHORIZED", "invalid api key"), 401);
+    const time = body.options?.turnTimeMs ?? DEFAULT_TURN_TIME_MS;
+
+    // 古い部屋から埋める（同時に2つ作られても、次に来た人が古い方に入る）
+    const candidates = await c.env.DB.prepare(
+      `SELECT id FROM rooms
+       WHERE status = 'waiting' AND game = ? AND auto_start = 1 AND turn_time_ms = ?
+         AND players < max_players AND updated_at > ?
+       ORDER BY created_at, id LIMIT ?`,
+    )
+      .bind(game.id, time, Date.now() - WAITING_LIST_TTL_MS, QUICKMATCH_CANDIDATES)
+      .all<{ id: string }>();
+    for (const { id } of candidates.results) {
+      const r = await c.env.GAME_ROOM.getByName(id).join(userId);
+      if (r.ok) return c.json({ roomId: id, ...r.data, created: false }, 201);
+      // 索引が古い（満席・開始済み・存在しない）ので次の候補へ
+    }
+
+    const roomId = newRoomId();
+    const stub = c.env.GAME_ROOM.getByName(roomId);
+    const init = await stub.init(roomId, game.id, { autoStart: true, turnTimeMs: time });
+    if (!init.ok) return respond(c, init);
+    const r = await stub.join(userId);
+    return r.ok ? c.json({ roomId, ...r.data, created: true }, 201) : respond(c, r);
+  },
+);
+
 routes.openapi(
   createRoute({
     method: "post",
@@ -204,7 +364,7 @@ routes.openapi(
     description: "プレイヤー ID は参加順に p1, p2, ...。`X-Api-Key` を付けると戦績がそのユーザーに紐づく。",
     request: {
       params: RoomIdParam,
-      headers: z.object({ "x-api-key": z.string().optional() }),
+      headers: ApiKeyHeader,
     },
     responses: {
       201: {
@@ -217,15 +377,8 @@ routes.openapi(
     },
   }),
   async (c) => {
-    let userId: string | null = null;
-    const key = c.req.header("x-api-key");
-    if (key) {
-      const row = await c.env.DB.prepare("SELECT id FROM users WHERE key_hash = ?")
-        .bind(await sha256Hex(key))
-        .first<{ id: string }>();
-      if (!row) return c.json(errBody("UNAUTHORIZED", "invalid api key"), 401);
-      userId = row.id;
-    }
+    const userId = await resolveUser(c);
+    if (userId === undefined) return c.json(errBody("UNAUTHORIZED", "invalid api key"), 401);
     return respond(c, await room(c).join(userId), 201);
   },
 );

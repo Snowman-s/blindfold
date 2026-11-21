@@ -38,7 +38,7 @@ Durable Object「GameRoom」… 1試合 = 1インスタンス（idFromName(roomI
    ├ SQLite … メタ情報・状態スナップショット・行動ログ
    └ Alarm … 手番の持ち時間切れ処理
    ▼
-D1 … users, matches, results
+D1 … users, matches, results, rooms（一覧用の索引）
 ```
 
 ## ディレクトリ構成（予定）
@@ -105,7 +105,9 @@ export interface GameDefinition<S, A> {
 | GET | `/games` | 利用できるゲームの一覧（`summary`、`rulesUrl` 付き） |
 | GET | `/games/:id/rules` | ゲームの説明（LLM 向け）。ルール・view の読み方・action の JSON Schema・共通の遊び方。`version` を ETag にする |
 | GET | `/games/:id/rules.md` | 同じ内容を Markdown 1枚で。プロンプトにそのまま貼れる |
-| POST | `/rooms` | `{ game: string, options?: {...} }` → `{ roomId, hostToken }`。未知のオプションは 400。`options.practice: true` で開始時に空席をサーバー側の練習相手が埋める（打ち方は `practiceAction`、未定義ならランダム。D1 には記録しない） |
+| POST | `/rooms` | `{ game: string, options?: {...} }` → `{ roomId, hostToken }`。未知のオプションは 400。`options.practice: true` で開始時に空席をサーバー側の練習相手が埋める（打ち方は `practiceAction`、未定義ならランダム。D1 には記録しない）。`options.autoStart: true` で満席になったら自動開始（practice と併用不可）。`options.unlisted: true` で一覧・クイックマッチから外す |
+| GET | `/rooms` | 公開ルームの一覧。`?status=` は `waiting`（既定。空席あり・最終更新から30分以内）か `playing`。`&game=&limit=` で絞り込み。D1 の `rooms` 索引から返す（best-effort。DO が正） |
+| POST | `/quickmatch` | `{ game, options?: { turnTimeMs } }` → `{ roomId, playerId, token, created }`。同じゲーム・持ち時間の autoStart の公開ルームに古い順で入り、無ければ作る |
 | POST | `/rooms/:id/join` | → `{ playerId, token }` |
 | POST | `/rooms/:id/start` | 試合開始（作成者のみ。`hostToken` を Bearer で渡す） |
 | GET | `/rooms/:id/state` | `Authorization: Bearer <token>` があればそのプレイヤー視点、なければ観戦視点 |
@@ -153,6 +155,7 @@ export interface GameDefinition<S, A> {
 - **必ず Hibernation API を使う**（`state.acceptWebSocket()` + `webSocketMessage()` ハンドラ）。`ws.accept()` は使わない（稼働時間が課金対象になる）。
 - ポーリングを前提にした設計にしない。状態は WS のプッシュで配る。
 - Alarm は「その時点の手番の締め切り」1つだけを設定する（ターンが進むたびに上書きする）。
+- ルーム一覧は D1 の `rooms`（索引）で持つ。書くのは作成・join・開始・終了のときだけで、1手ごとには書かない。`rev` で古い書き込みの上書きを防ぐ。
 - 状態の配信は当面フルの `view` でよい。サイズが問題になったら差分配信（JSON Patch）を検討する。
 
 ## GameRoom（Durable Object）の責務
@@ -188,9 +191,10 @@ pnpm install
 pnpm dev                       # wrangler dev
 pnpm test                      # vitest
 pnpm typecheck                 # tsc --noEmit
-pnpm deploy                    # wrangler deploy
+pnpm deploy                    # wrangler deploy（先に `pnpm wrangler d1 migrations apply <DB名> --remote`。未適用だと結果の書き込みが失敗し続ける）
 pnpm wrangler d1 migrations apply <DB名> --local
 pnpm tsx bots/random-bot.ts --url http://localhost:8787 --room <roomId> [--host-token <hostToken>]
+pnpm tsx bots/random-bot.ts --url http://localhost:8787 --quickmatch tictactoe
 ```
 
 ## コーディング規約

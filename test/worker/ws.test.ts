@@ -1,0 +1,542 @@
+import { SELF, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { env } from "cloudflare:workers";
+import { afterEach, describe, expect, it } from "vitest";
+import { randomPick, runBot, type SocketLike } from "../../bots/bot-core";
+import { games } from "../../src/games/registry";
+import { replay } from "../../src/lib/replay";
+
+const BASE = "https://example.com";
+const open: WebSocket[] = [];
+afterEach(() => {
+  for (const ws of open.splice(0)) {
+    try {
+      ws.close();
+    } catch {
+      // すでに閉じている
+    }
+  }
+});
+
+async function call(
+  method: string,
+  path: string,
+  opts: { token?: string; body?: unknown; headers?: Record<string, string> } = {},
+) {
+  const res = await SELF.fetch(BASE + path, {
+    method,
+    headers: {
+      ...(opts.token ? { Authorization: `Bearer ${opts.token}` } : {}),
+      ...(opts.body !== undefined ? { "Content-Type": "application/json" } : {}),
+      ...opts.headers,
+    },
+    body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+  });
+  return { status: res.status, json: (await res.json()) as any }; // テスト内のみ
+}
+
+/** 接続直後から受信を溜める（初回の state を取りこぼさない）。bot にもそのまま渡せる。 */
+class Conn implements SocketLike {
+  msgs: any[] = [];
+  private waiters: (() => void)[] = [];
+  private listeners: ((ev: { data: unknown }) => void)[] = [];
+  constructor(readonly ws: WebSocket) {
+    ws.addEventListener("message", (e) => {
+      this.msgs.push(JSON.parse(e.data as string));
+      this.listeners.forEach((l) => l({ data: e.data }));
+      this.waiters.splice(0).forEach((w) => w());
+    });
+  }
+  send(data: string) {
+    this.ws.send(data);
+  }
+  close() {
+    this.ws.close();
+  }
+  addEventListener(type: "message" | "close", fn: any) {
+    if (type === "close") return this.ws.addEventListener("close", fn);
+    this.msgs.forEach((m) => fn({ data: JSON.stringify(m) })); // 溜めた分を再生
+    this.listeners.push(fn);
+  }
+  async next(pred: (m: any) => boolean): Promise<any> {
+    for (;;) {
+      const hit = this.msgs.find(pred);
+      if (hit) return hit;
+      await new Promise<void>((r) => this.waiters.push(r));
+    }
+  }
+}
+
+async function connect(roomId: string, token?: string): Promise<Conn> {
+  const res = await SELF.fetch(`${BASE}/rooms/${roomId}/ws${token ? `?token=${token}` : ""}`, {
+    headers: { Upgrade: "websocket" },
+  });
+  expect(res.status).toBe(101);
+  const ws = res.webSocket!;
+  ws.accept(); // クライアント側の accept（DO 側は Hibernation API）
+  open.push(ws);
+  return new Conn(ws);
+}
+const inbox = (c: Conn) => c;
+
+async function newRoom(game: string, options?: unknown) {
+  const { json } = await call("POST", "/rooms", { body: { game, options } });
+  const roomId: string = json.roomId;
+  const a = (await call("POST", `/rooms/${roomId}/join`)).json;
+  const b = (await call("POST", `/rooms/${roomId}/join`)).json;
+  return { roomId, host: json.hostToken as string, a, b };
+}
+
+const stub = (id: string) => env.GAME_ROOM.getByName(id);
+
+describe("WebSocket", () => {
+  it("アップグレード要求がなければ 426、不正トークンは 401、存在しないルームは 404", async () => {
+    const { roomId } = await newRoom("tictactoe");
+    expect((await call("GET", `/rooms/${roomId}/ws`)).status).toBe(426);
+    const bad = await SELF.fetch(`${BASE}/rooms/${roomId}/ws?token=nope`, { headers: { Upgrade: "websocket" } });
+    expect(bad.status).toBe(401);
+    const none = await SELF.fetch(`${BASE}/rooms/zzz/ws`, { headers: { Upgrade: "websocket" } });
+    expect(none.status).toBe(404);
+  });
+
+  it("接続直後に state が届き、行動すると全員にその視点の state が配信される", async () => {
+    const { roomId, host, a, b } = await newRoom("tictactoe");
+    const wa = await connect(roomId, a.token);
+    const wb = await connect(roomId, b.token);
+    const spec = await connect(roomId);
+    const ia = inbox(wa);
+    const ib = inbox(wb);
+    const is = inbox(spec);
+    expect((await ia.next((m) => m.type === "state")).status).toBe("waiting");
+
+    await call("POST", `/rooms/${roomId}/start`, { token: host });
+    const sa = await ia.next((m) => m.status === "playing");
+    const sb = await ib.next((m) => m.status === "playing");
+    await is.next((m) => m.status === "playing");
+    expect(sa.legal).toHaveLength(9); // 手番のプレイヤーにだけ legal
+    expect(sb.legal).toBeUndefined();
+    expect(sa.currentPlayers).toEqual(["p1"]);
+
+    wa.send(JSON.stringify({ type: "action", turn: 0, action: { cell: 4 } }));
+    const sb1 = await ib.next((m) => m.turn === 1);
+    expect(sb1.legal).toHaveLength(8);
+    expect((await is.next((m) => m.turn === 1)).legal).toBeUndefined();
+    expect((await ia.next((m) => m.turn === 1)).legal).toBeUndefined();
+  });
+
+  it("REST の行動も WS 接続に配信される", async () => {
+    const { roomId, host, a, b } = await newRoom("tictactoe");
+    const wb = await connect(roomId, b.token);
+    const ib = inbox(wb);
+    await call("POST", `/rooms/${roomId}/start`, { token: host });
+    await call("POST", `/rooms/${roomId}/action`, { token: a.token, body: { turn: 0, action: { cell: 0 } } });
+    const s = await ib.next((m) => m.turn === 1);
+    expect(s.legal).toHaveLength(8);
+  });
+
+  it("エラーは閉じたコード集合で返り、接続は維持される", async () => {
+    const { roomId, host, a, b } = await newRoom("tictactoe");
+    const wa = await connect(roomId, a.token);
+    const wb = await connect(roomId, b.token);
+    const spec = await connect(roomId);
+    const ia = inbox(wa);
+    const ib = inbox(wb);
+    const is = inbox(spec);
+    await call("POST", `/rooms/${roomId}/start`, { token: host });
+    await ia.next((m) => m.status === "playing");
+
+    wa.send("not json");
+    expect((await ia.next((m) => m.type === "error")).code).toBe("BAD_REQUEST");
+    wa.send(JSON.stringify({ type: "action", turn: 0, action: { cell: 99 } }));
+    expect((await ia.next((m) => m.type === "error" && m.message === "invalid action")).code).toBe("BAD_REQUEST");
+
+    wb.send(JSON.stringify({ type: "action", turn: 0, action: { cell: 0 } }));
+    expect((await ib.next((m) => m.type === "error")).code).toBe("NOT_YOUR_TURN");
+    spec.send(JSON.stringify({ type: "action", turn: 0, action: { cell: 0 } }));
+    expect((await is.next((m) => m.type === "error")).code).toBe("NOT_YOUR_TURN");
+
+    wa.send(JSON.stringify({ type: "action", turn: 5, action: { cell: 0 } }));
+    expect((await ia.next((m) => m.type === "error" && m.code === "STALE_TURN")).code).toBe("STALE_TURN");
+
+    wa.send(JSON.stringify({ type: "action", turn: 0, action: { cell: 0 } }));
+    await ib.next((m) => m.turn === 1);
+    wb.send(JSON.stringify({ type: "action", turn: 1, action: { cell: 0 } }));
+    expect((await ib.next((m) => m.type === "error" && m.code === "ILLEGAL_ACTION")).code).toBe("ILLEGAL_ACTION");
+
+    wa.send(JSON.stringify({ type: "ping" }));
+    expect((await ia.next((m) => m.type === "pong")).type).toBe("pong");
+  });
+
+  it("終了済みルームに接続すると state の後に end が届く", async () => {
+    const { roomId, host, a, b } = await newRoom("tictactoe");
+    await call("POST", `/rooms/${roomId}/start`, { token: host });
+    const moves: [typeof a, number][] = [[a, 0], [b, 3], [a, 1], [b, 4], [a, 2]];
+    for (const [i, [p, cell]] of moves.entries()) {
+      await call("POST", `/rooms/${roomId}/action`, { token: p.token, body: { turn: i, action: { cell } } });
+    }
+    const ws = await connect(roomId);
+    const inb = inbox(ws);
+    const end = await inb.next((m) => m.type === "end");
+    expect(end.winners).toEqual(["p1"]);
+  });
+});
+
+describe("Bot 同士の対戦", () => {
+  for (const game of ["tictactoe", "highcard"]) {
+    it(`${game}: 最後まで終わり、ログから再現できる`, async () => {
+      const { roomId, host, a, b } = await newRoom(game);
+      const sockA = await connect(roomId, a.token);
+      const sockB = await connect(roomId, b.token);
+            const [ra, rb] = await Promise.all([
+        runBot(sockA, {
+          pick: randomPick,
+          startWhen: {
+            players: 2,
+            start: async () => void (await call("POST", `/rooms/${roomId}/start`, { token: host })),
+          },
+        }),
+        runBot(sockB, { pick: randomPick }),
+      ]);
+      expect(ra).toEqual(rb);
+
+      const state = (await call("GET", `/rooms/${roomId}/state`)).json;
+      expect(state.status).toBe("finished");
+      expect(state.result.winners).toEqual(ra.winners);
+
+      // ログ + シードから完全に再現できる
+      const log = (await call("GET", `/rooms/${roomId}/log`)).json;
+      const r = replay(games[game]!, log);
+      expect(r.turn).toBe(state.turn);
+      expect(r.result).toEqual(state.result);
+      expect(games[game]!.view(r.state, null)).toEqual(state.view);
+
+      // リプレイ API
+      const rp = (await call("GET", `/rooms/${roomId}/replay`)).json;
+      expect(rp.frames).toHaveLength(state.turn + 1);
+      expect(rp.frames.at(-1).view).toEqual(state.view);
+      expect(rp.result).toEqual(state.result);
+    });
+  }
+
+  it("highcard: 観戦者・相手の state に隠し情報が含まれない", async () => {
+    const { roomId, host, a, b } = await newRoom("highcard");
+    await call("POST", `/rooms/${roomId}/start`, { token: host });
+    const sa = (await call("GET", `/rooms/${roomId}/state`, { token: a.token })).json;
+    const sb = (await call("GET", `/rooms/${roomId}/state`, { token: b.token })).json;
+    const ss = (await call("GET", `/rooms/${roomId}/state`)).json;
+    expect(sa.view.hand).toHaveLength(5);
+    expect(sb.view.hand).toHaveLength(5);
+    expect(ss.view.hand).toBeUndefined();
+    expect(sa.legal).toHaveLength(5);
+    await call("POST", `/rooms/${roomId}/action`, { token: a.token, body: { turn: 0, action: sa.legal[0] } });
+    const ss2 = (await call("GET", `/rooms/${roomId}/state`)).json;
+    expect(ss2.view.hasPlayed).toEqual({ p1: true, p2: false });
+    expect(JSON.stringify(ss2.view)).not.toContain(`"myPlayed"`);
+    expect(ss2.currentPlayers).toEqual(["p2"]);
+  });
+});
+
+describe("持ち時間（Alarm）", () => {
+  it("state に deadline が入る。不正な turnTimeMs は 400", async () => {
+    expect((await call("POST", "/rooms", { body: { game: "tictactoe", options: { turnTimeMs: 5 } } })).status).toBe(400);
+    const { roomId, host, a } = await newRoom("tictactoe", { turnTimeMs: 30_000 });
+    expect((await call("GET", `/rooms/${roomId}/state`)).json.deadline).toBeNull();
+    const t0 = Date.now();
+    const s = (await call("POST", `/rooms/${roomId}/start`, { token: host })).json;
+    expect(s.deadline).toBeGreaterThanOrEqual(t0 + 30_000);
+    expect(s.deadline).toBeLessThan(t0 + 40_000);
+  });
+
+  it("締め切り前に alarm が誤発火しても何も起きない", async () => {
+    const { roomId, host, a } = await newRoom("tictactoe");
+    await call("POST", `/rooms/${roomId}/start`, { token: host });
+    await runDurableObjectAlarm(stub(roomId));
+    expect((await call("GET", `/rooms/${roomId}/state`)).json.status).toBe("playing");
+  });
+
+  async function expire(roomId: string) {
+    await runInDurableObject(stub(roomId), (_i, state) => {
+      state.storage.sql.exec("UPDATE meta SET value = ? WHERE key = 'deadline'", String(Date.now() - 1));
+    });
+    expect(await runDurableObjectAlarm(stub(roomId))).toBe(true);
+  }
+
+  it("手番のプレイヤーが時間切れで負け。WS に end が届き、ログから再現できる", async () => {
+    const { roomId, host, a, b } = await newRoom("tictactoe");
+    const wb = await connect(roomId, b.token);
+    const ib = inbox(wb);
+    await call("POST", `/rooms/${roomId}/start`, { token: host });
+    await call("POST", `/rooms/${roomId}/action`, { token: a.token, body: { turn: 0, action: { cell: 0 } } });
+    await expire(roomId); // p2 の手番で時間切れ
+
+    const end = await ib.next((m) => m.type === "end");
+    expect(end.winners).toEqual(["p1"]);
+    const state = (await call("GET", `/rooms/${roomId}/state`)).json;
+    expect(state).toMatchObject({ status: "finished", deadline: null, turn: 2 });
+    expect(state.result.winners).toEqual(["p1"]);
+    expect(
+      (await call("POST", `/rooms/${roomId}/action`, { token: b.token, body: { turn: 2, action: { cell: 1 } } })).status,
+    ).toBe(409);
+
+    const log = (await call("GET", `/rooms/${roomId}/log`)).json;
+    expect(log.actions[1]).toMatchObject({ turn: 1, player: null, timeout: ["p2"] });
+    const r = replay(games["tictactoe"]!, log);
+    expect(r.result).toEqual(state.result);
+    expect(r.turn).toBe(2);
+    const rp = (await call("GET", `/rooms/${roomId}/replay`)).json;
+    expect(rp.result).toEqual(state.result);
+  });
+
+  it("同時手番では、まだ出していないプレイヤーだけが負ける", async () => {
+    const { roomId, host, a } = await newRoom("highcard");
+    await call("POST", `/rooms/${roomId}/start`, { token: host });
+    const sa = (await call("GET", `/rooms/${roomId}/state`, { token: a.token })).json;
+    await call("POST", `/rooms/${roomId}/action`, { token: a.token, body: { turn: 0, action: sa.legal[0] } });
+    await expire(roomId);
+    const state = (await call("GET", `/rooms/${roomId}/state`)).json;
+    expect(state.status).toBe("finished");
+    expect(state.result.winners).toEqual(["p1"]);
+  });
+
+  it("時間切れは D1 に reason=timeout で記録される", async () => {
+    const { roomId, host, a } = await newRoom("tictactoe");
+    await call("POST", `/rooms/${roomId}/start`, { token: host });
+    await expire(roomId);
+    const m = await env.DB.prepare("SELECT reason FROM matches WHERE id = ?").bind(roomId).first<{ reason: string }>();
+    expect(m?.reason).toBe("timeout");
+  });
+
+  it("全員が時間切れなら引き分けではなく全員の負けとして記録される", async () => {
+    const { roomId, host } = await newRoom("highcard");
+    await call("POST", `/rooms/${roomId}/start`, { token: host });
+    await expire(roomId); // 誰も出さずに時間切れ
+    const state = (await call("GET", `/rooms/${roomId}/state`)).json;
+    expect(state.status).toBe("finished");
+    expect(state.result.winners).toEqual([]);
+    const rows = await env.DB.prepare("SELECT player_id, outcome FROM results WHERE match_id = ? ORDER BY player_id")
+      .bind(roomId)
+      .all<{ player_id: string; outcome: string }>();
+    expect(rows.results).toEqual([
+      { player_id: "p1", outcome: "loss" },
+      { player_id: "p2", outcome: "loss" },
+    ]);
+  });
+
+  it("同時手番で片方が出しても締め切りは延びない", async () => {
+    const { roomId, host, a, b } = await newRoom("highcard", { turnTimeMs: 60_000 });
+    const s0 = (await call("POST", `/rooms/${roomId}/start`, { token: host })).json;
+    // 締め切りを過去寄りにずらしておき、行動後に延長されていないことを確かめる
+    const d0 = s0.deadline - 30_000;
+    await runInDurableObject(stub(roomId), (_i, state) => {
+      state.storage.sql.exec("UPDATE meta SET value = ? WHERE key = 'deadline'", String(d0));
+    });
+    const sa = (await call("GET", `/rooms/${roomId}/state`, { token: a.token })).json;
+    const s1 = (await call("POST", `/rooms/${roomId}/action`, { token: a.token, body: { turn: 0, action: sa.legal[0] } }))
+      .json;
+    expect(s1.currentPlayers).toEqual(["p2"]);
+    expect(s1.deadline).toBe(d0);
+    expect(await runInDurableObject(stub(roomId), (_i, state) => state.storage.getAlarm())).toBe(d0);
+
+    // 両者が出して次のラウンドに入ったら持ち時間はリセットされる
+    const sb = (await call("GET", `/rooms/${roomId}/state`, { token: b.token })).json;
+    const s2 = (await call("POST", `/rooms/${roomId}/action`, { token: b.token, body: { turn: 1, action: sb.legal[0] } }))
+      .json;
+    expect(s2.currentPlayers).toEqual(["p1", "p2"]);
+    expect(s2.deadline).toBeGreaterThan(d0);
+  });
+
+  /** DO インスタンスの ctx.storage.setAlarm を、最初の n 回だけ失敗させる。 */
+  async function failSetAlarm(roomId: string, n: number) {
+    await runInDurableObject(stub(roomId), (i) => {
+      const inst = i as unknown as { ctx: DurableObjectState; __realCtx?: DurableObjectState };
+      inst.__realCtx ??= inst.ctx; // 二度目以降も元の ctx から包み直す
+      const real = inst.__realCtx;
+      let left = n;
+      const storage = new Proxy(real.storage, {
+        get(target, prop) {
+          if (prop === "setAlarm") {
+            return (at: number) => (left-- > 0 ? Promise.reject(new Error("setAlarm down")) : target.setAlarm(at));
+          }
+          const v = Reflect.get(target, prop, target);
+          return typeof v === "function" ? v.bind(target) : v;
+        },
+      });
+      const ctx = new Proxy(real, {
+        get(target, prop) {
+          if (prop === "storage") return storage;
+          const v = Reflect.get(target, prop, target);
+          return typeof v === "function" ? v.bind(target) : v;
+        },
+      });
+      Object.defineProperty(inst, "ctx", { value: ctx, configurable: true });
+    });
+  }
+  const alarmOf = (roomId: string) => runInDurableObject(stub(roomId), (_i, state) => state.storage.getAlarm());
+
+  it("setAlarm が一時的に失敗しても、その場の再試行で締め切りが張られる", async () => {
+    const { roomId, host, a } = await newRoom("tictactoe");
+    await call("POST", `/rooms/${roomId}/start`, { token: host });
+    await failSetAlarm(roomId, 2);
+    const r = await call("POST", `/rooms/${roomId}/action`, { token: a.token, body: { turn: 0, action: { cell: 0 } } });
+    expect(r.status).toBe(200);
+    expect(await alarmOf(roomId)).toBe(r.json.deadline);
+  });
+
+  it("setAlarm が失敗し続けても行動は成功し、次のアクセスで締め切りが張り直される", async () => {
+    const { roomId, host, a } = await newRoom("tictactoe");
+    await call("POST", `/rooms/${roomId}/start`, { token: host });
+    await failSetAlarm(roomId, 100);
+    await runInDurableObject(stub(roomId), (_i, state) => state.storage.deleteAlarm());
+    const r = await call("POST", `/rooms/${roomId}/action`, { token: a.token, body: { turn: 0, action: { cell: 0 } } });
+    expect(r.status).toBe(200); // 確定済みの行動は成功として返る
+    expect(r.json.turn).toBe(1);
+    expect(await alarmOf(roomId)).toBeNull();
+
+    await failSetAlarm(roomId, 0); // 復旧
+    const s = (await call("GET", `/rooms/${roomId}/state`)).json; // 観戦者のアクセスでも直る
+    expect(await alarmOf(roomId)).toBe(s.deadline);
+  });
+
+  it("D1 への書き込みが失敗したら alarm で再試行する", async () => {
+    const { roomId, host, a, b } = await newRoom("tictactoe");
+    let realDb: D1Database | null = null;
+    await runInDurableObject(stub(roomId), (i) => {
+      const inst = i as unknown as { env: Env };
+      realDb = inst.env.DB;
+      const broken = { batch: () => Promise.reject(new Error("D1 down")) } as unknown as D1Database;
+      inst.env = { ...inst.env, DB: broken };
+    });
+    await call("POST", `/rooms/${roomId}/start`, { token: host });
+    const moves: [any, number][] = [[a, 0], [b, 3], [a, 1], [b, 4], [a, 2]];
+    for (const [i, [p, cell]] of moves.entries()) {
+      await call("POST", `/rooms/${roomId}/action`, { token: p.token, body: { turn: i, action: { cell } } });
+    }
+    expect((await call("GET", `/rooms/${roomId}/state`)).json.status).toBe("finished");
+    const count = async () =>
+      (await env.DB.prepare("SELECT COUNT(*) AS n FROM matches WHERE id = ?").bind(roomId).first<{ n: number }>())!.n;
+    expect(await count()).toBe(0);
+
+    // 再試行用の alarm が予約されている。D1 を戻して発火させると書き込まれる
+    await runInDurableObject(stub(roomId), async (i, state) => {
+      expect(await state.storage.getAlarm()).not.toBeNull();
+      const inst = i as unknown as { env: Env };
+      inst.env = { ...inst.env, DB: realDb! };
+    });
+    expect(await runDurableObjectAlarm(stub(roomId))).toBe(true);
+    expect(await count()).toBe(1);
+  });
+});
+
+describe("ルームの存在確認・入力の制限", () => {
+  it("存在しないルームへのアクセスでは DO にテーブルが作られない", async () => {
+    const id = "ghost-room-for-test";
+    expect((await call("GET", `/rooms/${id}/state`)).status).toBe(404);
+    expect((await call("POST", `/rooms/${id}/join`)).status).toBe(404);
+    const tables = await runInDurableObject(stub(id), (_i, state) =>
+      state.storage.sql
+        .exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE '_cf_%'")
+        .toArray()
+        .map((r) => r.name),
+    );
+    expect(tables).toEqual([]);
+  });
+
+  it("未知のオプションは 400", async () => {
+    const r = await call("POST", "/rooms", { body: { game: "tictactoe", options: { junk: "x".repeat(1000) } } });
+    expect(r.status).toBe(400);
+  });
+
+  it("WS も REST と同じく Bearer を ?token= より優先する", async () => {
+    const { roomId, host, a, b } = await newRoom("tictactoe");
+    await call("POST", `/rooms/${roomId}/start`, { token: host });
+    const res = await SELF.fetch(`${BASE}/rooms/${roomId}/ws?token=${a.token}`, {
+      headers: { Upgrade: "websocket", Authorization: `Bearer ${b.token}` },
+    });
+    expect(res.status).toBe(101);
+    const ws = res.webSocket!;
+    ws.accept();
+    open.push(ws);
+    const s = await new Conn(ws).next((m) => m.type === "state");
+    expect(s.currentPlayers).toEqual(["p1"]);
+    expect(s.legal).toBeUndefined(); // p2 として接続している
+  });
+});
+
+describe("D1（users / matches / results）", () => {
+  async function playOut(roomId: string, host: string, a: any, b: any) {
+    await call("POST", `/rooms/${roomId}/start`, { token: host });
+    const moves: [any, number][] = [[a, 0], [b, 3], [a, 1], [b, 4], [a, 2]];
+    for (const [i, [p, cell]] of moves.entries()) {
+      await call("POST", `/rooms/${roomId}/action`, { token: p.token, body: { turn: i, action: { cell } } });
+    }
+  }
+
+  it("ユーザー登録 → 参加 → 終了で戦績が付く。API キーはハッシュで保存", async () => {
+    const u = await call("POST", "/users", { body: { name: "alice" } });
+    expect(u.status).toBe(201);
+    const stored = await env.DB.prepare("SELECT key_hash FROM users WHERE id = ?")
+      .bind(u.json.userId)
+      .first<{ key_hash: string }>();
+    expect(stored!.key_hash).not.toContain(u.json.apiKey);
+
+    const { json } = await call("POST", "/rooms", { body: { game: "tictactoe" } });
+    const roomId = json.roomId;
+    const host: string = json.hostToken;
+    const a = (await call("POST", `/rooms/${roomId}/join`, { headers: { "X-Api-Key": u.json.apiKey } })).json;
+    const b = (await call("POST", `/rooms/${roomId}/join`)).json;
+    expect((await call("POST", `/rooms/${roomId}/join`, { headers: { "X-Api-Key": "bad" } })).status).toBe(401);
+    await playOut(roomId, host, a, b);
+
+    const user = await call("GET", `/users/${u.json.userId}`);
+    expect(user.json.stats).toEqual({ played: 1, wins: 1, losses: 0, draws: 0 });
+    expect((await call("GET", "/users/nope")).status).toBe(404);
+
+    const list = (await call("GET", "/matches?game=tictactoe&limit=5")).json;
+    const m = list.find((x: any) => x.id === roomId);
+    expect(m.reason).toBe("normal");
+    expect(m.results).toEqual([
+      { playerId: "p1", userId: u.json.userId, outcome: "win", score: 1 },
+      { playerId: "p2", userId: null, outcome: "loss", score: 0 },
+    ]);
+    expect((await call("GET", "/matches?limit=0")).status).toBe(400);
+  });
+
+  it("結果の書き込みは冪等（同じ試合を二重に書いても1行）", async () => {
+    const { roomId, host, a, b } = await newRoom("tictactoe");
+    await playOut(roomId, host, a, b);
+    // persistResult を直接もう一度呼んでも、D1 には1試合分しか入らない
+    const inst = stub(roomId) as unknown as { persistResult: (g: unknown, r: unknown) => Promise<void> };
+    await runInDurableObject(stub(roomId) as DurableObjectStub, async (i: unknown) => {
+      await (i as typeof inst).persistResult(games["tictactoe"]!, { winners: ["p1"] });
+    });
+    const n = await env.DB.prepare("SELECT COUNT(*) AS n FROM results WHERE match_id = ?")
+      .bind(roomId)
+      .first<{ n: number }>();
+    expect(n!.n).toBe(2);
+  });
+});
+
+describe("OpenAPI", () => {
+  it("/docs は HTML で openapi.json を参照する", async () => {
+    const res = await SELF.fetch(BASE + "/docs");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/html");
+    expect(await res.text()).toContain("/openapi.json");
+  });
+
+  it("/openapi.json に主要パスが含まれる", async () => {
+    const r = await call("GET", "/openapi.json");
+    expect(r.status).toBe(200);
+    expect(r.json.openapi).toBe("3.1.0");
+    const paths = Object.keys(r.json.paths);
+    for (const p of [
+      "/games", "/rooms", "/rooms/{id}/join", "/rooms/{id}/start", "/rooms/{id}/state", "/rooms/{id}/action",
+      "/rooms/{id}/log", "/rooms/{id}/replay", "/rooms/{id}/ws", "/users", "/matches",
+    ]) {
+      expect(paths).toContain(p);
+    }
+    expect(r.json.paths["/rooms/{id}/ws"].get.responses["426"].description).toContain("UPGRADE_REQUIRED");
+    expect(r.json.paths["/rooms"].post.responses["201"].content["application/json"].schema.properties).toHaveProperty(
+      "hostToken",
+    );
+  });
+});

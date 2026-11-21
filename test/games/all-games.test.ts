@@ -4,6 +4,7 @@ import { highcard, ROUNDS } from "../../src/games/highcard";
 import { GameError } from "../../src/games/types";
 import { createRng, rngForTurn } from "../../src/lib/rng";
 import { gameRules, rulesMarkdown } from "../../src/lib/rules";
+import { practiceAction } from "../../src/lib/practice";
 import { applyTimeout, replay, type LogEntry } from "../../src/lib/replay";
 
 const PLAYERS = ["p1", "p2"];
@@ -39,6 +40,22 @@ describe.each(Object.keys(games))("%s", (gameId) => {
       const res = game.result(state);
       expect(res).not.toBeNull();
       expect(game.currentPlayers(state)).toEqual([]);
+    }
+  });
+
+  it("練習相手どうしで 100 試合が例外なく、合法手だけで決着する", () => {
+    for (let seed = 0; seed < 100; seed++) {
+      const r = createRng(`practice:${seed}`);
+      let state = game.init(PLAYERS, String(seed));
+      let turn = 0;
+      while (game.result(state) === null) {
+        const pid = game.currentPlayers(state)[0]!;
+        const pick = practiceAction(game, state, pid, r);
+        expect(pick).toBeDefined();
+        expect(game.legalActions(state, pid)).toContainEqual(pick!.action);
+        state = game.apply(state, pid, pick!.action, rngForTurn(String(seed), turn));
+        expect(++turn).toBeLessThan(1000);
+      }
     }
   });
 

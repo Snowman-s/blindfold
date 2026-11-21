@@ -1,7 +1,5 @@
-import type { GameDefinition, GameResult } from "../games/types";
+import type { AnyGame, GameResult } from "../games/types";
 import { rngForTurn, type Seed } from "./rng";
-
-type AnyGame = GameDefinition<unknown, unknown>;
 
 /** 行動ログの1行。timeout があれば持ち時間切れ（player / action は無視）。 */
 export interface LogEntry {
@@ -46,8 +44,11 @@ export interface Frame {
   state: unknown;
 }
 
-/** 初期シード + 行動ログから、各ターンの状態を再現する。frames[i] は turn=i の状態。 */
-export function replayFrames(game: AnyGame, log: ReplayLog): { frames: Frame[]; forfeit: GameResult | null } {
+/**
+ * 初期シード + 行動ログから、各ターンの状態を再現する。frames[i] は turn=i の状態。
+ * result はゲーム自身の結果、なければ時間切れによる決着（forfeit）。
+ */
+export function replayFrames(game: AnyGame, log: ReplayLog): { frames: Frame[]; result: GameResult | null } {
   let state = game.init(log.players, log.seed);
   let forfeit: GameResult | null = null;
   const frames: Frame[] = [{ turn: 0, state }];
@@ -62,11 +63,11 @@ export function replayFrames(game: AnyGame, log: ReplayLog): { frames: Frame[]; 
     }
     frames.push({ turn: e.turn + 1, state });
   }
-  return { frames, forfeit };
+  return { frames, result: game.result(state) ?? forfeit };
 }
 
 export function replay(game: AnyGame, log: ReplayLog) {
-  const { frames, forfeit } = replayFrames(game, log);
+  const { frames, result } = replayFrames(game, log);
   const last = frames[frames.length - 1]!;
-  return { state: last.state, turn: last.turn, result: game.result(last.state) ?? forfeit };
+  return { state: last.state, turn: last.turn, result };
 }

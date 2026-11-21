@@ -3,9 +3,9 @@ import { env } from "cloudflare:workers";
 import { afterEach, describe, expect, it } from "vitest";
 import { randomPick, runBot, type SocketLike } from "../../bots/bot-core";
 import { games } from "../../src/games/registry";
+import { WS_PROTOCOL, WS_TOKEN_PROTOCOL_PREFIX } from "../../src/lib/auth";
 import { replay } from "../../src/lib/replay";
-
-const BASE = "https://example.com";
+import { BASE, call, newRoom, playOut } from "./helpers";
 const open: WebSocket[] = [];
 afterEach(() => {
   for (const ws of open.splice(0)) {
@@ -16,23 +16,6 @@ afterEach(() => {
     }
   }
 });
-
-async function call(
-  method: string,
-  path: string,
-  opts: { token?: string; body?: unknown; headers?: Record<string, string> } = {},
-) {
-  const res = await SELF.fetch(BASE + path, {
-    method,
-    headers: {
-      ...(opts.token ? { Authorization: `Bearer ${opts.token}` } : {}),
-      ...(opts.body !== undefined ? { "Content-Type": "application/json" } : {}),
-      ...opts.headers,
-    },
-    body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
-  });
-  return { status: res.status, json: (await res.json()) as any }; // テスト内のみ
-}
 
 /** 接続直後から受信を溜める（初回の state を取りこぼさない）。bot にもそのまま渡せる。 */
 class Conn implements SocketLike {
@@ -69,29 +52,26 @@ class Conn implements SocketLike {
 /** ブラウザと同じく、トークンはサブプロトコルで渡す。 */
 const wsHeaders = (token?: string): Record<string, string> => ({
   Upgrade: "websocket",
-  ...(token ? { "Sec-WebSocket-Protocol": `apigames, apigames.token.${token}` } : {}),
+  ...(token ? { "Sec-WebSocket-Protocol": `${WS_PROTOCOL}, ${WS_TOKEN_PROTOCOL_PREFIX}${token}` } : {}),
 });
 
 async function connect(roomId: string, token?: string): Promise<Conn> {
   const res = await SELF.fetch(`${BASE}/rooms/${roomId}/ws`, { headers: wsHeaders(token) });
   expect(res.status).toBe(101);
-  if (token) expect(res.headers.get("Sec-WebSocket-Protocol")).toBe("apigames"); // トークンは応答に載せない
+  if (token) expect(res.headers.get("Sec-WebSocket-Protocol")).toBe(WS_PROTOCOL); // トークンは応答に載せない
   const ws = res.webSocket!;
   ws.accept(); // クライアント側の accept（DO 側は Hibernation API）
   open.push(ws);
   return new Conn(ws);
 }
-const inbox = (c: Conn) => c;
-
-async function newRoom(game: string, options?: unknown) {
-  const { json } = await call("POST", "/rooms", { body: { game, options } });
-  const roomId: string = json.roomId;
-  const a = (await call("POST", `/rooms/${roomId}/join`)).json;
-  const b = (await call("POST", `/rooms/${roomId}/join`)).json;
-  return { roomId, host: json.hostToken as string, a, b };
-}
-
 const stub = (id: string) => env.GAME_ROOM.getByName(id);
+
+/** 締め切りだけ過去にずらす（alarm は発火させない = 発火が遅れている状況）。 */
+async function pastDeadline(roomId: string) {
+  await runInDurableObject(stub(roomId), (_i, state) => {
+    state.storage.sql.exec("UPDATE meta SET value = ? WHERE key = 'deadline'", String(Date.now() - 1));
+  });
+}
 
 describe("WebSocket", () => {
   it("アップグレード要求がなければ 426、不正トークンは 401、存在しないルームは 404", async () => {
@@ -108,33 +88,29 @@ describe("WebSocket", () => {
     const wa = await connect(roomId, a.token);
     const wb = await connect(roomId, b.token);
     const spec = await connect(roomId);
-    const ia = inbox(wa);
-    const ib = inbox(wb);
-    const is = inbox(spec);
-    expect((await ia.next((m) => m.type === "state")).status).toBe("waiting");
+    expect((await wa.next((m) => m.type === "state")).status).toBe("waiting");
 
     await call("POST", `/rooms/${roomId}/start`, { token: host });
-    const sa = await ia.next((m) => m.status === "playing");
-    const sb = await ib.next((m) => m.status === "playing");
-    await is.next((m) => m.status === "playing");
+    const sa = await wa.next((m) => m.status === "playing");
+    const sb = await wb.next((m) => m.status === "playing");
+    await spec.next((m) => m.status === "playing");
     expect(sa.legal).toHaveLength(9); // 手番のプレイヤーにだけ legal
     expect(sb.legal).toBeUndefined();
     expect(sa.currentPlayers).toEqual(["p1"]);
 
     wa.send(JSON.stringify({ type: "action", turn: 0, action: { cell: 4 } }));
-    const sb1 = await ib.next((m) => m.turn === 1);
+    const sb1 = await wb.next((m) => m.turn === 1);
     expect(sb1.legal).toHaveLength(8);
-    expect((await is.next((m) => m.turn === 1)).legal).toBeUndefined();
-    expect((await ia.next((m) => m.turn === 1)).legal).toBeUndefined();
+    expect((await spec.next((m) => m.turn === 1)).legal).toBeUndefined();
+    expect((await wa.next((m) => m.turn === 1)).legal).toBeUndefined();
   });
 
   it("REST の行動も WS 接続に配信される", async () => {
     const { roomId, host, a, b } = await newRoom("tictactoe");
     const wb = await connect(roomId, b.token);
-    const ib = inbox(wb);
     await call("POST", `/rooms/${roomId}/start`, { token: host });
     await call("POST", `/rooms/${roomId}/action`, { token: a.token, body: { turn: 0, action: { cell: 0 } } });
-    const s = await ib.next((m) => m.turn === 1);
+    const s = await wb.next((m) => m.turn === 1);
     expect(s.legal).toHaveLength(8);
   });
 
@@ -143,44 +119,36 @@ describe("WebSocket", () => {
     const wa = await connect(roomId, a.token);
     const wb = await connect(roomId, b.token);
     const spec = await connect(roomId);
-    const ia = inbox(wa);
-    const ib = inbox(wb);
-    const is = inbox(spec);
     await call("POST", `/rooms/${roomId}/start`, { token: host });
-    await ia.next((m) => m.status === "playing");
+    await wa.next((m) => m.status === "playing");
 
     wa.send("not json");
-    expect((await ia.next((m) => m.type === "error")).code).toBe("BAD_REQUEST");
+    expect((await wa.next((m) => m.type === "error")).code).toBe("BAD_REQUEST");
     wa.send(JSON.stringify({ type: "action", turn: 0, action: { cell: 99 } }));
-    expect((await ia.next((m) => m.type === "error" && m.message === "invalid action")).code).toBe("BAD_REQUEST");
+    expect((await wa.next((m) => m.type === "error" && m.message === "invalid action")).code).toBe("BAD_REQUEST");
 
     wb.send(JSON.stringify({ type: "action", turn: 0, action: { cell: 0 } }));
-    expect((await ib.next((m) => m.type === "error")).code).toBe("NOT_YOUR_TURN");
+    expect((await wb.next((m) => m.type === "error")).code).toBe("NOT_YOUR_TURN");
     spec.send(JSON.stringify({ type: "action", turn: 0, action: { cell: 0 } }));
-    expect((await is.next((m) => m.type === "error")).code).toBe("NOT_YOUR_TURN");
+    expect((await spec.next((m) => m.type === "error")).code).toBe("NOT_YOUR_TURN");
 
     wa.send(JSON.stringify({ type: "action", turn: 5, action: { cell: 0 } }));
-    expect((await ia.next((m) => m.type === "error" && m.code === "STALE_TURN")).code).toBe("STALE_TURN");
+    expect((await wa.next((m) => m.type === "error" && m.code === "STALE_TURN")).code).toBe("STALE_TURN");
 
     wa.send(JSON.stringify({ type: "action", turn: 0, action: { cell: 0 } }));
-    await ib.next((m) => m.turn === 1);
+    await wb.next((m) => m.turn === 1);
     wb.send(JSON.stringify({ type: "action", turn: 1, action: { cell: 0 } }));
-    expect((await ib.next((m) => m.type === "error" && m.code === "ILLEGAL_ACTION")).code).toBe("ILLEGAL_ACTION");
+    expect((await wb.next((m) => m.type === "error" && m.code === "ILLEGAL_ACTION")).code).toBe("ILLEGAL_ACTION");
 
     wa.send(JSON.stringify({ type: "ping" }));
-    expect((await ia.next((m) => m.type === "pong")).type).toBe("pong");
+    expect((await wa.next((m) => m.type === "pong")).type).toBe("pong");
   });
 
   it("終了済みルームに接続すると state の後に end が届く", async () => {
     const { roomId, host, a, b } = await newRoom("tictactoe");
-    await call("POST", `/rooms/${roomId}/start`, { token: host });
-    const moves: [typeof a, number][] = [[a, 0], [b, 3], [a, 1], [b, 4], [a, 2]];
-    for (const [i, [p, cell]] of moves.entries()) {
-      await call("POST", `/rooms/${roomId}/action`, { token: p.token, body: { turn: i, action: { cell } } });
-    }
+    await playOut(roomId, host, a, b);
     const ws = await connect(roomId);
-    const inb = inbox(ws);
-    const end = await inb.next((m) => m.type === "end");
+    const end = await ws.next((m) => m.type === "end");
     expect(end.winners).toEqual(["p1"]);
   });
 });
@@ -240,6 +208,77 @@ describe("Bot 同士の対戦", () => {
   });
 });
 
+describe("練習相手（options.practice）", () => {
+  for (const game of ["tictactoe", "highcard"]) {
+    it(`${game}: 1人で参加すると空席を 練習相手が埋め、最後まで遊べる。戦績には残らない`, async () => {
+      const { json } = await call("POST", "/rooms", { body: { game, options: { practice: true } } });
+      const roomId: string = json.roomId;
+      const a = (await call("POST", `/rooms/${roomId}/join`)).json;
+      expect(a.playerId).toBe("p1");
+      const sock = await connect(roomId, a.token);
+      const end = await runBot(sock, {
+        pick: randomPick,
+        startWhen: {
+          players: 1,
+          start: async () => void (await call("POST", `/rooms/${roomId}/start`, { token: json.hostToken })),
+        },
+      });
+
+      const state = (await call("GET", `/rooms/${roomId}/state`)).json;
+      expect(state.status).toBe("finished");
+      expect(state.players).toEqual(["p1", "p2"]);
+      expect(state.result.winners).toEqual(end.winners);
+
+      // Bot の手もログに入り、シード + ログから再現できる
+      const log = (await call("GET", `/rooms/${roomId}/log`)).json;
+      expect(log.actions.some((e: any) => e.player === "p2")).toBe(true);
+      const r = replay(games[game]!, log);
+      expect(r.result).toEqual(state.result);
+
+      const m = await env.DB.prepare("SELECT COUNT(*) AS n FROM matches WHERE id = ?").bind(roomId).first<{ n: number }>();
+      expect(m!.n).toBe(0);
+    });
+  }
+
+  it("誰も参加しなくても開始でき、Bot 同士で決着する", async () => {
+    const { json } = await call("POST", "/rooms", { body: { game: "tictactoe", options: { practice: true } } });
+    const s = await call("POST", `/rooms/${json.roomId}/start`, { token: json.hostToken });
+    expect(s.status).toBe(200);
+    expect(s.json.status).toBe("finished");
+  });
+
+  it("1回で打つ手数の上限に達したら、続きは alarm で打つ", async () => {
+    const { json } = await call("POST", "/rooms", { body: { game: "tictactoe", options: { practice: true } } });
+    const roomId: string = json.roomId;
+    await runInDurableObject(stub(roomId) as DurableObjectStub, async (i: unknown) => {
+      (i as { botStepsPerCall: number }).botStepsPerCall = 2;
+    });
+    // 開始のリクエストでは2手だけ打って返る
+    const started = (await call("POST", `/rooms/${roomId}/start`, { token: json.hostToken })).json;
+    expect(started.status).toBe("playing");
+    expect(started.turn).toBe(2);
+    // 続きは alarm で打たれ、決着まで進む（テスト環境では alarm が自動で発火することもある）
+    let st = started;
+    for (let n = 0; st.status === "playing"; n++) {
+      expect(n).toBeLessThan(20);
+      await runDurableObjectAlarm(stub(roomId));
+      st = (await call("GET", `/rooms/${roomId}/state`)).json;
+    }
+    expect(st.status).toBe("finished");
+    expect(st.turn).toBeGreaterThan(2);
+  });
+
+  it("人数が揃っていれば Bot は入らない。practice に真偽値以外は 400", async () => {
+    const { roomId, host, a } = await newRoom("tictactoe", { practice: true });
+    await call("POST", `/rooms/${roomId}/start`, { token: host });
+    const st = (await call("GET", `/rooms/${roomId}/state`, { token: a.token })).json;
+    expect(st.status).toBe("playing");
+    expect(st.turn).toBe(0);
+    expect(st.legal).toHaveLength(9);
+    expect((await call("POST", "/rooms", { body: { game: "tictactoe", options: { practice: "random" } } })).status).toBe(400);
+  });
+});
+
 describe("持ち時間（Alarm）", () => {
   it("state に deadline が入る。不正な turnTimeMs は 400", async () => {
     expect((await call("POST", "/rooms", { body: { game: "tictactoe", options: { turnTimeMs: 5 } } })).status).toBe(400);
@@ -258,22 +297,20 @@ describe("持ち時間（Alarm）", () => {
     expect((await call("GET", `/rooms/${roomId}/state`)).json.status).toBe("playing");
   });
 
+  /** 締め切りを過去にずらして alarm を発火させる。 */
   async function expire(roomId: string) {
-    await runInDurableObject(stub(roomId), (_i, state) => {
-      state.storage.sql.exec("UPDATE meta SET value = ? WHERE key = 'deadline'", String(Date.now() - 1));
-    });
+    await pastDeadline(roomId);
     expect(await runDurableObjectAlarm(stub(roomId))).toBe(true);
   }
 
   it("手番のプレイヤーが時間切れで負け。WS に end が届き、ログから再現できる", async () => {
     const { roomId, host, a, b } = await newRoom("tictactoe");
     const wb = await connect(roomId, b.token);
-    const ib = inbox(wb);
     await call("POST", `/rooms/${roomId}/start`, { token: host });
     await call("POST", `/rooms/${roomId}/action`, { token: a.token, body: { turn: 0, action: { cell: 0 } } });
     await expire(roomId); // p2 の手番で時間切れ
 
-    const end = await ib.next((m) => m.type === "end");
+    const end = await wb.next((m) => m.type === "end");
     expect(end.winners).toEqual(["p1"]);
     const state = (await call("GET", `/rooms/${roomId}/state`)).json;
     expect(state).toMatchObject({ status: "finished", deadline: null, turn: 2 });
@@ -348,13 +385,6 @@ describe("持ち時間（Alarm）", () => {
     expect(s2.currentPlayers).toEqual(["p1", "p2"]);
     expect(s2.deadline).toBeGreaterThan(d0);
   });
-
-  /** 締め切りだけ過去にずらす（alarm は発火させない = 発火が遅れている状況）。 */
-  async function pastDeadline(roomId: string) {
-    await runInDurableObject(stub(roomId), (_i, state) => {
-      state.storage.sql.exec("UPDATE meta SET value = ? WHERE key = 'deadline'", String(Date.now() - 1));
-    });
-  }
 
   it("締め切り後に届いた REST の行動は拒否され、その場で時間切れが確定する", async () => {
     const { roomId, host, a } = await newRoom("tictactoe");
@@ -464,11 +494,7 @@ describe("持ち時間（Alarm）", () => {
       const broken = { batch: () => Promise.reject(new Error("D1 down")) } as unknown as D1Database;
       inst.env = { ...inst.env, DB: broken };
     });
-    await call("POST", `/rooms/${roomId}/start`, { token: host });
-    const moves: [any, number][] = [[a, 0], [b, 3], [a, 1], [b, 4], [a, 2]];
-    for (const [i, [p, cell]] of moves.entries()) {
-      await call("POST", `/rooms/${roomId}/action`, { token: p.token, body: { turn: i, action: { cell } } });
-    }
+    await playOut(roomId, host, a, b);
     expect((await call("GET", `/rooms/${roomId}/state`)).json.status).toBe("finished");
     const count = async () =>
       (await env.DB.prepare("SELECT COUNT(*) AS n FROM matches WHERE id = ?").bind(roomId).first<{ n: number }>())!.n;
@@ -544,14 +570,6 @@ describe("ルームの存在確認・入力の制限", () => {
 });
 
 describe("D1（users / matches / results）", () => {
-  async function playOut(roomId: string, host: string, a: any, b: any) {
-    await call("POST", `/rooms/${roomId}/start`, { token: host });
-    const moves: [any, number][] = [[a, 0], [b, 3], [a, 1], [b, 4], [a, 2]];
-    for (const [i, [p, cell]] of moves.entries()) {
-      await call("POST", `/rooms/${roomId}/action`, { token: p.token, body: { turn: i, action: { cell } } });
-    }
-  }
-
   it("ユーザー登録 → 参加 → 終了で戦績が付く。API キーはハッシュで保存", async () => {
     const u = await call("POST", "/users", { body: { name: "alice" } });
     expect(u.status).toBe(201);

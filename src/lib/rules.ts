@@ -1,5 +1,6 @@
 import { z } from "zod";
-import type { AnyGame } from "../games/registry";
+import type { AnyGame } from "../games/types";
+import { sha256Hex } from "./auth";
 
 /**
  * ゲームの説明（GET /games/:id/rules）を組み立てる。Bot 上の LLM がプロンプトに入れて読むことを想定する。
@@ -11,7 +12,8 @@ const COMMON = [
   "## How to play (all games)",
   "- State arrives as a WebSocket `state` message (or from `GET /rooms/{id}/state`). `view` is the board as you see it; `currentPlayers` lists who may act now.",
   "- **Legal moves are listed in `legal`. Pick one and send it unchanged as `action`; it is always accepted.** `legal` is present only when you may act now.",
-  '- To act, send `{ "type": "action", "turn": <turn from the latest state>, "action": <one of legal> }` (REST: `POST /rooms/{id}/action` with `{ turn, action }`).',
+  '- To act, send `{ "type": "action", "turn": <turn from the latest state>, "action": <one of legal> }` over the WebSocket (`GET /rooms/{id}/ws`).',
+  "- REST alternative: `POST /rooms/{id}/action` with `{ turn, action }`. REST has no way to wait for the other players, so to play a full game use the WebSocket: it pushes a new `state` whenever the turn changes. Use REST for single actions or debugging, not polling.",
   "- If `turn` does not match the current turn, the action is rejected with `STALE_TURN`. Wait for the next `state` and retry.",
   "- Each turn has a `deadline` (epoch ms). Missing it is a timeout.",
   "- Error codes: `ILLEGAL_ACTION` (illegal move), `NOT_YOUR_TURN` (you may not act now), `STALE_TURN` (outdated turn), `BAD_REQUEST` (malformed message).",
@@ -29,11 +31,6 @@ export interface GameRules {
   actionSchema: unknown;
   examples: { action: unknown; meaning: string }[];
   common: string;
-}
-
-async function shortHash(text: string): Promise<string> {
-  const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
-  return Array.from(new Uint8Array(d).slice(0, 6), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 const cache = new Map<string, Promise<GameRules>>();
@@ -54,7 +51,7 @@ export function gameRules(game: AnyGame): Promise<GameRules> {
         examples: game.docs.examples,
         common: COMMON,
       };
-      return { ...body, version: await shortHash(JSON.stringify(body)) };
+      return { ...body, version: (await sha256Hex(JSON.stringify(body))).slice(0, 12) };
     })();
     cache.set(game.id, p);
   }

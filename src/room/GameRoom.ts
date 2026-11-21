@@ -1,15 +1,12 @@
 import { DurableObject } from "cloudflare:workers";
-import { getGame, type AnyGame } from "../games/registry";
-import { GameError, type GameResult } from "../games/types";
+import { getGame } from "../games/registry";
+import { GameError, type AnyGame, type GameResult } from "../games/types";
 import { extractWsAuth, newToken, randomHex } from "../lib/auth";
 import { DEFAULT_TURN_TIME_MS, roomOptions } from "../lib/options";
-import { clientMessage, toWsErrorCode, type ServerMessage } from "../lib/protocol";
+import { clientMessage, errBody, toWsErrorCode, type RoomStatus, type ServerMessage } from "../lib/protocol";
 import { applyTimeout, replayFrames, type LogEntry, type ReplayLog } from "../lib/replay";
-import { rngForTurn, type Seed } from "../lib/rng";
-
-export type { ReplayLog } from "../lib/replay";
-
-export type RoomStatus = "waiting" | "playing" | "finished";
+import { practiceAction } from "../lib/practice";
+import { createRng, rngForTurn, type Seed } from "../lib/rng";
 
 export type RoomError = {
   ok: false;
@@ -26,6 +23,7 @@ const fail = (status: RoomError["status"], code: string, message: string): RoomE
   message,
 });
 const ok = <T>(data: T): RoomResult<T> => ({ ok: true, data });
+const NOT_FOUND = fail(404, "ROOM_NOT_FOUND", "room not found");
 
 export interface RoomState {
   game: string;
@@ -66,16 +64,37 @@ const PERSIST_RETRY_WINDOW_MS = 26 * 60 * 60 * 1000;
 /** setAlarm が失敗したときのその場での再試行間隔。 */
 const ALARM_RETRY_DELAYS_MS = [50, 200, 1000];
 
+/**
+ * 練習相手が1回の呼び出し（リクエスト / alarm）で続けて打つ手数の上限。
+ * Free プランは CPU 時間が短いので、上限に達したら alarm を「今」に張って続きはそちらで打つ。
+ */
+const MAX_BOT_STEPS_PER_CALL = 32;
+
 /** commit() で確定した結果。確定後の副作用（alarm・配信・D1）に使う。 */
 type Committed =
   | { kind: "waiting" }
   | { kind: "playing"; deadline: number }
-  | { kind: "finished"; game: AnyGame; result: GameResult };
+  | { kind: "finished"; result: GameResult };
+
+/** 視点によらない状態の共通部分（buildState / broadcast で1回だけ読む）。 */
+type RoomCore = {
+  game: AnyGame;
+  status: RoomStatus;
+  players: string[];
+  snap: { turn: number; state: unknown } | null;
+  currentPlayers: string[];
+  deadline: number | null;
+  result: GameResult | null;
+};
 
 export class GameRoom extends DurableObject<Env> {
   private sql: SqlStorage;
   /** テーブルが作成済み（= init 済みのルーム）か。 */
   private ready: boolean;
+  /** 練習相手の手を打っている最中か（commit → runBots の再入を防ぐ）。 */
+  private botsRunning = false;
+  /** 1回の呼び出しで練習相手が打つ手数の上限（テストで小さくできるようにインスタンスに持つ）。 */
+  private botStepsPerCall = MAX_BOT_STEPS_PER_CALL;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -145,6 +164,11 @@ export class GameRoom extends DurableObject<Env> {
     return this.getMeta("status") as RoomStatus;
   }
 
+  /** init 済みのルームか。 */
+  private exists(): boolean {
+    return this.getMeta("gameId") !== null;
+  }
+
   private game(): AnyGame {
     return getGame(this.getMeta("gameId")!)!;
   }
@@ -163,45 +187,56 @@ export class GameRoom extends DurableObject<Env> {
     return d ? Number(d) : null;
   }
 
-  private buildState(pid: string | null): RoomState {
-    const game = getGame(this.getMeta("gameId")!)!;
+  private loadCore(): RoomCore {
+    const game = this.game();
     const status = this.status();
     const players = this.playerIds();
     if (status === "waiting") {
-      return {
-        game: game.id,
-        status,
-        turn: 0,
-        players,
-        currentPlayers: [],
-        view: null,
-        deadline: null,
-        result: null,
-      };
+      return { game, status, players, snap: null, currentPlayers: [], deadline: null, result: null };
     }
-    const { turn, state } = this.loadSnapshot();
-    const currentPlayers = status === "playing" ? game.currentPlayers(state) : [];
+    const snap = this.loadSnapshot();
+    return {
+      game,
+      status,
+      players,
+      snap,
+      currentPlayers: status === "playing" ? game.currentPlayers(snap.state) : [],
+      deadline: this.deadline(),
+      result: this.resultOf(game, snap.state),
+    };
+  }
+
+  private stateFor(core: RoomCore, pid: string | null): RoomState {
+    const { game, status, players, snap, currentPlayers, deadline, result } = core;
     const out: RoomState = {
       game: game.id,
       status,
-      turn,
+      turn: snap?.turn ?? 0,
       players,
       currentPlayers,
-      view: game.view(state, pid),
-      deadline: this.deadline(),
-      result: this.resultOf(game, state),
+      view: snap ? game.view(snap.state, pid) : null,
+      deadline,
+      result,
     };
-    if (pid && status === "playing" && currentPlayers.includes(pid)) {
-      out.legal = game.legalActions(state, pid);
+    if (snap && pid && status === "playing" && currentPlayers.includes(pid)) {
+      out.legal = game.legalActions(snap.state, pid);
     }
     return out;
+  }
+
+  private buildState(pid: string | null): RoomState {
+    return this.stateFor(this.loadCore(), pid);
   }
 
   // ---- 配信 ----
 
   private send(ws: WebSocket, msg: ServerMessage): void {
+    this.sendRaw(ws, JSON.stringify(msg));
+  }
+
+  private sendRaw(ws: WebSocket, data: string): void {
     try {
-      ws.send(JSON.stringify(msg));
+      ws.send(data);
     } catch {
       // 切断済みの接続は無視する
     }
@@ -224,16 +259,24 @@ export class GameRoom extends DurableObject<Env> {
     return { type: "end", winners: r.winners, ...(r.scores ? { scores: r.scores } : {}) };
   }
 
-  /** 全接続に、その接続の視点の view を配る。 */
-  private broadcast(): void {
+  /**
+   * 全接続に、その接続の視点の view を配る（end があれば続けて end も）。
+   * 共通部分は1回だけ読み、同じ視点の接続（観戦者どうしなど）はメッセージを使い回す。
+   */
+  private broadcast(end?: GameResult): void {
+    const core = this.loadCore();
+    const byViewer = new Map<string | null, string>();
+    const endMsg = end ? JSON.stringify(this.endMessage(end)) : null;
     for (const ws of this.ctx.getWebSockets()) {
-      const att = ws.deserializeAttachment() as Attachment | null;
-      this.send(ws, this.stateMessage(this.buildState(att?.playerId ?? null)));
+      const pid = (ws.deserializeAttachment() as Attachment | null)?.playerId ?? null;
+      let msg = byViewer.get(pid);
+      if (msg === undefined) {
+        msg = JSON.stringify(this.stateMessage(this.stateFor(core, pid)));
+        byViewer.set(pid, msg);
+      }
+      this.sendRaw(ws, msg);
+      if (endMsg) this.sendRaw(ws, endMsg);
     }
-  }
-
-  private broadcastEnd(r: GameResult): void {
-    for (const ws of this.ctx.getWebSockets()) this.send(ws, this.endMessage(r));
   }
 
   /**
@@ -241,12 +284,11 @@ export class GameRoom extends DurableObject<Env> {
    * write と、決着判定・締め切りの更新を1つのトランザクションで確定し、その後で alarm・配信・D1 を行う。
    * 確定後の副作用が失敗しても変更は取り消さず成功として扱う（クライアントには確定済みの状態を配る）。
    *
-   * clock = "keep-if-shrinking" のとき、行動できるプレイヤーが減っただけ（同時手番で誰かが出した）なら
+   * prev（write 前に行動できたプレイヤー）を渡したとき、行動できるプレイヤーが減っただけ（同時手番で誰かが出した）なら
    * 締め切りを延ばさない。手番が移ったとき・新しいラウンドに入ったときだけ持ち時間をリセットする。
    */
-  private async commit(write: () => void, clock: "reset" | "keep-if-shrinking" = "reset"): Promise<void> {
+  private async commit(write: () => void, prev: string[] | null = null): Promise<void> {
     const out = this.ctx.storage.transactionSync((): Committed => {
-      const prevPending = this.getMeta("pending");
       const prevDeadline = this.getMeta("deadline");
       write();
       if (this.status() === "waiting") return { kind: "waiting" };
@@ -256,12 +298,10 @@ export class GameRoom extends DurableObject<Env> {
       if (result) {
         this.setMeta("status", "finished");
         this.setMeta("finishedAt", String(Date.now()));
-        return { kind: "finished", game, result };
+        return { kind: "finished", result };
       }
       const pending = game.currentPlayers(state);
-      const prev = prevPending ? (JSON.parse(prevPending) as string[]) : null;
       const shrinking =
-        clock === "keep-if-shrinking" &&
         prev !== null &&
         prevDeadline !== null &&
         pending.length > 0 &&
@@ -271,24 +311,71 @@ export class GameRoom extends DurableObject<Env> {
         ? Number(prevDeadline)
         : Date.now() + (this.options().turnTimeMs ?? DEFAULT_TURN_TIME_MS);
       this.setMeta("deadline", String(deadline));
-      this.setMeta("pending", JSON.stringify(pending));
       return { kind: "playing", deadline };
     });
 
     // ここから先は確定済み。失敗はログに残すだけで、呼び出し元にはエラーを返さない。
     if (out.kind === "finished") {
-      await this.tryAsync("deleteAlarm", () => this.ctx.storage.deleteAlarm());
-      this.trySync("broadcast", () => {
-        this.broadcast();
-        this.broadcastEnd(out.result);
-      });
-      if (!(await this.persistResult(out.game, out.result))) await this.schedulePersistRetry();
+      await this.attempt("deleteAlarm", () => this.ctx.storage.deleteAlarm());
+      await this.attempt("broadcast", () => this.broadcast(out.result));
+      if (!(await this.persistResult(out.result))) await this.schedulePersistRetry();
       return;
     }
     if (out.kind === "playing") {
       await this.armAlarm(out.deadline);
     }
-    this.trySync("broadcast", () => this.broadcast());
+    await this.attempt("broadcast", () => this.broadcast());
+    if (out.kind === "playing") await this.runBots();
+  }
+
+  /** 練習相手（サーバー側の Bot）のプレイヤー ID。 */
+  private bots(): string[] {
+    return JSON.parse(this.getMeta("bots") ?? "[]") as string[];
+  }
+
+  /** 今行動できる練習相手（いなければ null）。 */
+  private pendingBot(): string | null {
+    if (this.status() !== "playing") return null;
+    const bots = this.bots();
+    if (bots.length === 0) return null;
+    const pending = this.game().currentPlayers(this.loadSnapshot().state);
+    return pending.find((p) => bots.includes(p)) ?? null;
+  }
+
+  /**
+   * 練習相手の手番なら、その場で打つ（練習相手の手番でなくなるか、決着するまで続ける）。
+   * DO の中で打つので、受信メッセージも外部の接続も増えない。手は普通に行動ログに入るのでリプレイも変わらない。
+   * 1回で MAX_BOT_STEPS_PER_CALL 手を超えるときは、alarm を今に張って続きを打つ（alarm() → runBots）。
+   */
+  private async runBots(): Promise<void> {
+    if (this.botsRunning) return; // commit から再入したときは外側のループに任せる
+    this.botsRunning = true;
+    try {
+      for (let i = 0; ; i++) {
+        const bot = this.pendingBot();
+        if (!bot) return;
+        if (i >= this.botStepsPerCall) {
+          await this.armAlarm(Date.now()); // 締め切りの alarm は、続きの commit で張り直される
+          return;
+        }
+        const game = this.game();
+        const snap = this.loadSnapshot();
+        const pending = game.currentPlayers(snap.state);
+        // Bot の乱数はシードと無関係に作る（手はログに残るので再現には不要）
+        const pick = practiceAction(game, snap.state, bot, createRng(randomHex(16)));
+        if (!pick) return; // 打てる手がなければ持ち時間切れに任せる
+        // 読み込みから commit まで await を挟まない（他の行動と入れ替わらない）
+        const next = game.apply(snap.state, bot, pick.action, rngForTurn(this.seed(), snap.turn));
+        await this.commit(() => {
+          this.appendLog(snap.turn, bot, pick.action);
+          this.saveSnapshot(snap.turn + 1, next);
+        }, pending);
+      }
+    } catch (e) {
+      console.error("practice bot failed", e); // 打てなかった練習相手は持ち時間切れで負けになる
+    } finally {
+      this.botsRunning = false;
+    }
   }
 
   /** setAlarm を短い間隔で数回まで再試行する。最後まで失敗したら false（ensureAlarm が後で張り直す）。 */
@@ -326,17 +413,10 @@ export class GameRoom extends DurableObject<Env> {
     }
   }
 
-  private async tryAsync(what: string, f: () => Promise<unknown>): Promise<void> {
+  /** 確定後の副作用を実行し、失敗はログに残すだけにする。 */
+  private async attempt(what: string, f: () => unknown): Promise<void> {
     try {
       await f();
-    } catch (e) {
-      console.error(`${what} failed`, e);
-    }
-  }
-
-  private trySync(what: string, f: () => void): void {
-    try {
-      f();
     } catch (e) {
       console.error(`${what} failed`, e);
     }
@@ -346,10 +426,11 @@ export class GameRoom extends DurableObject<Env> {
    * D1 への書き込み。roomId をキーに冪等（INSERT OR IGNORE）なので何度再試行してもよい。
    * 成功（または D1 が無い）なら meta.persisted を立てて true を返す。失敗しても試合は壊さない。
    */
-  private async persistResult(game: AnyGame, result: GameResult): Promise<boolean> {
+  private async persistResult(result: GameResult): Promise<boolean> {
     try {
       const id = this.getMeta("roomId");
-      if (!id || !this.env.DB) return true;
+      // 練習試合は戦績・試合一覧に載せない（ランダム相手の勝ち数で戦績が水増しされないように）
+      if (!id || !this.env.DB || this.options().practice) return true;
       const players = this.sql.exec("SELECT id, user_id FROM players ORDER BY seq").toArray();
       // 時間切れによる決着（forfeit）に引き分けはない。勝者がいなければ全員の負け。
       const byTimeout = this.getMeta("forfeit") !== null;
@@ -362,7 +443,7 @@ export class GameRoom extends DurableObject<Env> {
           )
           .bind(
             id,
-            game.id,
+            this.getMeta("gameId"),
             this.seed(),
             JSON.stringify(players.map((p) => p.id)),
             Number(this.getMeta("startedAt")),
@@ -404,7 +485,7 @@ export class GameRoom extends DurableObject<Env> {
     const game = this.game();
     const result = this.resultOf(game, this.loadSnapshot().state);
     if (!result) return;
-    if (!(await this.persistResult(game, result))) await this.schedulePersistRetry();
+    if (!(await this.persistResult(result))) await this.schedulePersistRetry();
   }
 
   private options() {
@@ -438,12 +519,10 @@ export class GameRoom extends DurableObject<Env> {
 
   /** 参加。プレイヤー ID は参加順に p1, p2, ... */
   async join(userId: string | null = null): Promise<RoomResult<{ playerId: string; token: string }>> {
-    const gameId = this.getMeta("gameId");
-    if (gameId === null) return fail(404, "ROOM_NOT_FOUND", "room not found");
+    if (!this.exists()) return NOT_FOUND;
     if (this.status() !== "waiting") return fail(409, "ALREADY_STARTED", "game already started");
-    const game = getGame(gameId)!;
     const n = this.playerIds().length;
-    if (n >= game.maxPlayers) return fail(409, "ROOM_FULL", "room is full");
+    if (n >= this.game().maxPlayers) return fail(409, "ROOM_FULL", "room is full");
     const playerId = `p${n + 1}`;
     const token = newToken();
     await this.commit(() => {
@@ -454,8 +533,7 @@ export class GameRoom extends DurableObject<Env> {
 
   /** 試合開始（作成者 = POST /rooms で受け取った hostToken を持つ者のみ）。返すのは観戦視点。 */
   async start(token: string | null): Promise<RoomResult<RoomState>> {
-    const gameId = this.getMeta("gameId");
-    if (gameId === null) return fail(404, "ROOM_NOT_FOUND", "room not found");
+    if (!this.exists()) return NOT_FOUND;
     if (!token) return fail(401, "UNAUTHORIZED", "host token required");
     if (token !== this.getMeta("hostToken")) {
       return this.playerByToken(token)
@@ -464,14 +542,24 @@ export class GameRoom extends DurableObject<Env> {
     }
     if (this.status() !== "waiting") return fail(409, "ALREADY_STARTED", "game already started");
 
-    const game = getGame(gameId)!;
-    const players = this.playerIds();
+    const game = this.game();
+    const joined = this.playerIds();
+    // 練習相手は参加者の後ろの空席（minPlayers まで）に座る
+    const botIds = this.options().practice
+      ? Array.from({ length: Math.max(0, game.minPlayers - joined.length) }, (_, i) => `p${joined.length + i + 1}`)
+      : [];
+    const players = [...joined, ...botIds];
     if (players.length < game.minPlayers) {
       return fail(409, "NOT_ENOUGH_PLAYERS", `need at least ${game.minPlayers} players`);
     }
     const seed: Seed = randomHex(16); // 128 ビット。総当たりで特定されないように
     const state = game.init(players, seed);
     await this.commit(() => {
+      botIds.forEach((id, i) => {
+        // トークンは誰にも渡さない（練習相手の席には外から行動できない）
+        this.sql.exec("INSERT INTO players(id, token, seq, user_id) VALUES (?, ?, ?, NULL)", id, newToken(), joined.length + i);
+      });
+      if (botIds.length) this.setMeta("bots", JSON.stringify(botIds));
       this.setMeta("seed", String(seed));
       this.setMeta("startedAt", String(Date.now()));
       this.saveSnapshot(0, state);
@@ -482,7 +570,7 @@ export class GameRoom extends DurableObject<Env> {
 
   /** 状態取得。token があればそのプレイヤー視点、なければ観戦視点。 */
   async getState(token: string | null): Promise<RoomResult<RoomState>> {
-    if (this.getMeta("gameId") === null) return fail(404, "ROOM_NOT_FOUND", "room not found");
+    if (!this.exists()) return NOT_FOUND;
     await this.ensureAlarm();
     let pid: string | null = null;
     if (token) {
@@ -494,17 +582,15 @@ export class GameRoom extends DurableObject<Env> {
 
   /** REST の行動。turn が現在のターンと一致しなければ STALE_TURN。 */
   async act(token: string | null, turn: number, rawAction: unknown): Promise<RoomResult<RoomState>> {
-    if (this.getMeta("gameId") === null) return fail(404, "ROOM_NOT_FOUND", "room not found");
+    if (!this.exists()) return NOT_FOUND;
     const pid = this.playerByToken(token);
     if (!pid) return fail(401, "UNAUTHORIZED", "valid player token required");
     const r = await this.actAs(pid, turn, rawAction);
     return r.ok ? ok(this.buildState(pid)) : r;
   }
 
-  /** REST / WS 共通の行動処理。認証済みの playerId（観戦者は null）を受け取る。 */
+  /** REST / WS 共通の行動処理。存在するルームで、認証済みの playerId（観戦者は null）を受け取る。 */
   private async actAs(pid: string | null, turn: number, rawAction: unknown): Promise<RoomResult<null>> {
-    const gameId = this.getMeta("gameId");
-    if (gameId === null) return fail(404, "ROOM_NOT_FOUND", "room not found");
     if (!pid) return fail(401, "UNAUTHORIZED", "valid player token required");
     await this.ensureAlarm(); // 行動が拒否される場合（STALE_TURN など）でも締め切りを取り戻す
     if (this.status() !== "playing") return fail(409, "NOT_PLAYING", "game is not in progress");
@@ -518,7 +604,7 @@ export class GameRoom extends DurableObject<Env> {
     const snap = this.loadSnapshot();
     if (turn !== snap.turn) return fail(409, "STALE_TURN", `current turn is ${snap.turn}`);
 
-    const game = getGame(gameId)!;
+    const game = this.game();
     const parsed = game.actionSchema.safeParse(rawAction);
     if (!parsed.success) return fail(400, "BAD_REQUEST", "invalid action");
 
@@ -534,16 +620,21 @@ export class GameRoom extends DurableObject<Env> {
 
     // ログ追記・スナップショット・締め切りは commit 内の1トランザクションで確定する
     await this.commit(() => {
-      this.sql.exec(
-        "INSERT INTO actions(turn, player, action, at) VALUES (?, ?, ?, ?)",
-        snap.turn,
-        pid,
-        JSON.stringify(parsed.data),
-        Date.now(),
-      );
+      this.appendLog(snap.turn, pid, parsed.data);
       this.saveSnapshot(snap.turn + 1, next);
-    }, "keep-if-shrinking");
+    }, game.currentPlayers(snap.state));
     return ok(null);
+  }
+
+  /** 行動ログへの追記。timeout を渡すと持ち時間切れの行になる（符号化は readLog と対）。 */
+  private appendLog(turn: number, player: string, action: unknown, timeout?: string[]): void {
+    this.sql.exec(
+      "INSERT INTO actions(turn, player, action, at) VALUES (?, ?, ?, ?)",
+      turn,
+      timeout ? TIMEOUT_PLAYER : player,
+      JSON.stringify(timeout ? { $timeout: timeout } : action),
+      Date.now(),
+    );
   }
 
   private readLog(): LogEntry[] {
@@ -564,7 +655,7 @@ export class GameRoom extends DurableObject<Env> {
   /** 行動ログ。シードから隠し情報が推測されないよう、終了後のみ公開する。 */
   async getLog(): Promise<RoomResult<ReplayLog>> {
     const gameId = this.getMeta("gameId");
-    if (gameId === null) return fail(404, "ROOM_NOT_FOUND", "room not found");
+    if (gameId === null) return NOT_FOUND;
     if (this.status() !== "finished") {
       return fail(403, "NOT_FINISHED", "log is available after the game has finished");
     }
@@ -576,8 +667,7 @@ export class GameRoom extends DurableObject<Env> {
     const log = await this.getLog();
     if (!log.ok) return log;
     const game = getGame(log.data.game)!;
-    const { frames, forfeit } = replayFrames(game, log.data);
-    const last = frames[frames.length - 1]!;
+    const { frames, result } = replayFrames(game, log.data);
     return ok({
       game: game.id,
       seed: log.data.seed,
@@ -587,7 +677,7 @@ export class GameRoom extends DurableObject<Env> {
         view: game.view(f.state, null),
         action: i === 0 ? null : log.data.actions[i - 1]!,
       })),
-      result: game.result(last.state) ?? forfeit,
+      result,
     });
   }
 
@@ -595,19 +685,19 @@ export class GameRoom extends DurableObject<Env> {
 
   /** Worker から転送された WebSocket アップグレード。トークン（サブプロトコルか Bearer）が無ければ観戦。 */
   async fetch(request: Request): Promise<Response> {
+    const error = (status: number, code: string, message: string) =>
+      Response.json(errBody(code, message), { status });
     if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
-      return Response.json({ error: { code: "UPGRADE_REQUIRED", message: "expected WebSocket upgrade" } }, { status: 426 });
+      return error(426, "UPGRADE_REQUIRED", "expected WebSocket upgrade");
     }
-    if (this.getMeta("gameId") === null) {
-      return Response.json({ error: { code: "ROOM_NOT_FOUND", message: "room not found" } }, { status: 404 });
-    }
+    if (!this.exists()) return error(NOT_FOUND.status, NOT_FOUND.code, NOT_FOUND.message);
     await this.ensureAlarm();
     const auth = extractWsAuth(request);
-    if (!auth.ok) return Response.json({ error: { code: "BAD_REQUEST", message: auth.message } }, { status: 400 });
+    if (!auth.ok) return error(400, "BAD_REQUEST", auth.message);
     let pid: string | null = null;
     if (auth.token) {
       pid = this.playerByToken(auth.token);
-      if (!pid) return Response.json({ error: { code: "UNAUTHORIZED", message: "invalid token" } }, { status: 401 });
+      if (!pid) return error(401, "UNAUTHORIZED", "invalid token");
     }
 
     const pair = new WebSocketPair();
@@ -673,10 +763,17 @@ export class GameRoom extends DurableObject<Env> {
     const status = this.status();
     if (status === "finished") return this.retryPersist();
     if (status !== "playing") return;
+    // 練習相手の続き（runBots が1回の上限に達して張った alarm）
+    if (this.pendingBot() && !this.deadlinePassed()) {
+      await this.runBots();
+      // 打てずに抜けた（例外・打てる手なし）ときも、締め切りの alarm を失わないようにする
+      await this.ensureAlarm();
+      return;
+    }
     const deadline = this.getMeta("deadline");
     // 古い alarm の誤発火ガード: 締め切りがまだ先なら張り直すだけ
     if (deadline && Date.now() < Number(deadline)) {
-      await this.ctx.storage.setAlarm(Number(deadline));
+      await this.armAlarm(Number(deadline));
       return;
     }
     await this.resolveTimeout();
@@ -696,13 +793,7 @@ export class GameRoom extends DurableObject<Env> {
     const r = applyTimeout(game, snap.state, pending, this.playerIds(), this.seed(), snap.turn);
 
     await this.commit(() => {
-      this.sql.exec(
-        "INSERT INTO actions(turn, player, action, at) VALUES (?, ?, ?, ?)",
-        snap.turn,
-        TIMEOUT_PLAYER,
-        JSON.stringify({ $timeout: pending }),
-        Date.now(),
-      );
+      this.appendLog(snap.turn, TIMEOUT_PLAYER, null, pending);
       this.saveSnapshot(snap.turn + 1, r.state);
       if (r.forfeit) this.setMeta("forfeit", JSON.stringify(r.forfeit));
     });

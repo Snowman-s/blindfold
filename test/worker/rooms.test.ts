@@ -1,29 +1,8 @@
 import { SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { tictactoe } from "../../src/games/tictactoe";
-import { rngForTurn } from "../../src/lib/rng";
-
-const BASE = "https://example.com";
-
-async function call(method: string, path: string, opts: { token?: string; body?: unknown } = {}) {
-  const res = await SELF.fetch(BASE + path, {
-    method,
-    headers: {
-      ...(opts.token ? { Authorization: `Bearer ${opts.token}` } : {}),
-      ...(opts.body !== undefined ? { "Content-Type": "application/json" } : {}),
-    },
-    body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
-  });
-  return { status: res.status, json: (await res.json()) as any }; // テスト内のみ
-}
-
-async function setup() {
-  const { json: created } = await call("POST", "/rooms", { body: { game: "tictactoe" } });
-  const roomId: string = created.roomId;
-  const a = (await call("POST", `/rooms/${roomId}/join`)).json;
-  const b = (await call("POST", `/rooms/${roomId}/join`)).json;
-  return { roomId, host: created.hostToken as string, a, b };
-}
+import { games } from "../../src/games/registry";
+import { replay } from "../../src/lib/replay";
+import { BASE, call, newRoom } from "./helpers";
 
 describe("REST: ルーム", () => {
   it("GET /games", async () => {
@@ -103,13 +82,13 @@ describe("REST: ルーム", () => {
 
 describe("REST: 対戦", () => {
   it("開始前は行動できない", async () => {
-    const { roomId, host, a } = await setup();
+    const { roomId, host, a } = await newRoom("tictactoe");
     const r = await call("POST", `/rooms/${roomId}/action`, { token: a.token, body: { turn: 0, action: { cell: 0 } } });
     expect(r.json.error.code).toBe("NOT_PLAYING");
   });
 
   it("状態取得: legal は手番のプレイヤーにだけ付く", async () => {
-    const { roomId, host, a, b } = await setup();
+    const { roomId, host, a, b } = await newRoom("tictactoe");
     await call("POST", `/rooms/${roomId}/start`, { token: host });
 
     const sa = (await call("GET", `/rooms/${roomId}/state`, { token: a.token })).json;
@@ -128,7 +107,7 @@ describe("REST: 対戦", () => {
   });
 
   it("不正な行動のエラーコード", async () => {
-    const { roomId, host, a, b } = await setup();
+    const { roomId, host, a, b } = await newRoom("tictactoe");
     await call("POST", `/rooms/${roomId}/start`, { token: host });
     const act = (token: string, turn: number, action: unknown) =>
       call("POST", `/rooms/${roomId}/action`, { token, body: { turn, action } });
@@ -146,7 +125,7 @@ describe("REST: 対戦", () => {
   });
 
   it("最後まで遊べて、ログから再現できる", async () => {
-    const { roomId, host, a, b } = await setup();
+    const { roomId, host, a, b } = await newRoom("tictactoe");
     await call("POST", `/rooms/${roomId}/start`, { token: host });
     const tokens: Record<string, string> = { p1: a.token, p2: b.token };
 
@@ -181,10 +160,10 @@ describe("REST: 対戦", () => {
     expect(log.seed).toMatch(/^[0-9a-f]{32}$/); // 128 ビット
     expect(log.actions.map((x: { turn: number }) => x.turn)).toEqual(log.actions.map((_: unknown, i: number) => i));
 
-    let s = tictactoe.init(log.players, log.seed);
-    for (const x of log.actions) s = tictactoe.apply(s, x.player, x.action, rngForTurn(log.seed, x.turn));
-    expect(tictactoe.result(s)).toEqual(state.result);
-    expect(tictactoe.view(s, null)).toEqual(state.view);
+    const tictactoe = games["tictactoe"]!;
+    const r = replay(tictactoe, log);
+    expect(r.result).toEqual(state.result);
+    expect(tictactoe.view(r.state, null)).toEqual(state.view);
   });
 });
 

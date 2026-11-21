@@ -1,11 +1,19 @@
 import { z } from "zod";
 
+export const ROOM_STATUSES = ["waiting", "playing", "finished"] as const;
+export type RoomStatus = (typeof ROOM_STATUSES)[number];
+
+/** 行動の本体（WS の action メッセージと REST の POST /rooms/:id/action で共有）。 */
+export const actionBody = z.object({ turn: z.number().int().min(0), action: z.unknown() });
+
 /** クライアント → サーバー */
 export const clientMessage = z.discriminatedUnion("type", [
-  z.object({ type: z.literal("action"), turn: z.number().int().min(0), action: z.unknown() }),
+  actionBody.extend({ type: z.literal("action") }),
   z.object({ type: z.literal("ping") }),
 ]);
-export type ClientMessage = z.infer<typeof clientMessage>;
+
+/** REST / DO 共通のエラーレスポンスの本体。 */
+export const errBody = (code: string, message: string) => ({ error: { code, message } });
 
 export const WS_ERROR_CODES = ["ILLEGAL_ACTION", "NOT_YOUR_TURN", "STALE_TURN", "BAD_REQUEST"] as const;
 export type WsErrorCode = (typeof WS_ERROR_CODES)[number];
@@ -20,7 +28,7 @@ export type ServerMessage =
       legal?: unknown[];
       currentPlayers: string[];
       deadline: number | null;
-      status: "waiting" | "playing" | "finished";
+      status: RoomStatus;
       players: string[];
     }
   | { type: "error"; code: WsErrorCode; message: string }

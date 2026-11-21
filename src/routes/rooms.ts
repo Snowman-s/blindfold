@@ -4,23 +4,20 @@ import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { games, getGame } from "../games/registry";
 import { extractToken, newRoomId, sha256Hex, WS_PROTOCOL, WS_TOKEN_PROTOCOL_PREFIX } from "../lib/auth";
 import { roomOptions } from "../lib/options";
-import { gameRules, rulesMarkdown } from "../lib/rules";
+import { actionBody } from "../lib/protocol";
+import { gameRules, rulesMarkdown, type GameRules } from "../lib/rules";
 import type { RoomResult } from "../room/GameRoom";
-import { bearerSecurity, errBody, errors, ResultSchema, RoomIdParam, RoomStateSchema } from "./schemas";
+import {
+  bearerSecurity,
+  errBody,
+  errors,
+  ResultSchema,
+  RoomIdParam,
+  RoomStateSchema,
+  validationHook,
+} from "./schemas";
 
 type AppEnv = { Bindings: Env };
-
-/** バリデーション失敗を { error: { code, message } } に揃える。 */
-export const validationHook = (
-  result: { success: boolean; error?: { issues: { path: PropertyKey[]; message: string }[] } },
-  c: Context,
-) => {
-  if (!result.success) {
-    const i = result.error?.issues[0];
-    const where = i ? `${i.path.join(".") || "(root)"}: ${i.message}` : "invalid request";
-    return c.json(errBody("BAD_REQUEST", where), 400);
-  }
-};
 
 export const routes = new OpenAPIHono<AppEnv>({ defaultHook: validationHook });
 
@@ -97,12 +94,19 @@ const GameRulesSchema = z
   })
   .openapi("GameRules");
 
-/** 説明は静的なので長めにキャッシュさせる。version を ETag にして、変わっていなければ 304 を返す。 */
-function rulesCacheHeaders(c: Context<AppEnv>, version: string): boolean {
-  const etag = `"${version}"`;
+/**
+ * /rules と /rules.md の共通部分。説明は静的なので長めにキャッシュさせる。
+ * version を ETag にして、変わっていなければ 304 を返す。
+ */
+async function withRules(c: Context<AppEnv>, id: string, render: (r: GameRules) => Response): Promise<Response> {
+  const game = getGame(id);
+  if (!game) return c.json(errBody("NOT_FOUND", "unknown game"), 404);
+  const r = await gameRules(game);
+  const etag = `"${r.version}"`;
   c.header("ETag", etag);
   c.header("Cache-Control", "public, max-age=3600");
-  return c.req.header("If-None-Match") === etag;
+  if (c.req.header("If-None-Match") === etag) return c.body(null, 304);
+  return render(r);
 }
 
 routes.openapi(
@@ -122,13 +126,7 @@ routes.openapi(
       404: errors[404],
     },
   }),
-  async (c) => {
-    const game = getGame(c.req.valid("param").id);
-    if (!game) return c.json(errBody("NOT_FOUND", "unknown game"), 404);
-    const r = await gameRules(game);
-    if (rulesCacheHeaders(c, r.version)) return c.body(null, 304);
-    return c.json(r, 200);
-  },
+  async (c) => withRules(c, c.req.valid("param").id, (r) => c.json(r, 200)) as never,
 );
 
 routes.openapi(
@@ -145,13 +143,10 @@ routes.openapi(
       404: errors[404],
     },
   }),
-  async (c) => {
-    const game = getGame(c.req.valid("param").id);
-    if (!game) return c.json(errBody("NOT_FOUND", "unknown game"), 404);
-    const r = await gameRules(game);
-    if (rulesCacheHeaders(c, r.version)) return c.body(null, 304);
-    return c.body(rulesMarkdown(r), 200, { "Content-Type": "text/markdown; charset=utf-8" });
-  },
+  async (c) =>
+    withRules(c, c.req.valid("param").id, (r) =>
+      c.body(rulesMarkdown(r), 200, { "Content-Type": "text/markdown; charset=utf-8" }),
+    ) as never,
 );
 
 routes.openapi(
@@ -163,6 +158,7 @@ routes.openapi(
     summary: "ルーム作成",
     description:
       "`options.turnTimeMs`（1000〜86400000）で1手の持ち時間を指定できる。省略時は5分。時間切れは負け扱い。" +
+      "`options.practice: true` を付けると、開始時に空席（minPlayers まで）をサーバー側の練習相手が埋める（打ち方はゲームごと。戦績には残らない）。" +
       "未知のオプションは 400。返ってくる `hostToken` は試合開始（`/rooms/{id}/start`）に必要で、作成者だけが持つ。",
     request: {
       body: {
@@ -283,6 +279,8 @@ routes.openapi(
     operationId: "postAction",
     summary: "行動を送る（WS を使わない簡易 Bot 向け）",
     description:
+      "補助的な手段。REST には相手の手番が終わるのを待つ仕組みがないので、1試合を通して遊ぶなら WebSocket（`/rooms/{id}/ws`）を使う。" +
+      "`/state` のポーリングは前提にしない（無料枠のリクエスト数を消費する）。" +
       "`turn` が現在のターンと一致しなければ `STALE_TURN`（409）。" +
       "持ち時間を過ぎてから届いた行動も、その場で時間切れを確定させたうえで `STALE_TURN` になる。",
     security: bearerSecurity,
@@ -291,7 +289,7 @@ routes.openapi(
       body: {
         required: true,
         content: {
-          "application/json": { schema: z.object({ turn: z.number().int().min(0), action: z.unknown() }) },
+          "application/json": { schema: actionBody },
         },
       },
     },

@@ -1,7 +1,6 @@
 import { createRoute, OpenAPIHono, z } from "@hono/zod-openapi";
 import { newApiKey, newUserId, sha256Hex } from "../lib/auth";
-import { validationHook } from "./rooms";
-import { errBody, errors } from "./schemas";
+import { errBody, errors, validationHook } from "./schemas";
 
 export const userRoutes = new OpenAPIHono<{ Bindings: Env }>({ defaultHook: validationHook });
 

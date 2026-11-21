@@ -1,10 +1,24 @@
 import { z } from "@hono/zod-openapi";
+import type { Context } from "hono";
+import { errBody, ROOM_STATUSES } from "../lib/protocol";
 
-export const ErrorSchema = z
+export { errBody };
+
+/** バリデーション失敗を { error: { code, message } } に揃える。 */
+export const validationHook = (
+  result: { success: boolean; error?: { issues: { path: PropertyKey[]; message: string }[] } },
+  c: Context,
+) => {
+  if (!result.success) {
+    const i = result.error?.issues[0];
+    const where = i ? `${i.path.join(".") || "(root)"}: ${i.message}` : "invalid request";
+    return c.json(errBody("BAD_REQUEST", where), 400);
+  }
+};
+
+const ErrorSchema = z
   .object({ error: z.object({ code: z.string(), message: z.string() }) })
   .openapi("Error");
-
-export const errBody = (code: string, message: string) => ({ error: { code, message } });
 
 const errorResponse = (description: string) => ({
   description,
@@ -30,7 +44,7 @@ export const ResultSchema = z
 export const RoomStateSchema = z
   .object({
     game: z.string(),
-    status: z.enum(["waiting", "playing", "finished"]),
+    status: z.enum(ROOM_STATUSES),
     turn: z.number().int().describe("適用済みの行動数。行動にはこの値を付けて送る"),
     players: z.array(z.string()),
     currentPlayers: z.array(z.string()),

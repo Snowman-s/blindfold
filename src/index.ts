@@ -1,12 +1,60 @@
 import { OpenAPIHono } from "@hono/zod-openapi";
+import type { Context } from "hono";
+import { cors } from "hono/cors";
 import { HTTPException } from "hono/http-exception";
-import { routes, validationHook } from "./routes/rooms";
-import { errBody } from "./routes/schemas";
+import { guide, renderGuide } from "./lib/guide";
+import { routes } from "./routes/rooms";
+import { errBody, validationHook } from "./routes/schemas";
 import { userRoutes } from "./routes/users";
 
 const app = new OpenAPIHono<{ Bindings: Env }>({ defaultHook: validationHook });
 
-app.get("/", (c) => c.json({ name: "apigames", ok: true }));
+// ブラウザで動くクライアントを別オリジンからも作れるようにする。認証は Bearer / サブプロトコルで Cookie を使わないので、
+// どのオリジンを許可しても他人の資格情報が勝手に使われることはない。
+// WebSocket のアップグレードには CORS は効かず、DO が返す 101 のヘッダーは書き換えられないので対象外にする。
+const corsMw = cors({
+  origin: "*",
+  allowMethods: ["GET", "POST", "OPTIONS"],
+  allowHeaders: ["Authorization", "Content-Type", "X-Api-Key", "If-None-Match"],
+  exposeHeaders: ["ETag"],
+  maxAge: 86400,
+});
+app.use("*", async (c, next) => {
+  if (c.req.header("Upgrade")?.toLowerCase() === "websocket") return next();
+  return corsMw(c, next);
+});
+
+/** クライアント開発者（主にコーディングエージェント）向けのガイド。version を ETag にする。 */
+async function serveGuide(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const g = await guide();
+  const etag = `"${g.version}"`;
+  c.header("ETag", etag);
+  c.header("Cache-Control", "public, max-age=3600");
+  c.header("Vary", "Accept");
+  if (c.req.header("If-None-Match") === etag) return c.body(null, 304);
+  c.header("Content-Type", "text/markdown; charset=utf-8");
+  return c.body(renderGuide(g, new URL(c.req.url).origin));
+}
+
+app.get("/guide.md", serveGuide);
+app.get("/llms.txt", serveGuide);
+
+// ユーザーが最初に貼るのはルート URL なので、ここから迷わずガイドに辿り着けるようにする。
+// Markdown を求めるクライアントにはガイド本文をそのまま返す。
+app.get("/", async (c) => {
+  if ((c.req.header("Accept") ?? "").includes("text/markdown")) return serveGuide(c);
+  c.header("Vary", "Accept");
+  // 取得ツールは JSON を要約してから渡すことがあるので、相対パスより辿りやすい絶対 URL にする。
+  const origin = new URL(c.req.url).origin;
+  return c.json({
+    name: "apigames",
+    ok: true,
+    description: "Turn-based games playable over HTTP + WebSocket. To build a client, read the guide.",
+    guide: `${origin}/guide.md`,
+    games: `${origin}/games`,
+    openapi: `${origin}/openapi.json`,
+  });
+});
 app.route("/", routes);
 app.route("/", userRoutes);
 

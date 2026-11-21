@@ -1,9 +1,8 @@
-import type { GameDefinition } from "./types";
+import type { AnyGame } from "./types";
 import { tictactoe } from "./tictactoe";
 import { highcard } from "./highcard";
 
-// メソッド記法のパラメータは双変なので、個別のゲームを unknown 版として登録できる。
-export type AnyGame = GameDefinition<unknown, unknown>;
+export type { AnyGame } from "./types";
 
 export const games: Record<string, AnyGame> = {
   [tictactoe.id]: tictactoe,

@@ -40,9 +40,10 @@ export function extractWsAuth(req: Request): WsAuth {
   return { ok: true, token: fromProtocol ?? extractToken(req), protocol };
 }
 
+const toHex = (b: Uint8Array): string => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+
 export function randomHex(bytes: number): string {
-  const b = crypto.getRandomValues(new Uint8Array(bytes));
-  return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+  return toHex(crypto.getRandomValues(new Uint8Array(bytes)));
 }
 
 export function newToken(): string {
@@ -55,7 +56,7 @@ export function newRoomId(): string {
 
 export async function sha256Hex(s: string): Promise<string> {
   const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
-  return Array.from(new Uint8Array(d), (x) => x.toString(16).padStart(2, "0")).join("");
+  return toHex(new Uint8Array(d));
 }
 
 export function newApiKey(): string {
@@ -63,5 +64,5 @@ export function newApiKey(): string {
 }
 
 export function newUserId(): string {
-  return "u_" + crypto.randomUUID().replace(/-/g, "").slice(0, 12);
+  return "u_" + newRoomId();
 }

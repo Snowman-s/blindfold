@@ -58,8 +58,9 @@ src/
     auth.ts           # プレイヤートークン発行・検証
     protocol.ts       # WS メッセージの zod スキーマ
     replay.ts         # 行動ログからの再現・時間切れ解決（純粋関数）
-    options.ts        # ルームオプション（turnTimeMs）
+    options.ts        # ルームオプション（turnTimeMs、practice）
     rules.ts          # ゲームの説明（/games/:id/rules）の組み立て
+    guide.ts          # クライアント開発者向けガイド（/guide.md）の生成。state の例は実エンジンから作る
 bots/
   random-bot.ts       # 合法手からランダムに選ぶ Bot（Node で実行）
   bot-core.ts         # WS ループ（CLI とテストで共有）
@@ -86,6 +87,7 @@ export interface GameDefinition<S, A> {
   view(s: S, pid: string | null): unknown;     // 隠し情報を除去。null は観戦者
   result(s: S): null | { winners: string[]; scores?: Record<string, number> };
   onTimeout?(s: S, pids: string[], rng: Rng): S; // 任意。未定義なら時間切れのプレイヤーの負け
+  practiceAction?(s: S, pid: string, rng: Rng): A; // 任意。練習相手の打ち方。未定義なら合法手からランダム
 }
 ```
 
@@ -99,14 +101,15 @@ export interface GameDefinition<S, A> {
 
 | メソッド | パス | 内容 |
 |---|---|---|
+| GET | `/`（`Accept: text/markdown` ならガイド本文）、`/guide.md`、`/llms.txt` | クライアント開発者（コーディングエージェント）向けのガイド。URL を渡すだけでクライアントが書けることが目標。コードから生成し、`version` を ETag にする |
 | GET | `/games` | 利用できるゲームの一覧（`summary`、`rulesUrl` 付き） |
 | GET | `/games/:id/rules` | ゲームの説明（LLM 向け）。ルール・view の読み方・action の JSON Schema・共通の遊び方。`version` を ETag にする |
 | GET | `/games/:id/rules.md` | 同じ内容を Markdown 1枚で。プロンプトにそのまま貼れる |
-| POST | `/rooms` | `{ game: string, options?: {...} }` → `{ roomId, hostToken }`。未知のオプションは 400 |
+| POST | `/rooms` | `{ game: string, options?: {...} }` → `{ roomId, hostToken }`。未知のオプションは 400。`options.practice: true` で開始時に空席をサーバー側の練習相手が埋める（打ち方は `practiceAction`、未定義ならランダム。D1 には記録しない） |
 | POST | `/rooms/:id/join` | → `{ playerId, token }` |
 | POST | `/rooms/:id/start` | 試合開始（作成者のみ。`hostToken` を Bearer で渡す） |
 | GET | `/rooms/:id/state` | `Authorization: Bearer <token>` があればそのプレイヤー視点、なければ観戦視点 |
-| POST | `/rooms/:id/action` | WS を使わない簡易 Bot 向け。`{ turn, action }` |
+| POST | `/rooms/:id/action` | WS を使わない簡易 Bot 向け。`{ turn, action }`。相手の手を待つ手段はないので、単発の行動・デバッグ用（対戦は WS） |
 | GET | `/rooms/:id/log` | 行動ログ（リプレイ用。終了後のみ） |
 | GET | `/rooms/:id/replay` | ログから再現した各ターンの観戦視点（終了後のみ） |
 | POST | `/users` | `{ name }` → `{ userId, apiKey }`。join 時に `X-Api-Key` を付けると戦績が紐づく |
@@ -116,6 +119,7 @@ export interface GameDefinition<S, A> {
 | GET | `/rooms/:id/ws` | WebSocket へのアップグレード（サブプロトコル `["apigames", "apigames.token.<token>"]` か Bearer。無ければ観戦） |
 
 - トークンは URL に載せない（アクセスログ・ブラウザ履歴に残るため）。`?token=` は 400 で拒否する。
+- CORS は全オリジン許可（Cookie を使わず Bearer なので安全）。WS のアップグレードは対象外。
 - REST は `Authorization: Bearer`。WS はブラウザがヘッダーを付けられないのでサブプロトコルで渡し、サーバーはトークンを含まない `apigames` を選んで応答する。
 
 ### WebSocket メッセージ（JSON）
@@ -194,6 +198,6 @@ pnpm tsx bots/random-bot.ts --url http://localhost:8787 --room <roomId> [--host-
 - TypeScript strict。`any` は使わない（外部入力は zod で `unknown` から検証する）。
 - ゲームロジック（`src/games/`）は Cloudflare の API に依存させない。Node 単体でテストできる状態に保つ。
 - エラーは `GameError(code, message)` で投げ、ルーム側で `error` メッセージに変換する。
-- 新しいゲームを追加するときは、次の3つを必ず用意する：(1) `GameDefinition` の実装（`docs` を含む）、(2) `registry.ts` への登録、(3) ランダム Bot で 100 試合が例外なく終わるテスト。
+- 新しいゲームを追加するときは、次の3つを必ず用意する：(1) `GameDefinition` の実装（`docs` を含む）、(2) `registry.ts` への登録、(3) ランダム Bot で 100 試合が例外なく終わるテスト（練習相手どうしの 100 試合も all-games テストで自動的に走る。ランダムで決着しにくいゲームは `practiceAction` を定義する）。
 - `docs` はゲームのディレクトリの `docs.ts` に置き、**英語**で書く（LLM が読む前提。翻訳は Bot 側に任せる）。特に `view` の各フィールドの意味と、視点による違いを省略しない。全ゲーム共通の遊び方（turn・legal・エラー）は `src/lib/rules.ts` の `COMMON` にあるので、各ゲームには書かない。
 - 秘密情報（トークンの署名鍵など）は `wrangler secret` で管理し、コミットしない。ローカルでは `.dev.vars` を使う（gitignore 済みにする）。

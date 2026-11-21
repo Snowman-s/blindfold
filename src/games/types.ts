@@ -51,4 +51,12 @@ export interface GameDefinition<S, A> {
    * 未定義のゲームは「時間切れのプレイヤーの負け」（残りが勝者）で終了する。
    */
   onTimeout?(s: S, pids: string[], rng: Rng): S;
+  /**
+   * 練習相手（options.practice）の打ち方（任意）。pid が今行動できるときだけ呼ばれ、合法手を返すこと。
+   * 未定義のゲームは合法手からランダムに選ぶ。ランダムでは決着しにくいゲームは、決着に向かう簡単な打ち方を定義する。
+   */
+  practiceAction?(s: S, pid: string, rng: Rng): A;
 }
+
+// メソッド記法のパラメータは双変なので、個別のゲームを unknown 版として登録できる。
+export type AnyGame = GameDefinition<unknown, unknown>;

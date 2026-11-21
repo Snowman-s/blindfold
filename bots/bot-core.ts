@@ -1,14 +1,12 @@
+import type { GameResult } from "../src/games/types";
+import type { ServerMessage } from "../src/lib/protocol";
+
 /** Node のグローバル WebSocket / workerd の WebSocket の両方が満たす最小インターフェース。 */
 export interface SocketLike {
   send(data: string): void;
   close(): void;
   addEventListener(type: "message", fn: (ev: { data: unknown }) => void): void;
   addEventListener(type: "close", fn: () => void): void;
-}
-
-export interface BotEnd {
-  winners: string[];
-  scores?: Record<string, number>;
 }
 
 export interface BotOptions {
@@ -22,31 +20,29 @@ export interface BotOptions {
  * WebSocket で状態を受け取り、行動できるときだけ合法手を送る Bot。
  * error（STALE_TURN など）は無視して次の state を待つ。end を受け取ると解決する。
  */
-export function runBot(ws: SocketLike, opts: BotOptions): Promise<BotEnd> {
+export function runBot(ws: SocketLike, opts: BotOptions): Promise<GameResult> {
   return new Promise((resolve, reject) => {
     let started = false;
     let answeredTurn = -1;
 
     ws.addEventListener("message", (ev) => {
-      let msg: Record<string, unknown>;
+      let msg: ServerMessage;
       try {
-        msg = JSON.parse(String(ev.data)) as Record<string, unknown>;
+        msg = JSON.parse(String(ev.data)) as ServerMessage;
       } catch {
         return;
       }
       if (msg.type === "end") {
-        resolve({ winners: msg.winners as string[], scores: msg.scores as Record<string, number> | undefined });
+        resolve({ winners: msg.winners, scores: msg.scores });
         return;
       }
       if (msg.type !== "state") return;
 
-      const players = msg.players as string[];
-      if (msg.status === "waiting" && opts.startWhen && !started && players.length >= opts.startWhen.players) {
+      if (msg.status === "waiting" && opts.startWhen && !started && msg.players.length >= opts.startWhen.players) {
         started = true;
         opts.startWhen.start().catch(reject);
       }
-      const legal = msg.legal as unknown[] | undefined;
-      const turn = msg.turn as number;
+      const { legal, turn } = msg;
       if (msg.status === "playing" && legal && legal.length > 0 && answeredTurn !== turn) {
         answeredTurn = turn;
         ws.send(JSON.stringify({ type: "action", turn, action: opts.pick(legal) }));

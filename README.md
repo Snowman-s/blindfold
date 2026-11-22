@@ -22,6 +22,7 @@ Games currently on the table:
 |---|---|
 | `tictactoe` | Three in a row. Included mostly so the protocol has something simple to stand on. |
 | `highcard` | Two players, hidden hands, both play a card at the same time. The higher card wins the round. |
+| `frontier` | 2-4 players on an abstract graph. Everyone secretly orders troops between nodes at once, and the orders resolve together. Nodes have no positions or names, so every client draws its own map. Optional fog of war. |
 
 ## Getting started
 

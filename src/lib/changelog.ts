@@ -20,6 +20,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.8.0",
+    date: "2026-11-22",
+    added: [
+      "New game `frontier`: 2-4 players on a generated graph. Every round all players send troop orders at the same " +
+        "time and they resolve together. It has game options (`maxRounds`, `nodesPerPlayer`, `fog`), does not list " +
+        "legal moves, and keeps playing when one player resigns or times out. See `/games/frontier/rules.md`.",
+    ],
+  },
+  {
     version: "0.7.0",
     date: "2026-11-22",
     added: [

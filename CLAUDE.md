@@ -58,6 +58,7 @@ src/
     registry.ts       # gameId -> GameDefinition (current version only). getGame(id, rulesVersion?) returns only when the version matches
     tictactoe/        # First sample game (index.ts = GameDefinition, docs.ts = description for clients)
     highcard/         # Card game with hidden information + simultaneous turns
+    frontier/         # 2-4 player territory game on a generated graph (simultaneous orders, game options, no legalActions, onTimeout / onResign; map.ts = symmetric map generation)
   lib/
     rng.ts            # Seeded PRNG (string seed → cyrb128 → sfc32; 128-bit state)
     auth.ts           # Issuing and verifying player tokens

@@ -1,0 +1,74 @@
+import type { GameDocs } from "../types";
+import { MAX_MISSED as MISSED } from "./constants";
+import { CENTER_PRODUCTION, HOME_PRODUCTION, HOME_TROOPS } from "./map";
+
+/** Description served by GET /games/frontier/rules. */
+export const docs: GameDocs = {
+  summary:
+    "A 2-4 player territory game on an abstract graph. Every round all players secretly send troops from their nodes " +
+    "to adjacent nodes at the same time; orders are revealed and resolved together. Hold the most production when the rounds run out.",
+  rules: [
+    "### Board",
+    "- The board is a graph: numbered **nodes** joined by undirected **edges**. Nodes have no positions or names. Each has a `production` value and is either neutral or owned by one player.",
+    `- The map is generated from the room's seed and is symmetric: every player gets an identical sector with a home node (production ${HOME_PRODUCTION}, ${HOME_TROOPS} troops). Neighbouring sectors are linked, and one central node (production ${CENTER_PRODUCTION}) touches every sector.`,
+    "- Neutral nodes start with a garrison of troops. They never move and never grow.",
+    "",
+    "### A round",
+    "1. **Orders (simultaneous turn).** Every player still in the game sends one action `{ orders: [{ from, to, count }, ...] }` in any order. `from` must be your node, `to` must be adjacent to `from`, and the counts sent from one node may not exceed its troops. Each `(from, to)` pair may appear only once. An empty list holds everything. You cannot change orders once sent, and nobody sees other players' orders until the round resolves.",
+    "2. **Departure.** All troops in the orders leave their nodes at once.",
+    "3. **Clashes on edges.** If two different players send troops along the same edge in opposite directions, the two groups fight on the edge: both lose as many troops as the smaller group had. Survivors continue.",
+    "4. **Battles at nodes.** At every node that troops arrive at, the troops are counted per side: the owner's remaining troops plus the owner's own arrivals form one side (for a neutral node, its garrison), and each other player's arrivals form a side. The largest side wins, keeps the node (or takes it), and is left with its count minus the second-largest count. If the largest sides are tied, all troops there die and the owner does not change.",
+    "5. **Production.** Every owned node gains its `production` in troops. The counts you see in the next `state` are what you can send next round.",
+    "6. A player who owns no node is eliminated.",
+    "",
+    "Troops that reach one of your own nodes simply join it (moving between your own nodes is how you reinforce).",
+    "",
+    "Worked example: p1's node 4 has 7 troops and p2's node 9 (adjacent) has 5. p1 orders `{from:4,to:9,count:6}` and p2 orders `{from:9,to:4,count:2}`. On the edge the groups clash: 6 vs 2, so 4 p1 troops go on and p2's group is gone. At node 9, p2 has 3 left and p1 brings 4: p1 takes node 9 with 1 troop. Node 4 keeps its 1 remaining troop. Then production is added to both.",
+    "",
+    "### End and score",
+    "- The game ends after `maxRounds` rounds, or when one player is left.",
+    "- Your score (`territory`) is the total production of the nodes you own. The highest score wins. If tied, the most troops on owned nodes wins; if still tied, all tied players win. Players who left the game score 0.",
+    "",
+    "### Leaving the game",
+    `- **Timeout:** a player who does not send orders in time holds this round (as if they sent an empty list). After ${MISSED} timeouts in a row they are out (\`timedOut\`).`,
+    "- **Resign:** the player is out (`resigned`) and the others play on.",
+    "- When a player leaves for any reason, their nodes become neutral and keep their troops as a garrison. Orders they sent this round are discarded.",
+    "",
+    "### Notes",
+    "- The platform `turn` goes up by one each time any player sends orders. If you get `STALE_TURN` while the round has not changed (`round` is the same), just resend the same orders with the latest `turn`.",
+    "- This game does not list legal moves (`legal` is never sent); build orders from the rules above. An `ILLEGAL_ACTION` message names the bad order, and you may send corrected orders for the same round.",
+  ].join("\n"),
+  view: [
+    "- `round`: rounds finished so far; `maxRounds`: the game ends after this many.",
+    "- `fog`: whether fog of war is on (game option).",
+    "- `players`: all player IDs in seat order. `alive`: those still playing. `out`: player ID -> `eliminated` | `resigned` | `timedOut`.",
+    "- `nodes`: every node as `{ id, production, owner, troops }`. `id` is the index in the array. `owner` is a player ID or `null` (neutral).",
+    "  `troops` is `null` when fog hides it.",
+    "- `edges`: undirected edges `[a, b]` with `a < b`.",
+    "- `territory`: player ID -> current score (total production owned).",
+    "- `submitted`: for each player in `alive`, whether they have sent orders this round (never what the orders are).",
+    "- `lastMoves`: orders carried out in the previous round, `{ player, from, to, count }` (the counts as sent, before any fighting).",
+    "- `myOrders` (players only): your orders for this round, or `null` if you have not sent them.",
+    "",
+    "Viewpoints: without fog everyone sees every troop count. With fog on, a player sees troop counts only on their own nodes and the nodes next to them, and only `lastMoves` that start or end at such a node (plus their own).",
+    "Spectators and players who are out see no troop counts and no `lastMoves` while fog is on. After the game ends, everything is shown to everyone.",
+    "Owners, production and the graph are always public.",
+    "",
+    "**Presentation:** nodes have no coordinates, names or theme on purpose. Lay out the graph however you like and dress it",
+    "up as anything: star systems, subway stations, rooms in a dungeon, cells in a body. Two clients can show the same game",
+    "in completely different ways. If you generate names, seed them with the room ID so they stay the same for the whole game.",
+  ].join("\n"),
+  options: [
+    "- `maxRounds` (5-100, default 20): number of rounds.",
+    "- `nodesPerPlayer` (3-12, default 6): nodes in each player's sector, including the home. The map has `players x nodesPerPlayer + 1` nodes.",
+    "- `fog` (default false): fog of war. When on, troop counts are hidden except on and next to your own nodes, and spectators see none until the end.",
+  ].join("\n"),
+  examples: [
+    { action: { orders: [{ from: 3, to: 7, count: 5 }] }, meaning: "Send 5 troops from your node 3 to the adjacent node 7" },
+    {
+      action: { orders: [{ from: 3, to: 7, count: 4 }, { from: 3, to: 1, count: 2 }, { from: 8, to: 3, count: 6 }] },
+      meaning: "Split node 3's troops between nodes 7 and 1, and move 6 troops from node 8 into node 3",
+    },
+    { action: { orders: [] }, meaning: "Hold: send nothing this round" },
+  ],
+};

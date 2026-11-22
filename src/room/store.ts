@@ -4,7 +4,7 @@ import { roomOptions, type RoomOptions } from "../lib/options";
 import type { EndReason, RematchInfo, RoomStatus } from "../lib/protocol";
 import type { LogEntry } from "../lib/replay";
 import type { Seed } from "../lib/rng";
-import type { Snapshot } from "./logic";
+import type { Settlement, Snapshot } from "./logic";
 import { createTables } from "./schema";
 
 /**
@@ -24,6 +24,69 @@ const systemEvent = z.union([
 ]);
 export type SystemEvent = z.infer<typeof systemEvent>;
 
+/** meta の値の符号化（meta.value は TEXT）。 */
+interface Codec<T> {
+  enc(v: T): string;
+  dec(s: string): T;
+}
+const text = <T extends string = string>(): Codec<T> => ({ enc: (v) => v, dec: (s) => s as T });
+const num: Codec<number> = { enc: String, dec: Number };
+/** 立っているときだけ "1" を書くフラグ。 */
+const flag: Codec<true> = { enc: () => "1", dec: () => true };
+const json = <T>(): Codec<T> => ({ enc: (v) => JSON.stringify(v), dec: (s) => JSON.parse(s) as T });
+
+/**
+ * meta のキーと値の型。新しいキーはここに足す（GameRoom から文字列のキーを直接書かない）。
+ * schemaVersion は schema.ts が読み書きする。
+ */
+const META = {
+  roomId: text(),
+  gameId: text(),
+  /** ルームの作成時（init）に記録したルールの版 */
+  rulesVersion: num,
+  options: json<unknown>(),
+  gameOptions: json<unknown>(),
+  hostTokenHash: text(),
+  status: text<RoomStatus>(),
+  createdAt: num,
+  startedAt: num,
+  finishedAt: num,
+  /** このルームを消す時刻。待機中は最後の変更から、終了後は終了から数える。試合中は無い */
+  cleanupAt: num,
+  /** 現在の手番の締め切り */
+  deadline: num,
+  /** 次に払い出す席の番号（allocateSeat） */
+  nextSeat: num,
+  /** 再戦ルームの予約席：元のルームのプレイヤー ID → このルームの席 ID */
+  reserved: json<Record<string, string>>(),
+  seed: text<Seed>(),
+  /** 練習相手の席 */
+  bots: json<string[]>(),
+  /** 時間切れ・投了による決着 */
+  forfeit: json<GameResult>(),
+  /** 終了時に確定した結果 */
+  result: json<GameResult>(),
+  endReason: text<EndReason>(),
+  /** 一覧の索引（D1 の rooms）に書いた回数。書いたことのないルームは無い */
+  indexRev: num,
+  indexedAt: num,
+  /** エンジンが無くなって畳んだ（retire） */
+  retired: flag,
+  /** D1 に結果を書き終えた */
+  persisted: flag,
+  persistAttempts: num,
+  /** D1 への書き込みを諦めた */
+  persistGaveUp: flag,
+  /** 再戦ルームの ID（最初の rematch で決める） */
+  rematchRoomId: text(),
+  /** 再戦ルームを作り終えた */
+  rematchReady: flag,
+  /** 再戦を申し込んだプレイヤー */
+  rematchRequested: json<string[]>(),
+} as const;
+export type MetaKey = keyof typeof META;
+export type MetaValue<K extends MetaKey> = (typeof META)[K] extends Codec<infer T> ? T : never;
+
 export class RoomStore {
   /** テーブルが作成済み（= init 済みのルーム）か。 */
   ready: boolean;
@@ -41,28 +104,68 @@ export class RoomStore {
 
   // ---- meta ----
 
-  getMeta(key: string): string | null {
+  /** meta の値（無ければ null）。キーと型は META。 */
+  getMeta<K extends MetaKey>(key: K): MetaValue<K> | null {
     if (!this.ready) return null;
     const rows = this.sql.exec("SELECT value FROM meta WHERE key = ?", key).toArray();
-    return rows.length ? (rows[0]!.value as string) : null;
+    return rows.length ? (META[key].dec(rows[0]!.value as string) as MetaValue<K>) : null;
   }
 
-  setMeta(key: string, value: string): void {
-    this.sql.exec("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", key, value);
+  setMeta<K extends MetaKey>(key: K, value: MetaValue<K>): void {
+    const codec = META[key] as Codec<MetaValue<K>>;
+    this.sql.exec("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", key, codec.enc(value));
   }
 
-  deleteMeta(key: string): void {
+  deleteMeta(key: MetaKey): void {
     this.sql.exec("DELETE FROM meta WHERE key = ?", key);
   }
 
-  private getJson<T>(key: string, fallback: T): T {
-    const v = this.getMeta(key);
-    return v === null ? fallback : (JSON.parse(v) as T);
+  /** 新しいルームの meta を書く（init のトランザクションの中で、createTables の後に呼ぶ）。 */
+  initMeta(m: {
+    roomId: string;
+    gameId: string;
+    rulesVersion: number;
+    options: RoomOptions;
+    gameOptions: unknown;
+    hostTokenHash: string;
+    createdAt: number;
+    cleanupAt: number;
+    reserved: Record<string, string> | null;
+  }): void {
+    this.setMeta("roomId", m.roomId);
+    this.setMeta("gameId", m.gameId);
+    this.setMeta("rulesVersion", m.rulesVersion);
+    this.setMeta("options", m.options);
+    this.setMeta("gameOptions", m.gameOptions);
+    this.setMeta("hostTokenHash", m.hostTokenHash);
+    this.setMeta("status", "waiting");
+    this.setMeta("createdAt", m.createdAt);
+    this.setMeta("cleanupAt", m.cleanupAt);
+    // 再戦ルームでは、練習相手などの追加の席は予約席の後ろから
+    this.setMeta("nextSeat", m.reserved ? Object.keys(m.reserved).length + 1 : 1);
+    if (m.reserved) this.setMeta("reserved", m.reserved);
   }
 
-  private getNumber(key: string): number | null {
-    const v = this.getMeta(key);
-    return v === null ? null : Number(v);
+  /** commit で確定した状態（logic.ts の settle）を書く。 */
+  recordSettlement(s: Settlement): void {
+    switch (s.kind) {
+      case "waiting":
+        this.setMeta("cleanupAt", s.cleanupAt);
+        return;
+      case "playing":
+        this.setMeta("deadline", s.deadline);
+        return;
+      case "finished":
+        this.setMeta("status", "finished");
+        this.setMeta("result", s.result);
+        this.setMeta("finishedAt", s.finishedAt);
+        this.setMeta("cleanupAt", s.cleanupAt);
+        return;
+    }
+  }
+
+  roomId(): string | null {
+    return this.getMeta("roomId");
   }
 
   gameId(): string | null {
@@ -75,7 +178,7 @@ export class RoomStore {
   }
 
   status(): RoomStatus {
-    return this.getMeta("status") as RoomStatus;
+    return this.getMeta("status")!;
   }
 
   seed(): Seed {
@@ -84,43 +187,59 @@ export class RoomStore {
 
   /** ルームの作成時（init）に記録したルールの版。 */
   rulesVersion(): number {
-    return Number(this.getMeta("rulesVersion")!);
+    return this.getMeta("rulesVersion")!;
   }
 
   /** ゲーム固有のオプション（init で既定値を補って保存した値。オプションの無いゲームは null）。 */
   gameOptions(): unknown {
-    return this.getJson<unknown>("gameOptions", null);
+    return this.getMeta("gameOptions") ?? null;
   }
 
   /** ルームのオプション。保存時に検証済みだが、読めなければ既定値（{}）として扱う。 */
   options(): RoomOptions {
-    const parsed = roomOptions.safeParse(this.getJson<unknown>("options", {}));
+    const parsed = roomOptions.safeParse(this.getMeta("options") ?? {});
     return parsed.success ? parsed.data : {};
   }
 
   /** 現在の手番の締め切り（epoch ms）。status は見ない。 */
   deadline(): number | null {
-    return this.getNumber("deadline");
+    return this.getMeta("deadline");
   }
 
   /** このルームを消す時刻（epoch ms）。待機中は最後の変更から、終了後は終了から数える。 */
   cleanupAt(): number | null {
-    return this.getNumber("cleanupAt");
+    return this.getMeta("cleanupAt");
   }
 
   /** 一覧の索引（D1 の rooms）を最後に書いた（書こうとした）時刻。索引に載せないルームは null。 */
   indexedAt(): number | null {
-    return this.getNumber("indexedAt");
+    return this.getMeta("indexedAt");
+  }
+
+  /** 一覧の索引に書いたことがあるか（掃除のときに D1 の行を消すかどうか）。 */
+  indexed(): boolean {
+    return this.getMeta("indexRev") !== null;
+  }
+
+  /**
+   * 索引に書く rev を払い出し、書いた時刻を残す。rev は呼ぶたびに増える
+   * （同期処理の中で状態と一緒に読むので、後の rev ほど新しい状態）。
+   */
+  nextIndexRev(now: number): number {
+    const rev = (this.getMeta("indexRev") ?? 0) + 1;
+    this.setMeta("indexRev", rev);
+    this.setMeta("indexedAt", now);
+    return rev;
   }
 
   /** 練習相手（サーバー側の Bot）のプレイヤー ID。 */
   bots(): string[] {
-    return this.getJson<string[]>("bots", []);
+    return this.getMeta("bots") ?? [];
   }
 
   /** 時間切れ・投了による決着（ゲーム自身の結果より優先度は低い）。 */
   forfeit(): GameResult | null {
-    return this.getJson<GameResult | null>("forfeit", null);
+    return this.getMeta("forfeit");
   }
 
   /**
@@ -128,7 +247,7 @@ export class RoomStore {
    * （エンジンが無くなっても D1 に書けるように、また後から計算し直した結果とずれないように）。
    */
   result(): GameResult | null {
-    return this.getJson<GameResult | null>("result", null);
+    return this.getMeta("result");
   }
 
   /** 試合が終わった理由。時間切れ・投了で終わったときだけ書く。無ければ通常の決着。 */
@@ -137,15 +256,33 @@ export class RoomStore {
     return r === "timeout" || r === "resign" ? r : "normal";
   }
 
+  /** エンジンが無くなって畳んだルームか（retire）。 */
+  retired(): boolean {
+    return this.getMeta("retired") === true;
+  }
+
+  /** 終了済みで、D1 への書き込みが済んでおらず、諦めてもいないか。 */
+  persistPending(): boolean {
+    return this.status() === "finished" && !this.getMeta("persisted") && !this.getMeta("persistGaveUp");
+  }
+
   /** 再戦用に席を予約したルームなら、元のルームのプレイヤー ID → このルームの席 ID。 */
   reservedSeats(): Record<string, string> | null {
-    return this.getJson<Record<string, string> | null>("reserved", null);
+    return this.getMeta("reserved");
   }
 
   rematchInfo(): RematchInfo | null {
     const roomId = this.getMeta("rematchRoomId");
-    const by = this.getMeta("rematchRequested");
-    return roomId && by ? { roomId, requestedBy: JSON.parse(by) as string[] } : null;
+    const requestedBy = this.getMeta("rematchRequested");
+    return roomId && requestedBy ? { roomId, requestedBy } : null;
+  }
+
+  /** 再戦の申し込みを記録する。新しく申し込んだなら true（もう申し込んでいれば false）。 */
+  requestRematch(pid: string): boolean {
+    const requested = this.getMeta("rematchRequested") ?? [];
+    if (requested.includes(pid)) return false;
+    this.setMeta("rematchRequested", [...requested, pid]);
+    return true;
   }
 
   /**
@@ -154,8 +291,8 @@ export class RoomStore {
    * seq は番号と揃える（手番の順 = ORDER BY seq）。nextSeat は init で書く。
    */
   allocateSeat(): { id: string; seq: number } {
-    const n = Number(this.getMeta("nextSeat")!);
-    this.setMeta("nextSeat", String(n + 1));
+    const n = this.getMeta("nextSeat")!;
+    this.setMeta("nextSeat", n + 1);
     return { id: `p${n}`, seq: n - 1 };
   }
 

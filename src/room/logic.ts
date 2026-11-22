@@ -1,6 +1,7 @@
 import { GameError, type AnyGame, type GameResult } from "../games/types";
 import type { EndReason, RematchInfo, RoomState, RoomStatus, ServerMessage } from "../lib/protocol";
 import { applyResign, applyTimeout } from "../lib/replay";
+import { FINISHED_ROOM_TTL_MS, WAITING_ROOM_TTL_MS } from "../lib/options";
 import { rngForTurn, type Seed } from "../lib/rng";
 
 /**
@@ -177,6 +178,107 @@ export function nextDeadline(
     pending.length < prev.length &&
     pending.every((p) => prev.includes(p));
   return shrinking ? prevDeadline : now + turnTimeMs;
+}
+
+/**
+ * commit で確定する状態（write の後のルームの状態から決める）。GameRoom はこれを meta に書き、確定後の副作用に使う。
+ * - waiting … 放置された待機中のルームは、最後の変更から WAITING_ROOM_TTL_MS で消す
+ * - finished … 結果を確定し、終了から FINISHED_ROOM_TTL_MS で消す
+ * - playing … 次の締め切り（nextDeadline）
+ */
+export type Settlement =
+  | { kind: "waiting"; cleanupAt: number }
+  | { kind: "playing"; deadline: number }
+  | { kind: "finished"; result: GameResult; finishedAt: number; cleanupAt: number };
+
+export function settle(
+  room:
+    | { status: "waiting" }
+    | {
+        status: "playing";
+        game: AnyGame;
+        state: unknown;
+        forfeit: GameResult | null;
+        /** write 前に行動できたプレイヤー（締め切りを延ばすかどうか。nextDeadline） */
+        prev: string[] | null;
+        prevDeadline: number | null;
+        turnTimeMs: number;
+      },
+  now: number,
+): Settlement {
+  if (room.status === "waiting") return { kind: "waiting", cleanupAt: now + WAITING_ROOM_TTL_MS };
+  const result = resultOf(room.game, room.state, room.forfeit);
+  if (result) return { kind: "finished", result, finishedAt: now, cleanupAt: now + FINISHED_ROOM_TTL_MS };
+  const pending = room.game.currentPlayers(room.state);
+  return { kind: "playing", deadline: nextDeadline(room.prev, room.prevDeadline, pending, now, room.turnTimeMs) };
+}
+
+/**
+ * 掃除の時刻。playing の間は（待機中に書いた値が残っていても）消さない。ただしエンジンが無いルームは
+ * 進めようがないので消す（cleanupAt は retire が書く）。
+ */
+export const cleanupDueAt = (status: RoomStatus, hasEngine: boolean, cleanupAt: number | null): number | null =>
+  status === "playing" && hasEngine ? null : cleanupAt;
+
+/** alarm の時刻を決めるのに使うルームの状態。 */
+export type AlarmFacts = {
+  status: RoomStatus;
+  /** 作成時の rulesVersion のエンジンがあるか */
+  hasEngine: boolean;
+  /** 終了済みで、D1 への書き込みが済んでおらず、諦めてもいないか */
+  persistPending: boolean;
+  cleanupAt: number | null;
+  deadline: number | null;
+};
+
+/**
+ * 今張っておくべき alarm の時刻。playing なら手番の締め切り、終了後で D1 未書き込みなら今（再試行）、それ以外は掃除。
+ * エンジンが無いルームは時間切れを処理できないので掃除だけ（毎回失敗する alarm でリクエストを消費しないように）。
+ * D1 の再試行はエンジンを使わない（meta の result）ので、エンジンが無くても続ける。
+ */
+export function wantedAlarm(f: AlarmFacts, now: number): number | null {
+  if (f.status === "playing" && f.hasEngine) return f.deadline;
+  if (f.persistPending) return now;
+  return cleanupDueAt(f.status, f.hasEngine, f.cleanupAt);
+}
+
+/**
+ * alarm が発火したときにすること。retire はエンジンが無いルームを畳んでから step を行うこと。
+ * - cleanup … 掃除の時刻を過ぎた。ルームを消す
+ * - persist … 終了済み。D1 への書き込みを再試行する（済んでいれば掃除の alarm を張る）
+ * - armCleanup … 早すぎた掃除の alarm（待機中に更新された）か、エンジンが無いルーム。掃除の時刻で張り直す
+ * - bots … 練習相手の続き（runBots が1回の上限に達して張った alarm）
+ * - armDeadline … 締め切りがまだ先（古い alarm の誤発火）。締め切りで張り直す
+ * - timeout … 手番の締め切りを過ぎた。時間切れを確定させる
+ */
+export type AlarmStep = "cleanup" | "persist" | "armCleanup" | "bots" | "armDeadline" | "timeout";
+
+export function planAlarm(f: AlarmFacts & { botPending: boolean }, now: number): { retire: boolean; step: AlarmStep } {
+  const due = cleanupDueAt(f.status, f.hasEngine, f.cleanupAt);
+  if (due !== null && now >= due) return { retire: false, step: "cleanup" };
+  // D1 への書き込みの再試行はエンジンを使わないので、エンジンが無くなっていても続ける（戦績を失わないように）。
+  // エンジンが無いのに例外にすると alarm が再試行され続ける（1回 = 1リクエスト）ので、畳んで掃除だけ予約する
+  const retire = !f.hasEngine;
+  if (f.status === "finished") return { retire, step: "persist" };
+  if (retire || f.status !== "playing") return { retire, step: "armCleanup" };
+  const deadlinePassed = f.deadline !== null && now >= f.deadline;
+  if (f.botPending && !deadlinePassed) return { retire, step: "bots" };
+  if (f.deadline !== null && !deadlinePassed) return { retire, step: "armDeadline" };
+  return { retire, step: "timeout" };
+}
+
+/**
+ * D1 への結果書き込みが失敗したときの再試行（alarm で指数バックオフ、最大1時間おき）。
+ * D1 の日次上限は UTC 0時にリセットされるので、終了から 26 時間は諦めない（alarm 1回 = 1リクエスト）。
+ */
+export const PERSIST_RETRY_BASE_MS = 30_000;
+export const PERSIST_RETRY_MAX_MS = 60 * 60 * 1000;
+export const PERSIST_RETRY_WINDOW_MS = 26 * 60 * 60 * 1000;
+
+/** attempts 回失敗した後の次の再試行の時刻。終了から PERSIST_RETRY_WINDOW_MS を過ぎていれば null（諦める）。 */
+export function nextPersistRetry(attempts: number, finishedAt: number, now: number): number | null {
+  if (now - finishedAt > PERSIST_RETRY_WINDOW_MS) return null;
+  return now + Math.min(PERSIST_RETRY_BASE_MS * 2 ** attempts, PERSIST_RETRY_MAX_MS);
 }
 
 export type Outcome = "win" | "loss" | "draw";

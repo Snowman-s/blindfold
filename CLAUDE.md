@@ -48,8 +48,8 @@ src/
   index.ts            # Worker エントリ（Hono app + DO の export）
   routes/             # REST ルート
   room/GameRoom.ts    # Durable Object（RPC の入口・トランザクション・alarm・配信・D1 の実行・練習相手）
-  room/logic.ts       # ルームの状態遷移と配る状態の組み立て（純粋関数。Node でテストできる）
-  room/store.ts       # DO 内 SQLite の読み書き（RoomStore。GameRoom からは SQL を書かない）
+  room/logic.ts       # ルームの状態遷移（commit で確定する状態 settle、alarm の判断 planAlarm / wantedAlarm、D1 再試行の間隔）と配る状態の組み立て（純粋関数。Node でテストできる）
+  room/store.ts       # DO 内 SQLite の読み書き（RoomStore。GameRoom からは SQL を書かない）。meta のキーと型は META に1か所で定義する
   room/d1.ts          # D1 に書く文（matches / results / rooms 索引）の組み立て
   room/schema.ts      # DO 内 SQLite のスキーマと移行（MIGRATIONS。列やテーブルを足すときはここ）
   games/
@@ -216,7 +216,7 @@ export interface GameDefinition<S, A, O = null> {    // O = ゲーム固有の�
 1. ルームのライフサイクル：`waiting` → `playing` → `finished`
 2. プレイヤーの参加とトークン検証。WS には `serializeAttachment({ playerId })` でプレイヤー情報を持たせる
 3. 行動の受信 → `actionSchema` で検証 → 手番とターンを確認 → `apply` → ログに追記 → 状態を保存 → 全接続に `view` を配信
-   - 何を書くかの判断（行動・投了・時間切れの解決、締め切り、配る状態）は `room/logic.ts` の純粋関数、SQL は `room/store.ts`、D1 の文は `room/d1.ts`。GameRoom は「判断 → `commit`（1トランザクション）→ 副作用」の順に呼ぶだけにする
+   - 何を書くかの判断（行動・投了・時間切れの解決、締め切り・決着の確定、alarm で何をするか、配る状態）は `room/logic.ts` の純粋関数、SQL は `room/store.ts`、D1 の文は `room/d1.ts`。GameRoom は「入口（`enter` / `enterPlayer` / `enterViewer`）→ 判断 → `commit`（1トランザクション）→ 副作用」の順に呼ぶだけにする
 4. 持ち時間切れ（Alarm）時の処理：ゲームごとに定義する（自動パス／負け扱いなど）。デフォルトは負け扱い
 5. 終了時に D1 へ結果を書き込む
 6. 掃除：待機中は最後の変更から `WAITING_ROOM_TTL_MS`（24時間）、終了後は終了から `FINISHED_ROOM_TTL_MS`（7日）で `deleteAll()` し、D1 の `rooms` の行も消す（`matches`・`results` は残す）。時刻は `meta.cleanupAt`。alarm は1つなので、締め切り・D1 の再試行が無いときの行き先にする（`wantedAlarm()`）。試合中は消さない（エンジンが消えたルームは除く）。接続は close コード 4001 で閉じる

@@ -7,15 +7,21 @@ import {
   decideResign,
   decideTimeout,
   nextDeadline,
+  nextPersistRetry,
+  planAlarm,
   outcomeOf,
   practiceBotCount,
   rematchSeats,
   roomState,
+  settle,
   stateMessage,
+  wantedAlarm,
+  type AlarmFacts,
   type RoomCore,
 } from "../../src/room/logic";
 import { elimination } from "../fixtures/elimination";
 import { guess } from "../fixtures/guess";
+import { FINISHED_ROOM_TTL_MS, WAITING_ROOM_TTL_MS } from "../../src/lib/options";
 
 // GameRoom の状態遷移は DO を起こさずに Node で確かめられる（src/room/logic.ts は Cloudflare 非依存）
 const ttt = games["tictactoe"]!;
@@ -107,5 +113,67 @@ describe("その他", () => {
     expect(outcomeOf({ winners: [] }, false, "p1")).toBe("draw");
     expect(outcomeOf({ winners: [] }, true, "p1")).toBe("loss");
     expect(outcomeOf({ winners: ["p1"] }, true, "p1")).toBe("win");
+  });
+});
+
+describe("settle", () => {
+  const base = { game: ttt, forfeit: null, prev: null, prevDeadline: null, turnTimeMs: 1000 };
+  it("待機中は最後の変更から WAITING_ROOM_TTL_MS で消す", () => {
+    expect(settle({ status: "waiting" }, 10)).toEqual({ kind: "waiting", cleanupAt: 10 + WAITING_ROOM_TTL_MS });
+  });
+  it("決着していなければ締め切り、決着（forfeit も）していれば終了から FINISHED_ROOM_TTL_MS で消す", () => {
+    const state = ttt.init(P, "s", null);
+    expect(settle({ status: "playing", ...base, state }, 10)).toEqual({ kind: "playing", deadline: 1010 });
+    const forfeit = { winners: ["p2"] };
+    expect(settle({ status: "playing", ...base, state, forfeit }, 10)).toEqual({
+      kind: "finished",
+      result: forfeit,
+      finishedAt: 10,
+      cleanupAt: 10 + FINISHED_ROOM_TTL_MS,
+    });
+  });
+});
+
+describe("planAlarm / wantedAlarm", () => {
+  const facts = (f: Partial<AlarmFacts>): AlarmFacts => ({
+    status: "playing", hasEngine: true, persistPending: false, cleanupAt: null, deadline: 100, ...f,
+  });
+  const plan = (f: Partial<AlarmFacts>, now: number, botPending = false) => planAlarm({ ...facts(f), botPending }, now);
+
+  it("試合中：締め切り前は張り直し、過ぎたら時間切れ。練習相手は締め切り前だけ打つ", () => {
+    expect(plan({}, 50)).toEqual({ retire: false, step: "armDeadline" });
+    expect(plan({}, 100)).toEqual({ retire: false, step: "timeout" });
+    expect(plan({}, 50, true)).toEqual({ retire: false, step: "bots" });
+    expect(plan({}, 100, true)).toEqual({ retire: false, step: "timeout" });
+    expect(wantedAlarm(facts({}), 0)).toBe(100);
+  });
+  it("試合中は待機中に書いた cleanupAt が残っていても消さない", () => {
+    expect(plan({ cleanupAt: 10 }, 50)).toEqual({ retire: false, step: "armDeadline" });
+  });
+  it("待機中：掃除の時刻を過ぎたら消し、早すぎれば張り直す", () => {
+    expect(plan({ status: "waiting", cleanupAt: 10, deadline: null }, 10)).toEqual({ retire: false, step: "cleanup" });
+    expect(plan({ status: "waiting", cleanupAt: 10, deadline: null }, 5)).toEqual({ retire: false, step: "armCleanup" });
+    expect(wantedAlarm(facts({ status: "waiting", cleanupAt: 10, deadline: null }), 0)).toBe(10);
+  });
+  it("終了後：D1 未書き込みなら今すぐ再試行（エンジンが無くても）", () => {
+    const f = { status: "finished" as const, persistPending: true, cleanupAt: 1000 };
+    expect(plan(f, 50)).toEqual({ retire: false, step: "persist" });
+    expect(plan({ ...f, hasEngine: false }, 50)).toEqual({ retire: true, step: "persist" });
+    expect(wantedAlarm(facts(f), 50)).toBe(50);
+    expect(wantedAlarm(facts({ ...f, persistPending: false }), 50)).toBe(1000);
+  });
+  it("エンジンが無い試合中のルームは畳んで掃除だけ（時間切れは処理しない）", () => {
+    expect(plan({ hasEngine: false }, 500)).toEqual({ retire: true, step: "armCleanup" });
+    expect(plan({ hasEngine: false, cleanupAt: 400 }, 500)).toEqual({ retire: false, step: "cleanup" });
+    expect(wantedAlarm(facts({ hasEngine: false, cleanupAt: 400 }), 0)).toBe(400);
+  });
+});
+
+describe("nextPersistRetry", () => {
+  it("指数バックオフで最大1時間おき、終了から 26 時間で諦める", () => {
+    expect(nextPersistRetry(0, 0, 0)).toBe(30_000);
+    expect(nextPersistRetry(1, 0, 0)).toBe(60_000);
+    expect(nextPersistRetry(20, 0, 0)).toBe(60 * 60 * 1000);
+    expect(nextPersistRetry(0, 0, 26 * 60 * 60 * 1000 + 1)).toBeNull();
   });
 });

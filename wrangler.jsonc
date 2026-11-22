@@ -25,9 +25,9 @@
   "d1_databases": [
     {
       "binding": "DB",
-      // デプロイ前に `pnpm wrangler d1 create apigames` で作成し、返ってきた ID に置き換える
+      // `pnpm wrangler d1 create apigames` で作成した ID
       "database_name": "apigames",
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "c726ff90-174f-4c35-844e-b2d58a376b90",
       "migrations_dir": "migrations"
     }
   ]

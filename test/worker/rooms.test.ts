@@ -11,6 +11,7 @@ describe("REST: ルーム", () => {
     expect(r.json).toEqual([
       expect.objectContaining({ id: "tictactoe", minPlayers: 2, maxPlayers: 2, rulesUrl: "/games/tictactoe/rules" }),
       expect.objectContaining({ id: "highcard", minPlayers: 2, maxPlayers: 2, rulesUrl: "/games/highcard/rules" }),
+      expect.objectContaining({ id: "frontier", minPlayers: 2, maxPlayers: 4, hasOptions: true, listsLegalActions: false }),
     ]);
     for (const g of r.json) expect(g.summary.length).toBeGreaterThan(0);
   });

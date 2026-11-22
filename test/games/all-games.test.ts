@@ -55,7 +55,8 @@ const suite: Record<string, AnyGame> = {
   [guess.id]: guess as AnyGame,
 };
 
-describe.each(Object.keys(suite))("%s", (gameId) => {
+// 1試合が長いゲーム（frontier は 100 試合 × 数十手 × 全視点）もあるので、制限時間を既定（5 秒）より長くする
+describe.each(Object.keys(suite))("%s", { timeout: 30_000 }, (gameId) => {
   const game = suite[gameId]!;
 
   it("legalActions か practiceAction のどちらかを定義している（練習相手が打てる）", () => {

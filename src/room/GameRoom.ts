@@ -361,26 +361,30 @@ export class GameRoom extends DurableObject<Env> {
    * write と、決着判定・締め切りの更新を1つのトランザクションで確定し、その後で alarm・配信・D1 を行う。
    * 確定後の副作用が失敗しても変更は取り消さず成功として扱う（クライアントには確定済みの状態を配る）。
    * prev は write 前に行動できたプレイヤー（締め切りを延ばすかどうかの判定。nextDeadline）。
+   * resign は write が投了か（行動できるプレイヤーが変わらなければ締め切りと phaseTurn をそのまま残す。settle）。
    */
-  private async commit(write: () => void, prev: string[] | null = null): Promise<void> {
+  private async commit(write: () => void, prev: string[] | null = null, resign = false): Promise<void> {
     const out = this.ctx.storage.transactionSync((): Settlement => {
       const s = this.store;
       const prevDeadline = s.deadline();
+      const prevPhaseTurn = s.getMeta("phaseTurn");
       write();
-      const settled = settle(
-        s.status() === "waiting"
-          ? { status: "waiting" }
-          : {
-              status: "playing",
-              game: this.game(),
-              state: s.loadSnapshot().state,
-              forfeit: s.forfeit(),
-              prev,
-              prevDeadline,
-              turnTimeMs: s.options().turnTimeMs ?? DEFAULT_TURN_TIME_MS,
-            },
-        Date.now(),
-      );
+      const playing = () => {
+        const snap = s.loadSnapshot(); // 待機中はまだ無いので、試合中だけ読む
+        return {
+          status: "playing" as const,
+          game: this.game(),
+          state: snap.state,
+          turn: snap.turn,
+          forfeit: s.forfeit(),
+          prev,
+          prevDeadline,
+          prevPhaseTurn,
+          resign,
+          turnTimeMs: s.options().turnTimeMs ?? DEFAULT_TURN_TIME_MS,
+        };
+      };
+      const settled = settle(s.status() === "waiting" ? { status: "waiting" } : playing(), Date.now());
       s.recordSettlement(settled);
       return settled;
     });
@@ -919,7 +923,7 @@ export class GameRoom extends DurableObject<Env> {
     await this.commit(() => {
       this.store.appendSystem(snap.turn, { $resign: pid });
       this.writeResolution(snap.turn, r.data);
-    }, game.currentPlayers(snap.state));
+    }, game.currentPlayers(snap.state), true);
     return ok(null);
   }
 
@@ -936,7 +940,7 @@ export class GameRoom extends DurableObject<Env> {
     }
     const game = this.game();
     const snap = this.store.loadSnapshot();
-    const r = decideAction(game, snap, pid, turn, rawAction, this.store.seed());
+    const r = decideAction(game, snap, pid, turn, rawAction, this.store.seed(), this.store.getMeta("phaseTurn") ?? snap.turn);
     if (!r.ok) return r;
     // ログ追記・スナップショット・締め切りは commit 内の1トランザクションで確定する
     await this.commit(() => {

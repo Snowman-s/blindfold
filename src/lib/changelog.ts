@@ -20,6 +20,20 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.8.0",
+    date: "2026-11-22",
+    added: [
+      "New game `frontier`: 2-4 players on a generated graph. Every round all players send troop orders at the same " +
+        "time and they resolve together. It has game options (`maxRounds`, `nodesPerPlayer`, `fog`), does not list " +
+        "legal moves, and keeps playing when one player resigns or times out. See `/games/frontier/rules.md`.",
+      "On a simultaneous turn, an action whose `turn` is older than the current one but from the same simultaneous turn " +
+        "(other players acted in between) is accepted while the sender may still act, instead of failing with `STALE_TURN`. " +
+        "Duplicates and turns from before the simultaneous turn still get `STALE_TURN`.",
+      "A resign that does not change who may act now (for example by a player who already acted on a simultaneous turn) " +
+        "keeps the current deadline and simultaneous turn, so in-flight actions are still accepted and nobody gets extra time.",
+    ],
+  },
+  {
     version: "0.7.0",
     date: "2026-11-22",
     added: [

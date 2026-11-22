@@ -98,8 +98,20 @@ function fromGameError(e: unknown): RoomError | null {
 }
 
 /**
- * 行動の検証と適用。turn が現在のターンと違えば STALE_TURN、形が違えば BAD_REQUEST、
+ * 送られた turn を受け付けるか。現在のターンと一致すれば受け付ける。古くても、同じ同時手番の中
+ * （phaseTurn 以降。phaseTurn は同時手番が始まったターン）で、送った人がまだ行動できるなら受け付ける
+ * （同時手番では他の人が出すたびに turn が進むので、届くまでに他の人が出しただけの手を STALE_TURN にしない）。
+ * 二重送信は、1回目で行動できる人から外れるので STALE_TURN のまま。
+ */
+export function acceptsTurn(game: AnyGame, snap: Snapshot, pid: string, turn: number, phaseTurn: number): boolean {
+  if (turn === snap.turn) return true;
+  return phaseTurn <= turn && turn < snap.turn && game.currentPlayers(snap.state).includes(pid);
+}
+
+/**
+ * 行動の検証と適用。turn を受け付けなければ（acceptsTurn）STALE_TURN、形が違えば BAD_REQUEST、
  * ゲームが拒否すれば GameError のコード。成功なら検証済みの行動と次の状態。
+ * phaseTurn は今の同時手番が始まったターン（記録が無ければ snap.turn で、turn の完全一致だけを受け付ける）。
  */
 export function decideAction(
   game: AnyGame,
@@ -108,8 +120,9 @@ export function decideAction(
   turn: number,
   rawAction: unknown,
   seed: Seed,
+  phaseTurn: number = snap.turn,
 ): RoomResult<{ action: unknown; next: unknown }> {
-  if (turn !== snap.turn) return fail(409, "STALE_TURN", `current turn is ${snap.turn}`);
+  if (!acceptsTurn(game, snap, pid, turn, phaseTurn)) return fail(409, "STALE_TURN", `current turn is ${snap.turn}`);
   const parsed = game.actionSchema.safeParse(rawAction);
   if (!parsed.success) return fail(400, "BAD_REQUEST", "invalid action");
   try {
@@ -161,34 +174,45 @@ export function decideTimeout(
 }
 
 /**
- * 次の締め切り。prev（変更前に行動できたプレイヤー）を渡したとき、行動できるプレイヤーが減っただけ
- * （同時手番で誰かが出した）なら前の締め切りのまま。手番が移ったとき・新しいラウンドに入ったときだけ持ち時間をリセットする。
+ * 同じ同時手番が続いているか：prev（変更前に行動できたプレイヤー）から、行動できるプレイヤーが減っただけ
+ * （同時手番で誰かが出した・抜けた）なら true。手番が移ったとき・新しいラウンドに入ったときは false。
+ * unchangedKeeps は「行動できるプレイヤーが変わらなかった」ときも true にするか。投了のときだけ true：
+ * 通常の手で同じ顔ぶれになるのは新しいラウンド（全員が出し終えた）だが、もう出した人や手番でない人の投了では
+ * 顔ぶれが変わらないまま同じ手番が続く（締め切りを延ばしたり、送信中の手を STALE_TURN にしたりしない）。
  */
+export const sameSimultaneousTurn = (
+  prev: string[] | null,
+  prevDeadline: number | null,
+  pending: string[],
+  unchangedKeeps = false,
+): boolean =>
+  prev !== null &&
+  prevDeadline !== null &&
+  pending.length > 0 &&
+  (pending.length < prev.length || (unchangedKeeps && pending.length === prev.length)) &&
+  pending.every((p) => prev.includes(p));
+
+/** 次の締め切り。同じ同時手番が続いているなら前の締め切りのまま、そうでなければ持ち時間をリセットする。 */
 export function nextDeadline(
   prev: string[] | null,
   prevDeadline: number | null,
   pending: string[],
   now: number,
   turnTimeMs: number,
+  unchangedKeeps = false,
 ): number {
-  const shrinking =
-    prev !== null &&
-    prevDeadline !== null &&
-    pending.length > 0 &&
-    pending.length < prev.length &&
-    pending.every((p) => prev.includes(p));
-  return shrinking ? prevDeadline : now + turnTimeMs;
+  return sameSimultaneousTurn(prev, prevDeadline, pending, unchangedKeeps) ? prevDeadline! : now + turnTimeMs;
 }
 
 /**
  * commit で確定する状態（write の後のルームの状態から決める）。GameRoom はこれを meta に書き、確定後の副作用に使う。
  * - waiting … 放置された待機中のルームは、最後の変更から WAITING_ROOM_TTL_MS で消す
  * - finished … 結果を確定し、終了から FINISHED_ROOM_TTL_MS で消す
- * - playing … 次の締め切り（nextDeadline）
+ * - playing … 次の締め切り（nextDeadline）と、今の同時手番が始まったターン（phaseTurn。acceptsTurn）
  */
 export type Settlement =
   | { kind: "waiting"; cleanupAt: number }
-  | { kind: "playing"; deadline: number }
+  | { kind: "playing"; deadline: number; phaseTurn: number }
   | { kind: "finished"; result: GameResult; finishedAt: number; cleanupAt: number };
 
 export function settle(
@@ -203,6 +227,12 @@ export function settle(
         prev: string[] | null;
         prevDeadline: number | null;
         turnTimeMs: number;
+        /** write 後のターン */
+        turn: number;
+        /** write 前の phaseTurn（記録の無いルームは null） */
+        prevPhaseTurn: number | null;
+        /** write が投了か（行動できるプレイヤーが変わらなければ同じ手番が続く。sameSimultaneousTurn） */
+        resign?: boolean;
       },
   now: number,
 ): Settlement {
@@ -210,7 +240,13 @@ export function settle(
   const result = resultOf(room.game, room.state, room.forfeit);
   if (result) return { kind: "finished", result, finishedAt: now, cleanupAt: now + FINISHED_ROOM_TTL_MS };
   const pending = room.game.currentPlayers(room.state);
-  return { kind: "playing", deadline: nextDeadline(room.prev, room.prevDeadline, pending, now, room.turnTimeMs) };
+  const keep = room.resign ?? false;
+  const same = sameSimultaneousTurn(room.prev, room.prevDeadline, pending, keep);
+  return {
+    kind: "playing",
+    deadline: nextDeadline(room.prev, room.prevDeadline, pending, now, room.turnTimeMs, keep),
+    phaseTurn: same && room.prevPhaseTurn !== null ? room.prevPhaseTurn : room.turn,
+  };
 }
 
 /**

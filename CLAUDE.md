@@ -240,11 +240,17 @@ pnpm install
 pnpm dev                       # wrangler dev
 pnpm test                      # vitest
 pnpm typecheck                 # tsc --noEmit
-pnpm deploy                    # wrangler deploy (run `pnpm wrangler d1 migrations apply blindfold --remote` first; otherwise result writes keep failing)
+pnpm deploy                    # wrangler deploy (run `pnpm wrangler d1 migrations apply blindfold --remote` first; otherwise result writes keep failing). Normally not run by hand; CI deploys (see below)
 pnpm wrangler d1 migrations apply blindfold --local
 pnpm tsx bots/random-bot.ts --url http://localhost:8787 --room <roomId> [--host-token <hostToken>]
 pnpm tsx bots/random-bot.ts --url http://localhost:8787 --quickmatch tictactoe
 ```
+
+## CI / deploy
+
+- Direct pushes to master are blocked. Make a branch and merge through a PR.
+- `.github/workflows/ci.yml`: runs `typecheck` and `test` on every PR (the required check's job name is `test`). Warns when a PR changes D1 migrations, the DO `migrations` in wrangler.jsonc, or a `rulesVersion`, because those hit production the moment the PR is merged.
+- `.github/workflows/deploy.yml`: on push to master (= merge), runs tests → `d1 migrations apply --remote` → `wrangler deploy`. Skips changes that don't touch the Worker (`*.md`, `doc/`, `bots/`, `test/`, etc.), because every deploy restarts DOs and drops WS connections. Can also be run manually (`workflow_dispatch`). Secrets: `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`.
 
 ## Coding conventions
 

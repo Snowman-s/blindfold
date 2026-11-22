@@ -1,0 +1,55 @@
+# PR ごとに型検査とテストを回す。ブランチ保護の必須チェックには job 名「test」を登録する。
+# 必須チェックにするので paths-ignore は付けない（付けるとドキュメントだけの PR がマージできなくなる）。
+name: CI
+
+on:
+  pull_request:
+    branches: [master]
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # 本番に影響する変更の検出で base との差分を取るため
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+
+      # マージした瞬間に本番へ影響が出る変更を、PR の画面（注釈とジョブのサマリー）で知らせる。失敗にはしない
+      - name: Detect changes that affect production on merge
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          notes=""
+          if git diff --name-only "$BASE_SHA"...HEAD -- migrations/ | grep -q .; then
+            notes="$notes- D1 マイグレーションが追加・変更されています。マージ時に本番 D1 に適用されます（列・テーブルの追加だけに限るのが安全）。\n"
+          fi
+          if git diff -U0 "$BASE_SHA"...HEAD -- wrangler.jsonc | grep -E '^[+-]' | grep -v -E '^(\+\+\+|---)' | grep -q '"migrations"\|new_sqlite_classes\|deleted_classes\|renamed_classes'; then
+            notes="$notes- wrangler.jsonc の Durable Object の migrations が変わっています。クラスの削除・改名は DO のデータを消します。\n"
+          fi
+          if git diff -U0 "$BASE_SHA"...HEAD -- src/games/ | grep -E '^\+' | grep -v '^+++' | grep -q 'rulesVersion:'; then
+            notes="$notes- rulesVersion が変わっています。マージ時点で進行中・終了済みの旧版のルームは GAME_REMOVED になります。\n"
+          fi
+          if [ -n "$notes" ]; then
+            printf '## マージすると本番に影響する変更\n\n%b\nどのデプロイでも、進行中の WS 接続は切れます。\n' "$notes" >> "$GITHUB_STEP_SUMMARY"
+            printf '%b' "$notes" | while IFS= read -r line; do
+              [ -n "$line" ] && echo "::warning title=Production impact::${line#- }"
+            done
+          fi

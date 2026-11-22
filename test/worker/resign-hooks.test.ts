@@ -1,6 +1,6 @@
 import { SELF, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { games } from "../../src/games/registry";
 import type { AnyGame } from "../../src/games/types";
 import { WS_PROTOCOL } from "../../src/lib/auth";
@@ -95,6 +95,18 @@ describe("行動ログの読み込み", () => {
     await runInDurableObject(stub(json.roomId), (_i, state) => {
       state.storage.sql.exec("INSERT INTO actions(turn, player, action, at) VALUES (5, '', '{\"$unknown\":1}', 0)");
     });
-    expect((await call("GET", `/rooms/${json.roomId}/log`)).status).toBe(500);
+    // 500 の原因は GameRoom が console.error に出す。わざと起こすエラーなので、このテストの間だけ黙らせて中身を確かめる
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const res = await call("GET", `/rooms/${json.roomId}/log`);
+      expect(res.status).toBe(500);
+      expect(res.json.error.code).toBe("INTERNAL");
+      expect(logged).toHaveBeenCalledWith(
+        "failed to read action log",
+        expect.objectContaining({ message: "corrupt system log row at turn 5" }),
+      );
+    } finally {
+      logged.mockRestore();
+    }
   });
 });

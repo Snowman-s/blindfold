@@ -19,7 +19,7 @@ import { createRng, rngForTurn, type Seed } from "../lib/rng";
 
 export type RoomError = {
   ok: false;
-  status: 400 | 401 | 403 | 404 | 409;
+  status: 400 | 401 | 403 | 404 | 409 | 500;
   code: string;
   message: string;
 };
@@ -966,7 +966,15 @@ export class GameRoom extends DurableObject<Env> {
     if (this.status() !== "finished") {
       return fail(403, "NOT_FINISHED", "log is available after the game has finished");
     }
-    return ok({ game: gameId, seed: this.seed(), players: this.playerIds(), actions: this.readLog() });
+    let actions: LogEntry[];
+    try {
+      actions = this.readLog();
+    } catch (e) {
+      // DO から例外を投げると workerd が uncaught exception として別に出すので、ここで記録して 500 で返す
+      console.error("failed to read action log", e);
+      return fail(500, "INTERNAL", "internal error");
+    }
+    return ok({ game: gameId, seed: this.seed(), players: this.playerIds(), actions });
   }
 
   /** ログから再現した各ターンの観戦視点。終了後のみ。 */

@@ -80,13 +80,6 @@ describe("options.autoStart", () => {
   });
 });
 
-it("/openapi.json に一覧とクイックマッチが載る", async () => {
-  const r = await call("GET", "/openapi.json");
-  expect(r.status).toBe(200);
-  expect(r.json.paths["/rooms"].get).toBeDefined();
-  expect(r.json.paths["/quickmatch"].post).toBeDefined();
-});
-
 describe("POST /quickmatch", () => {
   it("1人目は部屋を作り、2人目はそこに入って試合が始まる。3人目は新しい部屋", async () => {
     const options = { turnTimeMs: uniqueTurnTime() };

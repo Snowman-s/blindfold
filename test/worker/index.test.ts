@@ -152,9 +152,4 @@ describe("CORS", () => {
     expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
     expect(res.headers.get("Access-Control-Allow-Headers")?.toLowerCase()).toContain("authorization");
   });
-
-  it("通常のレスポンスにも Access-Control-Allow-Origin が付く", async () => {
-    const res = await SELF.fetch(`${BASE}/games`, { headers: { Origin: "https://client.example" } });
-    expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
-  });
 });

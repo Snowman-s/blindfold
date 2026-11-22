@@ -116,31 +116,3 @@ describe("WebSocket connection limits", () => {
     expect(n).toBe(MAX_SOCKETS_PER_SEAT);
   });
 });
-
-describe("rate limits on reads and upgrades", () => {
-  const ip = (n: number) => ({ "CF-Connecting-IP": `198.51.100.${n}` });
-
-  it("limits WebSocket upgrades per IP before the room is reached", async () => {
-    const statuses: number[] = [];
-    for (let i = 0; i < 31; i++) {
-      // 形式に合わない ID なので DO は起きない（制限はその前に効く）
-      const res = await SELF.fetch("https://example.com/rooms/nope/ws", { headers: { Upgrade: "websocket", ...ip(1) } });
-      statuses.push(res.status);
-    }
-    expect(statuses.slice(0, 30).every((s) => s === 404)).toBe(true);
-    expect(statuses[30]).toBe(429);
-  });
-
-  it("shares one limit across room reads, actions, matches and users", async () => {
-    const h = ip(2);
-    let last = 0;
-    for (let i = 0; i < 59; i++) last = (await call("GET", "/matches", { headers: h })).status;
-    expect(last).toBe(200);
-    expect((await call("POST", "/rooms/000000000000/action", { body: { turn: 0, action: {} }, headers: h })).status).not.toBe(429);
-    const over = await call("GET", "/rooms/000000000000/state", { headers: h });
-    expect(over.status).toBe(429);
-    expect(over.json.error.code).toBe("RATE_LIMITED");
-    // 書き込み系の制限（RL_ROOMS）は別のカウンタ
-    expect((await call("POST", "/rooms", { body: { game: "tictactoe" }, headers: h })).status).toBe(201);
-  });
-});

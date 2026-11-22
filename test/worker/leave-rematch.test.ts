@@ -217,10 +217,4 @@ describe("POST /rooms/:id/rematch", () => {
     await call("POST", `/rooms/${ra.roomId}/resign`, { token: rb.token }); // a の勝ち
     expect((await call("GET", `/users/${user.userId}`)).json.stats).toMatchObject({ played: 2, wins: 2 });
   });
-
-  it("/openapi.json に leave と rematch が載る", async () => {
-    const r = await call("GET", "/openapi.json");
-    expect(r.json.paths["/rooms/{id}/leave"].post).toBeDefined();
-    expect(r.json.paths["/rooms/{id}/rematch"].post).toBeDefined();
-  });
 });

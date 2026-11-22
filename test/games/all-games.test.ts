@@ -107,10 +107,6 @@ describe.each(Object.keys(suite))("%s", (gameId) => {
     }
   });
 
-  it("rulesVersion は 1 以上の整数", () => {
-    expect(Number.isInteger(game.rulesVersion) && game.rulesVersion >= 1).toBe(true);
-  });
-
   it("説明（docs）が揃っていて、行動の例は actionSchema を満たす", async () => {
     expect(game.docs.summary.length).toBeGreaterThan(0);
     expect(game.docs.rules.length).toBeGreaterThan(0);

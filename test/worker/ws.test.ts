@@ -157,7 +157,7 @@ describe("WebSocket", () => {
     expect(s.legal).toHaveLength(8);
   });
 
-  it("エラーは閉じたコード集合で返り、接続は維持される", async () => {
+  it("エラーは REST と同じコードで返り、接続は維持される", async () => {
     const { roomId, host, a, b } = await newRoom("tictactoe");
     const wa = await connect(roomId, a.token);
     const wb = await connect(roomId, b.token);
@@ -173,7 +173,7 @@ describe("WebSocket", () => {
     wb.send(JSON.stringify({ type: "action", turn: 0, action: { cell: 0 } }));
     expect((await wb.next((m) => m.type === "error")).code).toBe("NOT_YOUR_TURN");
     spec.send(JSON.stringify({ type: "action", turn: 0, action: { cell: 0 } }));
-    expect((await spec.next((m) => m.type === "error")).code).toBe("NOT_YOUR_TURN");
+    expect((await spec.next((m) => m.type === "error")).code).toBe("UNAUTHORIZED");
 
     wa.send(JSON.stringify({ type: "action", turn: 5, action: { cell: 0 } }));
     expect((await wa.next((m) => m.type === "error" && m.code === "STALE_TURN")).code).toBe("STALE_TURN");
@@ -638,17 +638,17 @@ describe("投了（resign）", () => {
     await call("POST", `/rooms/${roomId}/start`, { token: host });
     const spec = await connect(roomId);
     spec.send(JSON.stringify({ type: "resign" }));
-    expect((await spec.next((m) => m.type === "error")).code).toBe("NOT_YOUR_TURN");
+    expect((await spec.next((m) => m.type === "error")).code).toBe("UNAUTHORIZED");
     expect((await call("GET", `/rooms/${roomId}/state`)).json.status).toBe("playing");
   });
 
-  it("WS で終了後に投了すると ILLEGAL_ACTION", async () => {
+  it("WS で終了後に投了すると NOT_PLAYING（REST と同じコード）", async () => {
     const { roomId, host, a, b } = await newRoom("tictactoe");
     await playOut(roomId, host, a, b);
     const wb = await connect(roomId, b.token);
     expect(await wb.next((m) => m.type === "end")).toMatchObject({ winners: ["p1"], reason: "normal" });
     wb.send(JSON.stringify({ type: "resign" }));
-    expect((await wb.next((m) => m.type === "error")).code).toBe("ILLEGAL_ACTION");
+    expect((await wb.next((m) => m.type === "error")).code).toBe("NOT_PLAYING");
   });
 
   it("締め切り後の投了は、先に時間切れが確定して NOT_PLAYING になる", async () => {

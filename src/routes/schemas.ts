@@ -59,12 +59,18 @@ export const RoomStateSchema = z
       .int()
       .nullable()
       .describe("Rules version this game is played with (recorded at start). null while waiting"),
+    gameOptions: z
+      .unknown()
+      .describe("Game-specific options of this room (defaults filled in; see optionsSchema in /games/{id}/rules). null for games without options"),
     status: openEnum(ROOM_STATUSES, "Room lifecycle. Treat an unknown value as neither waiting nor finished: keep listening for the next state."),
     turn: z.number().int().describe("Number of actions applied so far. Send this value with your action"),
     players: z.array(z.string()),
     currentPlayers: z.array(z.string()),
     view: z.unknown().describe("Game-specific board as seen by the caller (hidden information removed). Its JSON Schema is viewSchema in /games/{id}/rules. null while waiting"),
-    legal: z.array(z.unknown()).optional().describe("Present only if the caller may act now"),
+    legal: z
+      .array(z.unknown())
+      .optional()
+      .describe("Present only if the caller may act now and the game lists legal moves (listsLegalActions in /games). Whether you may act is decided by currentPlayers, not by legal"),
     deadline: z.number().nullable().describe("Deadline of the current turn (epoch ms, server clock). null unless playing"),
     now: z.number().describe("Server clock (epoch ms) when this response was built. Time left = deadline - now (do not use the client's clock)"),
     result: ResultSchema.nullable(),

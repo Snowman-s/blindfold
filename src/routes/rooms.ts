@@ -3,7 +3,14 @@ import type { Context } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { games, getGame } from "../games/registry";
 import { extractToken, newRoomId, sha256Hex, WS_PROTOCOL, WS_TOKEN_PROTOCOL_PREFIX } from "../lib/auth";
-import { DEFAULT_TURN_TIME_MS, roomOptions, turnTimeMs, WAITING_LIST_TTL_MS } from "../lib/options";
+import {
+  DEFAULT_TURN_TIME_MS,
+  gameOptionsKey,
+  parseGameOptions,
+  roomOptions,
+  turnTimeMs,
+  WAITING_LIST_TTL_MS,
+} from "../lib/options";
 import { actionBody, CLOSE_LEFT_ROOM } from "../lib/protocol";
 import { gameRules, rulesMarkdown, type GameRules } from "../lib/rules";
 import type { RoomResult } from "../room/GameRoom";
@@ -56,6 +63,18 @@ async function resolveUser(c: Context<AppEnv>): Promise<string | null | undefine
 
 const ApiKeyHeader = z.object({ "x-api-key": z.string().optional() });
 
+const LISTS_LEGAL = z
+  .boolean()
+  .describe(
+    "True if state messages list the legal moves in `legal` when you may act. If false, `legal` is never sent: build the action from actionSchema and the rules (an illegal one is rejected with ILLEGAL_ACTION)",
+  );
+
+/** POST /rooms・/quickmatch の gameOptions（中身はゲームごとの optionsSchema で DO / ルートが検証する）。 */
+const GAME_OPTIONS_IN = z
+  .unknown()
+  .optional()
+  .describe("Options specific to the game, matching optionsSchema in /games/{id}/rules. Omit for the defaults. Games without options reject any value");
+
 const GameInfo = z
   .object({
     id: z.string(),
@@ -66,6 +85,8 @@ const GameInfo = z
       .describe("Version of the shape of view (an integer, bumped when a view field is removed, renamed, changes type or meaning, or gets a new value in a fixed set; not when a field is added)"),
     minPlayers: z.number().int(),
     maxPlayers: z.number().int(),
+    listsLegalActions: LISTS_LEGAL,
+    hasOptions: z.boolean().describe("True if the game takes gameOptions (see optionsSchema in its rules)"),
     summary: z.string(),
     rulesUrl: z.string().describe("Rules in JSON. Append .md for the Markdown version"),
   })
@@ -88,6 +109,8 @@ routes.openapi(
         viewVersion: g.viewVersion,
         minPlayers: g.minPlayers,
         maxPlayers: g.maxPlayers,
+        listsLegalActions: g.legalActions !== undefined,
+        hasOptions: g.optionsSchema !== undefined,
         summary: g.docs.summary,
         rulesUrl: `/games/${g.id}/rules`,
       })),
@@ -113,6 +136,7 @@ const GameRulesSchema = z
       .describe("Version of the shape of view (an integer, bumped when a view field is removed, renamed, changes type or meaning, or gets a new value in a fixed set; not when a field is added)"),
     minPlayers: z.number().int(),
     maxPlayers: z.number().int(),
+    listsLegalActions: LISTS_LEGAL,
     summary: z.string(),
     rules: z.string().describe("Markdown: goal, turns, how the game is decided, timeouts"),
     view: z.string().describe("Markdown: meaning of each field of view, and how it differs by viewer"),
@@ -120,6 +144,11 @@ const GameRulesSchema = z
       .unknown()
       .describe("JSON Schema of view (fields that only some viewers receive are optional). Does not forbid extra fields: new ones may be added"),
     actionSchema: z.unknown().describe("JSON Schema of action"),
+    optionsSchema: z
+      .unknown()
+      .describe("JSON Schema of gameOptions (POST /rooms), or null if the game has no options. Unknown keys are rejected"),
+    defaultGameOptions: z.unknown().describe("gameOptions used when none are given (null if the game has no options)"),
+    options: z.string().nullable().describe("Markdown: meaning of each game option. null if the game has no options"),
     examples: z.array(z.object({ action: z.unknown(), meaning: z.string() })),
     stateExamples: z
       .array(z.object({ title: z.string(), message: z.unknown() }))
@@ -196,13 +225,19 @@ routes.openapi(
       "With `options.practice: true`, server-side practice bots fill the empty seats (up to minPlayers) when the game starts (how they play depends on the game; practice games are not recorded). " +
       "With `options.autoStart: true`, the game starts as soon as maxPlayers have joined (cannot be combined with practice). " +
       "Rooms are listed in `GET /rooms` by default; pass `options.unlisted: true` to hide a room (practice rooms are never listed). " +
-      "Unknown options are rejected with 400. The returned `hostToken` is needed to start the game (`/rooms/{id}/start`); only the creator has it.",
+      "Unknown options are rejected with 400. " +
+      "`gameOptions` are options specific to the game (see `optionsSchema` in `/games/{id}/rules`; games without options reject them with 400). " +
+      "Defaults are filled in and recorded with the room, its log and its match. The returned `hostToken` is needed to start the game (`/rooms/{id}/start`); only the creator has it.",
     request: {
       body: {
         required: true,
         content: {
           "application/json": {
-            schema: z.object({ game: z.string().openapi({ example: "tictactoe" }), options: roomOptions.optional() }),
+            schema: z.object({
+              game: z.string().openapi({ example: "tictactoe" }),
+              options: roomOptions.optional(),
+              gameOptions: GAME_OPTIONS_IN,
+            }),
           },
         },
       },
@@ -226,7 +261,7 @@ routes.openapi(
     const body = c.req.valid("json");
     if (!getGame(body.game)) return c.json(errBody("UNKNOWN_GAME", `unknown game: ${body.game}`), 400);
     const roomId = newRoomId();
-    const r = await c.env.GAME_ROOM.getByName(roomId).init(roomId, body.game, body.options);
+    const r = await c.env.GAME_ROOM.getByName(roomId).init(roomId, body.game, body.options, body.gameOptions);
     return r.ok ? c.json({ roomId, hostToken: r.data.hostToken }, 201) : respond(c, r);
   },
 );
@@ -235,6 +270,7 @@ const RoomSummary = z
   .object({
     roomId: z.string(),
     game: z.string(),
+    gameOptions: z.unknown().describe("Game-specific options of the room (defaults filled in). null for games without options"),
     status: openEnum(["waiting", "playing"], "Same as status in the room state."),
     players: z.number().int().describe("Number of players who have joined"),
     maxPlayers: z.number().int(),
@@ -271,7 +307,7 @@ routes.openapi(
   async (c) => {
     const { status, game, limit } = c.req.valid("query");
     const rows = await c.env.DB.prepare(
-      `SELECT id, game, status, players, max_players, auto_start, turn_time_ms, created_at, updated_at
+      `SELECT id, game, game_options, status, players, max_players, auto_start, turn_time_ms, created_at, updated_at
        FROM rooms
        WHERE status = ?1 AND (?2 IS NULL OR game = ?2)
          AND (?1 <> 'waiting' OR (players < max_players AND updated_at > ?3))
@@ -279,13 +315,14 @@ routes.openapi(
     )
       .bind(status, game ?? null, Date.now() - WAITING_LIST_TTL_MS, limit)
       .all<{
-        id: string; game: string; status: "waiting" | "playing"; players: number; max_players: number;
+        id: string; game: string; game_options: string; status: "waiting" | "playing"; players: number; max_players: number;
         auto_start: number; turn_time_ms: number; created_at: number; updated_at: number;
       }>();
     return c.json(
       rows.results.map((r) => ({
         roomId: r.id,
         game: r.game,
+        gameOptions: JSON.parse(r.game_options) as unknown,
         status: r.status,
         players: r.players,
         maxPlayers: r.max_players,
@@ -310,7 +347,7 @@ routes.openapi(
     operationId: "quickMatch",
     summary: "Quick match (join an open room, or create one)",
     description:
-      "Joins the oldest public auto-start room of the same game and turn time that has a free seat, or creates such a room (`autoStart: true`) and joins it. " +
+      "Joins the oldest public auto-start room of the same game, game options and turn time that has a free seat, or creates such a room (`autoStart: true`) and joins it. " +
       "The game starts by itself once the room is full, so connect the WebSocket with the returned `token` right away and wait (you receive `status: \"waiting\"` states, then `playing`). " +
       "`created` tells whether a new room was created. No `hostToken` is returned (nobody can start early). Send `X-Api-Key` to record the result on your user.",
     request: {
@@ -322,6 +359,7 @@ routes.openapi(
             schema: z.object({
               game: z.string().openapi({ example: "tictactoe" }),
               options: z.strictObject({ turnTimeMs: turnTimeMs.optional() }).optional(),
+              gameOptions: GAME_OPTIONS_IN,
             }),
           },
         },
@@ -352,15 +390,18 @@ routes.openapi(
     const userId = await resolveUser(c);
     if (userId === undefined) return c.json(errBody("UNAUTHORIZED", "invalid api key"), 401);
     const time = body.options?.turnTimeMs ?? DEFAULT_TURN_TIME_MS;
+    // 既定値を補った値で照合する（省略と、既定値を明示したものは同じルームに入る）
+    const gopts = parseGameOptions(game, body.gameOptions);
+    if (!gopts.ok) return c.json(errBody("BAD_REQUEST", gopts.message), 400);
 
     // 古い部屋から埋める（同時に2つ作られても、次に来た人が古い方に入る）
     const candidates = await c.env.DB.prepare(
       `SELECT id FROM rooms
-       WHERE status = 'waiting' AND game = ? AND auto_start = 1 AND turn_time_ms = ?
+       WHERE status = 'waiting' AND game = ? AND game_options = ? AND auto_start = 1 AND turn_time_ms = ?
          AND players < max_players AND updated_at > ?
        ORDER BY created_at, id LIMIT ?`,
     )
-      .bind(game.id, time, Date.now() - WAITING_LIST_TTL_MS, QUICKMATCH_CANDIDATES)
+      .bind(game.id, gameOptionsKey(gopts.value), time, Date.now() - WAITING_LIST_TTL_MS, QUICKMATCH_CANDIDATES)
       .all<{ id: string }>();
     for (const { id } of candidates.results) {
       const r = await c.env.GAME_ROOM.getByName(id).join(userId);
@@ -370,7 +411,7 @@ routes.openapi(
 
     const roomId = newRoomId();
     const stub = c.env.GAME_ROOM.getByName(roomId);
-    const init = await stub.init(roomId, game.id, { autoStart: true, turnTimeMs: time });
+    const init = await stub.init(roomId, game.id, { autoStart: true, turnTimeMs: time }, gopts.value);
     if (!init.ok) return respond(c, init);
     const r = await stub.join(userId);
     return r.ok ? c.json({ roomId, ...r.data, created: true }, 201) : respond(c, r);
@@ -590,6 +631,7 @@ export const LogSchema = z
       .int()
       .describe("Rules version the game was played with. If it differs from rulesVersion in /games/{id}/rules, the rules changed later and /replay is no longer available for this game"),
     seed: z.string().describe("Initial seed (128 bits, 32 hex characters)"),
+    gameOptions: z.unknown().describe("Game-specific options the game was played with (defaults filled in). null for games without options"),
     players: z.array(z.string()),
     actions: z.array(LogEntrySchema).describe("Every entry in turn order; actions[i].turn === i"),
   })
@@ -600,6 +642,7 @@ export const ReplaySchema = z
     game: z.string(),
     rulesVersion: z.number().int().describe("Rules version the game was played with (always the current one; older games fail with GAME_REMOVED)"),
     seed: z.string(),
+    gameOptions: z.unknown(),
     players: z.array(z.string()),
     frames: z
       .array(
@@ -623,7 +666,7 @@ routes.openapi(
     tags: ["rooms"],
     operationId: "getLog",
     summary: "Action log (for replays)",
-    description: "Available only after the game has ended, so that the seed cannot reveal hidden information. `seed` + `actions` reproduce the game exactly.",
+    description: "Available only after the game has ended, so that the seed cannot reveal hidden information. `seed` + `gameOptions` + `actions` reproduce the game exactly.",
     request: { params: RoomIdParam },
     responses: {
       200: { description: "Action log", content: { "application/json": { schema: LogSchema } } },

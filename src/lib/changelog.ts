@@ -20,6 +20,27 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.5.0",
+    date: "2026-11-22",
+    breaking: [
+      "WebSocket `error` messages now carry the same `code` as the REST API instead of a reduced set. A spectator's " +
+        "action or resignation gets `UNAUTHORIZED` (was `NOT_YOUR_TURN`), an action or resignation before the start or " +
+        "after the end gets `NOT_PLAYING` (was `ILLEGAL_ACTION`), and other REST codes such as `GAME_REMOVED` are no " +
+        "longer turned into `BAD_REQUEST`.",
+      "Whether you may act is decided by `currentPlayers`, not by the presence of `legal`. Games may now leave out " +
+        "`legal` entirely (`listsLegalActions: false` in `GET /games` and `/games/{id}/rules`); every current game still lists it.",
+    ],
+    added: [
+      "Game-specific options: `gameOptions` in `POST /rooms` and `POST /quickmatch`, described by `optionsSchema`, " +
+        "`defaultGameOptions` and `options` in `/games/{id}/rules` (and `hasOptions` in `GET /games`). The value with " +
+        "defaults filled in is returned as `gameOptions` in the room state, `GET /rooms`, `/log`, `/replay` and " +
+        "`GET /matches`, and kept by rematches. Quick match only pairs rooms with the same game options. No current game has options yet.",
+      "The WebSocket `state` message has the same fields as `GET /rooms/{id}/state`: `game`, `rulesVersion`, " +
+        "`gameOptions` and `result` were added to it (and `gameOptions` to the REST state).",
+      "`listsLegalActions` in `GET /games` and `/games/{id}/rules`.",
+    ],
+  },
+  {
     version: "0.4.0",
     date: "2026-11-22",
     breaking: [

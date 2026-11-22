@@ -94,6 +94,7 @@ export const MatchSchema = z
     id: z.string().describe("Same as the roomId of the game (so /rooms/{id}/log and /replay work with it)"),
     game: z.string(),
     rulesVersion: z.number().int().describe("Rules version the game was played with"),
+    gameOptions: z.unknown().describe("Game-specific options the game was played with (defaults filled in). null for games without options"),
     players: z.array(z.string()),
     startedAt: z.number().describe("epoch ms"),
     finishedAt: z.number().describe("epoch ms"),
@@ -134,7 +135,7 @@ userRoutes.openapi(
     const { game, limit } = c.req.valid("query");
     // 1クエリで取得する（Free プランは1回の呼び出しあたりの D1 クエリ数に上限がある）
     const rows = await c.env.DB.prepare(
-      `SELECT m.id, m.game, m.rules_version, m.players, m.started_at, m.finished_at, m.reason,
+      `SELECT m.id, m.game, m.rules_version, m.game_options, m.players, m.started_at, m.finished_at, m.reason,
               r.player_id, r.user_id, r.outcome, r.score
        FROM (SELECT * FROM matches WHERE (?1 IS NULL OR game = ?1) ORDER BY finished_at DESC, id LIMIT ?2) m
        JOIN results r ON r.match_id = m.id
@@ -142,7 +143,7 @@ userRoutes.openapi(
     )
       .bind(game ?? null, limit)
       .all<{
-        id: string; game: string; rules_version: number; players: string; started_at: number; finished_at: number; reason: EndReason;
+        id: string; game: string; rules_version: number; game_options: string; players: string; started_at: number; finished_at: number; reason: EndReason;
         player_id: string; user_id: string | null; outcome: (typeof OUTCOMES)[number]; score: number | null;
       }>();
     const byId = new Map<string, z.infer<typeof MatchSchema>>();
@@ -150,7 +151,8 @@ userRoutes.openapi(
       let m = byId.get(r.id);
       if (!m) {
         m = {
-          id: r.id, game: r.game, rulesVersion: r.rules_version, players: JSON.parse(r.players) as string[],
+          id: r.id, game: r.game, rulesVersion: r.rules_version,
+          gameOptions: JSON.parse(r.game_options) as unknown, players: JSON.parse(r.players) as string[],
           startedAt: r.started_at, finishedAt: r.finished_at, reason: r.reason, results: [],
         };
         byId.set(r.id, m);

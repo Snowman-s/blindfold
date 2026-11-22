@@ -12,6 +12,7 @@ CREATE TABLE matches (
   game TEXT NOT NULL,
   rules_version INTEGER NOT NULL, -- 試合を始めたときのルールの版（GameDefinition.rulesVersion）
   seed TEXT NOT NULL, -- 128 ビット（16 進 32 文字）。INTEGER だと数字だけのシードが数値に変換される
+  game_options TEXT NOT NULL, -- ゲーム固有のオプション（既定値を補った値の JSON。オプションの無いゲームは 'null'）
   players TEXT NOT NULL, -- JSON 配列
   started_at INTEGER NOT NULL,
   finished_at INTEGER NOT NULL,
@@ -35,6 +36,7 @@ CREATE INDEX idx_results_user ON results(user_id);
 CREATE TABLE rooms (
   id TEXT PRIMARY KEY,
   game TEXT NOT NULL,
+  game_options TEXT NOT NULL, -- matches.game_options と同じ形。クイックマッチは既定のオプションのルームだけに入る
   status TEXT NOT NULL, -- 'waiting' | 'playing' | 'finished'
   players INTEGER NOT NULL, -- 参加人数
   max_players INTEGER NOT NULL,

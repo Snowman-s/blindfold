@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { GameResult } from "../games/types";
 
 export const ROOM_STATUSES = ["waiting", "playing", "finished"] as const;
 export type RoomStatus = (typeof ROOM_STATUSES)[number];
@@ -23,34 +24,43 @@ export const CLOSE_LEFT_ROOM = 4000;
 /** REST / DO 共通のエラーレスポンスの本体。 */
 export const errBody = (code: string, message: string) => ({ error: { code, message } });
 
-export const WS_ERROR_CODES = ["ILLEGAL_ACTION", "NOT_YOUR_TURN", "STALE_TURN", "BAD_REQUEST", "INTERNAL"] as const;
-export type WsErrorCode = (typeof WS_ERROR_CODES)[number];
+/**
+ * ルームの状態（REST の GET /rooms/:id/state などの本体）。WS の state メッセージはこれに type: "state" を付けただけ。
+ * 2つを別々に定義するとフィールドがずれるので、ここを唯一の定義にする。
+ */
+export interface RoomState {
+  game: string;
+  /** 試合の開始時に記録したルールの版。waiting の間は null */
+  rulesVersion: number | null;
+  /** ゲーム固有のオプション（既定値を補った後の値）。オプションを持たないゲームは null */
+  gameOptions: unknown;
+  status: RoomStatus;
+  turn: number;
+  players: string[];
+  currentPlayers: string[];
+  view: unknown;
+  /** 呼び出したプレイヤーが今行動でき、ゲームが合法手を列挙するときだけ付く */
+  legal?: unknown[];
+  /** 現在の手番の締め切り（epoch ms）。playing 以外は null */
+  deadline: number | null;
+  /** サーバーの現在時刻（epoch ms）。クライアントは deadline - now で残り時間を出す（時計ずれ対策） */
+  now: number;
+  result: GameResult | null;
+  /** 終了後に誰かが再戦を申し込んだときだけ付く */
+  rematch?: RematchInfo;
+}
 
-/** サーバー → クライアント */
+/** 再戦の案内。roomId は新しいルーム、requestedBy は申し込んだ（このルームでの）プレイヤー ID。 */
+export interface RematchInfo {
+  roomId: string;
+  requestedBy: string[];
+}
+
+/**
+ * サーバー → クライアント。error の code は REST と同じコード（読み替えない）。値は増えうる。
+ */
 export type ServerMessage =
-  | {
-      type: "state";
-      turn: number;
-      view: unknown;
-      /** 受け取るプレイヤーが今行動できるときだけ付く */
-      legal?: unknown[];
-      currentPlayers: string[];
-      deadline: number | null;
-      /** サーバーの現在時刻（epoch ms）。残り時間は deadline - now で出す */
-      now: number;
-      status: RoomStatus;
-      players: string[];
-      /** 終了後、誰かが再戦を申し込んだときだけ付く */
-      rematch?: { roomId: string; requestedBy: string[] };
-    }
-  | { type: "error"; code: WsErrorCode; message: string }
+  | ({ type: "state" } & RoomState)
+  | { type: "error"; code: string; message: string }
   | { type: "end"; winners: string[]; scores?: Record<string, number>; reason: EndReason }
   | { type: "pong" };
-
-/** REST 側のエラーコードを WS の閉じたコード集合に写す（対応はガイドの 1.6 にも書いてある）。 */
-export function toWsErrorCode(code: string): WsErrorCode {
-  if ((WS_ERROR_CODES as readonly string[]).includes(code)) return code as WsErrorCode;
-  if (code === "UNAUTHORIZED") return "NOT_YOUR_TURN"; // 観戦者の行動など
-  if (code === "NOT_PLAYING") return "ILLEGAL_ACTION";
-  return "BAD_REQUEST";
-}

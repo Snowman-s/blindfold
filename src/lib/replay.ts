@@ -18,6 +18,8 @@ export interface ReplayLog {
   /** 試合の開始時に記録したルールの版（GameDefinition.rulesVersion）。再現はこの版のエンジン（getGame(game, rulesVersion)）で行う。 */
   rulesVersion: number;
   seed: Seed;
+  /** ゲーム固有のオプション（既定値を補った値。optionsSchema の無いゲームは null）。init にそのまま渡す。 */
+  gameOptions: unknown;
   players: string[];
   actions: LogEntry[];
 }
@@ -72,11 +74,11 @@ export interface Frame {
 }
 
 /**
- * 初期シード + 行動ログから、各ターンの状態を再現する。frames[i] は turn=i の状態。
+ * 初期シード + ゲームオプション + 行動ログから、各ターンの状態を再現する。frames[i] は turn=i の状態。
  * result はゲーム自身の結果、なければ時間切れ・投了による決着（forfeit）。
  */
 export function replayFrames(game: AnyGame, log: ReplayLog): { frames: Frame[]; result: GameResult | null } {
-  let state = game.init(log.players, log.seed);
+  let state = game.init(log.players, log.seed, log.gameOptions ?? null);
   let forfeit: GameResult | null = null;
   const frames: Frame[] = [{ turn: 0, state }];
   for (const e of log.actions) {

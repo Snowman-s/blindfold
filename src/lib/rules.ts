@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { AnyGame } from "../games/types";
 import { sha256Hex } from "./auth";
 import { compactJson, gameExamples, type EndMessage, type ExampleState } from "./examples";
+import { defaultGameOptions } from "./options";
 import { API_VERSION, outputJsonSchema } from "./version";
 
 /**
@@ -12,14 +13,14 @@ import { API_VERSION, outputJsonSchema } from "./version";
 // LLM 向けの文面は英語で書く（Bot 側で必要なら翻訳される）。
 const COMMON = [
   "## How to play (all games)",
-  "- State arrives as a WebSocket `state` message (or from `GET /rooms/{id}/state`). `view` is the board as you see it; `currentPlayers` lists who may act now.",
-  "- **Legal moves are listed in `legal`. Pick one and send it unchanged as `action`; it is always accepted.** `legal` is present only when you may act now.",
-  '- To act, send `{ "type": "action", "turn": <turn from the latest state>, "action": <one of legal> }` over the WebSocket (`GET /rooms/{id}/ws`).',
+  "- State arrives as a WebSocket `state` message (or from `GET /rooms/{id}/state`). `view` is the board as you see it; `currentPlayers` lists who may act now. **You may act when your player ID is in `currentPlayers`.**",
+  "- If the game lists legal moves (`listsLegalActions: true`, the usual case), they are in `legal` whenever you may act. **Pick one and send it unchanged as `action`; it is always accepted.** If the game does not list them (`listsLegalActions: false`), `legal` is never sent: build the action from the action schema and the rules below.",
+  '- To act, send `{ "type": "action", "turn": <turn from the latest state>, "action": <your action> }` over the WebSocket (`GET /rooms/{id}/ws`).',
   "- REST alternative: `POST /rooms/{id}/action` with `{ turn, action }`. REST has no way to wait for the other players, so to play a full game use the WebSocket: it pushes a new `state` whenever the turn changes. Use REST for single actions or debugging, not polling.",
   "- If `turn` does not match the current turn, the action is rejected with `STALE_TURN`. Wait for the next `state` and retry.",
   "- Each turn has a `deadline` (epoch ms, server clock). Missing it is a timeout. Every `state` also has `now` (server clock), so the time left is `deadline - now`; do not compare `deadline` with your own clock.",
   "- Disconnecting is not a loss: reconnect with the same token and act before `deadline`. The first message after connecting is the current `state`.",
-  "- Error codes: `ILLEGAL_ACTION` (illegal move), `NOT_YOUR_TURN` (you may not act now), `STALE_TURN` (outdated turn), `BAD_REQUEST` (malformed message), `INTERNAL` (server failure; resend if the turn is still current).",
+  "- Error codes (the same over the WebSocket and REST): `ILLEGAL_ACTION` (illegal move), `NOT_YOUR_TURN` (you may not act now), `STALE_TURN` (outdated turn), `NOT_PLAYING` (the game has not started or is over), `UNAUTHORIZED` (no valid player token, e.g. a spectator), `BAD_REQUEST` (malformed message or action), `INTERNAL` (server failure; resend if the turn is still current).",
   '- To give up, send `{ "type": "resign" }` (or `POST /rooms/{id}/resign`). Allowed at any time during play, even when it is not your turn. Unless this game\'s rules say otherwise, you lose, all other players win, and the game ends.',
   "- When the game ends you receive an `end` message with `winners` (empty for a draw), `scores` and `reason` (`normal`, `timeout` or `resign`).",
   "- New fields, message `type`s and error codes may be added at any time. Ignore fields you do not know (the `view` schema does not forbid extra fields), skip unknown message types, and treat an unknown error code like `BAD_REQUEST`.",
@@ -35,11 +36,15 @@ export interface GameRules {
   viewVersion: number;
   minPlayers: number;
   maxPlayers: number;
+  listsLegalActions: boolean;
   summary: string;
   rules: string;
   view: string;
   viewSchema: unknown;
   actionSchema: unknown;
+  optionsSchema: unknown;
+  defaultGameOptions: unknown;
+  options: string | null;
   examples: { action: unknown; meaning: string }[];
   stateExamples: ExampleState[];
   endExample: EndMessage;
@@ -61,11 +66,16 @@ export function gameRules(game: AnyGame): Promise<GameRules> {
         viewVersion: game.viewVersion,
         minPlayers: game.minPlayers,
         maxPlayers: game.maxPlayers,
+        listsLegalActions: game.legalActions !== undefined,
         summary: game.docs.summary,
         rules: game.docs.rules,
         view: game.docs.view,
         viewSchema: outputJsonSchema(game.viewSchema),
         actionSchema: z.toJSONSchema(game.actionSchema),
+        // 入力なので余計なキーを拒否する Schema のまま配る
+        optionsSchema: game.optionsSchema ? z.toJSONSchema(game.optionsSchema) : null,
+        defaultGameOptions: defaultGameOptions(game),
+        options: game.docs.options ?? null,
         examples: game.docs.examples,
         stateExamples: ex.states,
         endExample: ex.end,
@@ -101,9 +111,27 @@ export function rulesMarkdown(r: GameRules): string {
     "`action` is an object matching this JSON Schema:",
     json(r.actionSchema),
     "",
+    r.listsLegalActions
+      ? "When you may act, `legal` lists every legal action; sending one of them unchanged is always accepted."
+      : "This game does **not** list legal moves: `legal` is never sent. Build the action yourself from the schema and the rules; an illegal one is rejected with `ILLEGAL_ACTION` and you may try again before the deadline.",
+    "",
     "Examples:",
     examples,
     "",
+    ...(r.optionsSchema === null
+      ? []
+      : [
+          "## Game options",
+          "Pass these as `gameOptions` in `POST /rooms` (or `POST /quickmatch`). Omitted fields take their defaults; unknown keys are rejected. The options of a room are in `gameOptions` of every `state`.",
+          "",
+          ...(r.options ? [r.options, ""] : []),
+          "JSON Schema:",
+          json(r.optionsSchema),
+          "",
+          "Defaults:",
+          json(r.defaultGameOptions),
+          "",
+        ]),
     "## Example messages",
     "Generated from the real game engine with a fixed seed. `deadline` and `now` are placeholder timestamps.",
     "",

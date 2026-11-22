@@ -7,7 +7,7 @@ const rng = createRng("1");
 const P = ["a", "b"];
 
 function play(cells: number[]) {
-  let s = g.init(P, "1");
+  let s = g.init(P, "1", null);
   cells.forEach((cell, i) => {
     s = g.apply(s, P[i % 2]!, { cell }, rng);
   });
@@ -16,15 +16,15 @@ function play(cells: number[]) {
 
 describe("tictactoe", () => {
   it("初期状態: 先手のみ行動でき、合法手は9個", () => {
-    const s = g.init(P, "1");
+    const s = g.init(P, "1", null);
     expect(g.currentPlayers(s)).toEqual(["a"]);
-    expect(g.legalActions(s, "a")).toHaveLength(9);
-    expect(g.legalActions(s, "b")).toEqual([]);
+    expect(g.legalActions!(s, "a")).toHaveLength(9);
+    expect(g.legalActions!(s, "b")).toEqual([]);
     expect(g.result(s)).toBeNull();
   });
 
   it("apply は元の状態を変更しない", () => {
-    const s = g.init(P, "1");
+    const s = g.init(P, "1", null);
     const before = JSON.stringify(s);
     g.apply(s, "a", { cell: 4 }, rng);
     expect(JSON.stringify(s)).toBe(before);
@@ -74,7 +74,7 @@ describe("tictactoe", () => {
   });
 
   it("同じ人数でない／重複プレイヤーは init で拒否", () => {
-    expect(() => g.init(["a"], "1")).toThrow(GameError);
-    expect(() => g.init(["a", "a"], "1")).toThrow(GameError);
+    expect(() => g.init(["a"], "1", null)).toThrow(GameError);
+    expect(() => g.init(["a", "a"], "1", null)).toThrow(GameError);
   });
 });

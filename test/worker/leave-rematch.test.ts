@@ -185,7 +185,7 @@ describe("POST /rooms/:id/rematch", () => {
     expect(s.currentPlayers).toEqual(["p1"]);
     old.ws.send(JSON.stringify({ type: "action", turn: 0, action: { cell: 0 } }));
     const err = await old.next((m) => m.type === "error");
-    expect(err.code).toBe("NOT_YOUR_TURN");
+    expect(err.code).toBe("UNAUTHORIZED");
     old.ws.close();
   });
 

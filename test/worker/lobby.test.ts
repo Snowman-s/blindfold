@@ -134,8 +134,8 @@ describe("POST /quickmatch", () => {
     const now = Date.now();
     const insert = (id: string, createdAt: number) =>
       env.DB.prepare(
-        `INSERT INTO rooms(id, game, status, players, max_players, auto_start, turn_time_ms, created_at, updated_at, rev)
-         VALUES (?, 'tictactoe', 'waiting', 1, 2, 1, ?, ?, ?, 1)`,
+        `INSERT INTO rooms(id, game, game_options, status, players, max_players, auto_start, turn_time_ms, created_at, updated_at, rev)
+         VALUES (?, 'tictactoe', 'null', 'waiting', 1, 2, 1, ?, ?, ?, 1)`,
       )
         .bind(id, t, createdAt, now)
         .run();

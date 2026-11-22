@@ -1,4 +1,5 @@
 import type { AnyGame } from "../games/types";
+import { defaultGameOptions } from "./options";
 import { practiceAction } from "./practice";
 import type { LogEntry, ReplayLog } from "./replay";
 import { createRng, rngForTurn } from "./rng";
@@ -52,18 +53,30 @@ function stateMessage(
   status: "playing" | "finished",
 ): StateMessage {
   const current = status === "playing" ? game.currentPlayers(state) : [];
-  const legal = pid && current.includes(pid) ? game.legalActions(state, pid) : undefined;
+  const legal = pid && current.includes(pid) ? game.legalActions?.(state, pid) : undefined;
   return {
     type: "state",
+    game: game.id,
+    rulesVersion: game.rulesVersion,
+    gameOptions: defaultGameOptions(game),
+    status,
     turn,
+    players: examplePlayers(game),
+    currentPlayers: current,
     view: game.view(state, pid),
     ...(legal ? { legal } : {}),
-    currentPlayers: current,
     deadline: status === "playing" ? EXAMPLE_DEADLINE : null,
     now: EXAMPLE_NOW,
-    status,
-    players: examplePlayers(game),
+    result: game.result(state),
   };
+}
+
+/** 例の最初の手。合法手を列挙するゲームはその先頭、しないゲームは練習相手の打ち方（固定シード）。 */
+function firstActionOf(game: AnyGame, s: unknown, pid: string, seed: string): unknown {
+  if (game.legalActions) return game.legalActions(s, pid)[0];
+  const pick = practiceAction(game, s, pid, createRng(`${seed}:first`));
+  if (!pick) throw new Error(`${game.id}: no first action for the example`);
+  return pick.action;
 }
 
 const cache = new Map<string, GameExamples>();
@@ -75,9 +88,10 @@ export function gameExamples(game: AnyGame): GameExamples {
 
   const seed = EXAMPLE_SEED;
   const players = examplePlayers(game);
-  const s0 = game.init(players, seed);
+  const gameOptions = defaultGameOptions(game);
+  const s0 = game.init(players, seed, gameOptions);
   const first = game.currentPlayers(s0)[0]!;
-  const firstAction = game.legalActions(s0, first)[0];
+  const firstAction = firstActionOf(game, s0, first, seed);
   const s1 = game.apply(s0, first, firstAction, rngForTurn(seed, 0));
   const actor = game.currentPlayers(s1)[0] ?? first;
   const player = stateMessage(game, s1, 1, actor, "playing");
@@ -130,7 +144,7 @@ export function gameExamples(game: AnyGame): GameExamples {
     spectator,
     states,
     end,
-    log: { game: game.id, rulesVersion: game.rulesVersion, seed, players, actions },
+    log: { game: game.id, rulesVersion: game.rulesVersion, seed, gameOptions, players, actions },
   };
   cache.set(game.id, out);
   return out;

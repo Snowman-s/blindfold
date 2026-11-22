@@ -4,7 +4,7 @@ import type { AnyGame } from "../games/types";
 import { sha256Hex, WS_PROTOCOL, WS_TOKEN_PROTOCOL_PREFIX } from "./auth";
 import { DEFAULT_TURN_TIME_MS, roomOptions, WAITING_LIST_TTL_MS } from "./options";
 import { compactJson, gameExamples } from "./examples";
-import { CLOSE_LEFT_ROOM, WS_ERROR_CODES } from "./protocol";
+import { CLOSE_LEFT_ROOM } from "./protocol";
 import { replayFrames } from "./replay";
 import { API_VERSION } from "./version";
 
@@ -37,7 +37,15 @@ function gameSection(game: AnyGame): string {
     "Action JSON Schema:",
     code("json", json(z.toJSONSchema(game.actionSchema))),
     "",
-    `Example \`state\` after one move, as **${ex.actor}** (who may act now, so \`legal\` is present):`,
+    ...(game.legalActions
+      ? []
+      : ["This game does **not** list legal moves (`listsLegalActions: false`): `legal` is never sent. Build the action from the schema and the rules.", ""]),
+    ...(game.optionsSchema
+      ? ["Game options (`gameOptions` in `POST /rooms`; see the rules for their meaning):", code("json", json(z.toJSONSchema(game.optionsSchema))), ""]
+      : []),
+    game.legalActions
+      ? `Example \`state\` after one move, as **${ex.actor}** (who may act now, so \`legal\` is present):`
+      : `Example \`state\` after one move, as **${ex.actor}** (who may act now):`,
     code("json", json(ex.player)),
     "",
     "The same moment as a **spectator** (no token). Hidden information (if the game has any) is removed and `legal` is absent:",
@@ -72,6 +80,7 @@ export function responseExamples() {
       game: log.game,
       rulesVersion: log.rulesVersion,
       seed: log.seed,
+      gameOptions: log.gameOptions,
       players: log.players,
       frames: [...allFrames.slice(0, 2), allFrames[allFrames.length - 1]!],
       result,
@@ -83,6 +92,7 @@ export function responseExamples() {
       id: EXAMPLE_ROOM_ID,
       game: log.game,
       rulesVersion: log.rulesVersion,
+      gameOptions: log.gameOptions,
       players: log.players,
       startedAt: log.actions[0]!.at,
       finishedAt: last.at,
@@ -104,16 +114,20 @@ function responseShapes(): string {
     "",
     "Available once the game is `finished`. Before that it fails with `NOT_FINISHED` (403), because the seed would reveal",
     "hidden information.",
-    `\`seed\` + \`actions\` reproduce the game exactly. Example (a finished \`${r.game.id}\` game):`,
+    `\`seed\` + \`gameOptions\` + \`actions\` reproduce the game exactly. Example (a finished \`${r.game.id}\` game):`,
     code("json", json(r.log)),
     code(
       "ts",
       [
-        "type Log = { game: string; rulesVersion: number; seed: string; players: string[]; actions: LogEntry[] }; // actions[i].turn === i",
+        "type Log = {",
+        "  game: string; rulesVersion: number; seed: string;",
+        "  gameOptions: unknown;   // the room's game options (defaults filled in); null for games without options",
+        "  players: string[]; actions: LogEntry[]; // actions[i].turn === i",
+        "};",
         "type LogEntry = {",
         "  turn: number;           // the turn it was applied at; applying it produced turn + 1",
         "  player: string | null;  // who acted; null on a timeout / resignation entry",
-        "  action: unknown | null; // the action as sent (an element of legal); null on a timeout / resignation entry",
+        "  action: unknown | null; // the action as sent; null on a timeout / resignation entry",
         "  at: number;             // epoch ms (server clock)",
         "  timeout?: string[];     // only on a timeout entry: the players who ran out of time",
         "  resign?: string;        // only on a resignation entry: the player who resigned",
@@ -172,7 +186,10 @@ async function post(path, body, token) {
   return data;
 }
 
-/** Plays one game as a player. Resolves with the \`end\` message. */
+/**
+ * Plays one game as a player. Resolves with the \`end\` message.
+ * Uses \`legal\`, so it works for games with \`listsLegalActions: true\` (such as tictactoe, used below).
+ */
 function play(roomId, token, pick = (legal) => legal[Math.floor(Math.random() * legal.length)]) {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(\`\${WS_BASE}/rooms/\${roomId}/ws\`, ["${WS_PROTOCOL}", "${WS_TOKEN_PROTOCOL_PREFIX}" + token]);
@@ -239,25 +256,30 @@ console.log(end.winners.length === 0 ? "draw" : end.winners.includes(me.playerId
 
 const MESSAGE_TYPES = `// Client -> server (WebSocket text frames, JSON)
 type ClientMessage =
-  | { type: "action"; turn: number; action: unknown } // turn = \`turn\` of the latest state; action = one element of \`legal\`
+  | { type: "action"; turn: number; action: unknown } // turn = \`turn\` of the latest state; action = e.g. one element of \`legal\`
   | { type: "resign" }                               // give up (by default: you lose, everyone else wins, the game ends)
   | { type: "ping" };                                 // answered with { type: "pong" } (free keepalive)
 
 // Server -> client
+// The "state" message is the same object as GET /rooms/{id}/state returns, plus type: "state".
 type ServerMessage =
   | {
       type: "state";
+      game: string;                 // game ID
+      rulesVersion: number | null;  // rules version the game is played with; null while waiting
+      gameOptions: unknown;         // the room's game options (defaults filled in); null for games without options
+      status: "waiting" | "playing" | "finished";
       turn: number;                 // number of actions applied so far; echo it when acting
-      view: unknown;                // game-specific board as seen by the receiver (hidden info removed)
-      legal?: unknown[];            // present only if the receiver may act now
+      players: string[];            // all player IDs in seat order ("p1", "p2", ...)
       currentPlayers: string[];     // player IDs who may act now (several = simultaneous turn)
+      view: unknown;                // game-specific board as seen by the receiver (hidden info removed); null while waiting
+      legal?: unknown[];            // present only if the receiver may act now and the game lists legal moves
       deadline: number | null;      // epoch ms (server clock) by which currentPlayers must act; null when not playing
       now: number;                  // server clock (epoch ms) when this message was built; time left = deadline - now
-      status: "waiting" | "playing" | "finished";
-      players: string[];            // all player IDs in seat order ("p1", "p2", ...)
+      result: { winners: string[]; scores?: Record<string, number> } | null; // set once finished (same as in "end")
       rematch?: { roomId: string; requestedBy: string[] }; // only after the end, once someone asked for a rematch (1.9)
     }
-  | { type: "error"; code: ${WS_ERROR_CODES.map((c) => `"${c}"`).join(" | ")}; message: string }
+  | { type: "error"; code: string; message: string } // the same codes as REST (1.6), e.g. "STALE_TURN"
   | {
       type: "end";
       winners: string[];            // empty = draw (or everyone timed out)
@@ -289,7 +311,7 @@ function buildGuide(): string {
         "REST auth     Authorization: Bearer <token>",
         "Never         put a token in the URL: ?token= is rejected with 400",
         'Act           {"type":"action","turn":<turn of latest state>,"action":<one element of legal, unchanged>}',
-        "Loop          on every `state`: if `legal` is present, send one action for that `turn` (once)",
+        "Loop          on every `state`: if your playerId is in `currentPlayers`, send one action for that `turn` (once), e.g. an element of `legal`",
         "STALE_TURN    ignore it and wait for the next `state`",
         'Resign        {"type":"resign"} over WS, or POST /rooms/{id}/resign (Bearer token): you lose, the game ends',
         "End           `end` message: { winners, scores, reason }",
@@ -300,7 +322,13 @@ function buildGuide(): string {
       ].join("\n"),
     ),
     "",
-    "- Sending an element of `legal` unchanged is always accepted. You never need to compute legality yourself.",
+    "- Sending an element of `legal` unchanged is always accepted. You never need to compute legality yourself, as long",
+    "  as the game lists legal moves (`listsLegalActions: true` in `GET /games`" +
+      (gameList.every((g) => g.legalActions)
+        ? "; true for every game today"
+        : `; false for ${gameList.filter((g) => !g.legalActions).map((g) => `\`${g.id}\``).join(", ")}`) +
+      "). For a game",
+    "  that does not, `legal` is never sent and you build the action from the game's action schema (section 5).",
     "- State is pushed over the WebSocket after every change. Do not poll `GET /rooms/{id}/state`: the service runs on a",
     "  free tier with a daily request budget.",
     "- CORS is enabled for all REST endpoints (any origin; `Authorization`, `Content-Type` and `X-Api-Key` are allowed), so",
@@ -320,11 +348,12 @@ function buildGuide(): string {
     "   `created: true` means you made a new room and are waiting for someone else. Connect the WebSocket **right away**",
     "   with your `token`: you receive `state` messages with `status: \"waiting\"` (and a growing `players`) until the room",
     "   fills, then a `status: \"playing\"` state, with `legal` if you move first. Optional body `options.turnTimeMs`",
-    "   (matched exactly) and header `X-Api-Key` work as for `/rooms` and `/join`. Nobody gets a `hostToken`.",
+    "   and `gameOptions` (both matched exactly, after filling in defaults) and header `X-Api-Key` work as for `/rooms`",
+    "   and `/join`. Nobody gets a `hostToken`.",
     `   A room you created stops being offered to others ${WAITING_LIST_TTL_MS / 60000} minutes after its last join. If nobody`,
     "   has joined by then, call `POST /rooms/{roomId}/leave` with your token (1.2) and `/quickmatch` again.",
     "2. **Browse open rooms.** `GET /rooms` lists public waiting rooms that still have a free seat",
-    "   (`?game=&limit=`; each item has `roomId`, `game`, `players`, `maxPlayers`, `autoStart`, `turnTimeMs`). Join one",
+    "   (`?game=&limit=`; each item has `roomId`, `game`, `gameOptions`, `players`, `maxPlayers`, `autoStart`, `turnTimeMs`). Join one",
     "   with `POST /rooms/{roomId}/join`. The list is an index and can lag a little: if the join fails with `ROOM_FULL`,",
     `   \`ALREADY_STARTED\` or \`ROOM_NOT_FOUND\`, try the next room. Rooms not updated for ${WAITING_LIST_TTL_MS / 60000} minutes are not listed.`,
     "3. **Host your own room** (1.1). Rooms are listed in `GET /rooms` by default; pass `options.unlisted: true` to keep",
@@ -340,6 +369,12 @@ function buildGuide(): string {
     "`options` is optional. Unknown keys are rejected with 400. Its JSON Schema:",
     code("json", json(z.toJSONSchema(roomOptions))),
     `\`turnTimeMs\` is the time limit per turn; the default is ${DEFAULT_TURN_TIME_MS} ms (${DEFAULT_TURN_TIME_MS / 60000} minutes).`,
+    "",
+    "**Game options:** some games take options of their own (`hasOptions: true` in `GET /games`). Pass them as",
+    "`gameOptions` next to `options`, e.g. `{\"game\":\"<id>\",\"gameOptions\":{...}}`. Their JSON Schema, defaults and",
+    "meaning are `optionsSchema`, `defaultGameOptions` and `options` in `/games/{id}/rules`. Omitted fields take their",
+    "defaults; unknown keys, and any `gameOptions` for a game without options, are rejected with 400. The filled-in",
+    "value is part of every `state` (`gameOptions`), `GET /rooms`, `/log` and `/matches`, and a rematch keeps it.",
     "",
     '**Practice opponent:** with `"options": {"practice": true}`, the server fills the empty seats (up to `minPlayers`)',
     "with built-in bots when the game starts. They take the seats after the joined players (join once and you are `p1`,",
@@ -410,12 +445,15 @@ function buildGuide(): string {
     "",
     "On every `state` message:",
     "1. Render `view` (see the game's rules for its fields).",
-    "2. If `legal` is present, it is your move. Choose one element and send",
-    '   `{"type":"action","turn":<state.turn>,"action":<element>}`. Send at most one action per `turn`.',
+    "2. If your `playerId` is in `currentPlayers` (and `status` is `playing`), it is your move. Choose one element of",
+    '   `legal` and send `{"type":"action","turn":<state.turn>,"action":<element>}`. Send at most one action per `turn`.',
+    "   In a game that does not list legal moves (`listsLegalActions: false`), `legal` is absent: build the action",
+    "   from the game's action schema; if it is rejected with `ILLEGAL_ACTION`, you may send another one for the same `turn`.",
     "3. Otherwise wait. The next `state` arrives when anyone acts (including on simultaneous turns, where",
     "   `currentPlayers` lists several players and shrinks as they act).",
     "",
-    "Your own seat is your `playerId` from `join`; compare it with `currentPlayers` and the IDs in `view`.",
+    "Your own seat is your `playerId` from `join`; compare it with `currentPlayers` and the IDs in `view`. In games that",
+    "list legal moves, `legal` is present exactly when you may act, so checking for it works too.",
     "",
     "### 1.6 Errors",
     "",
@@ -424,14 +462,16 @@ function buildGuide(): string {
     "| code | meaning | what to do |",
     "|---|---|---|",
     "| `STALE_TURN` | `turn` is not the current turn (duplicate, outdated, or the deadline passed) | wait for the next `state` |",
-    "| `NOT_YOUR_TURN` | you may not act now (or you are a spectator) | wait for a `state` with `legal` |",
-    "| `ILLEGAL_ACTION` | the move breaks the rules, or the game is not in progress | send an element of `legal` |",
+    "| `NOT_YOUR_TURN` | you may not act now | wait for a `state` whose `currentPlayers` includes you |",
+    "| `ILLEGAL_ACTION` | the move breaks the rules | send an element of `legal` (or, without `legal`, another action) |",
+    "| `NOT_PLAYING` | the game has not started yet or is already over (for example an action sent after `end`) | wait for a `playing` state, or stop |",
+    "| `UNAUTHORIZED` | the connection has no valid player token (a spectator, or a seat that was left) | reconnect with a player token |",
+    "| `GAME_REMOVED` | the game (or the rules version the room was started with) is no longer on the server | stop; nothing can be done in this room |",
     "| `BAD_REQUEST` | malformed JSON / message / action shape | fix the message format |",
     "| `INTERNAL` | server-side failure while handling the message | resend the same action if its `turn` is still current; otherwise wait for the next `state` (or reconnect) |",
     "",
-    "The WebSocket uses only the codes above. Where the REST API has a more specific code, the WebSocket maps it:",
-    "`UNAUTHORIZED` (a spectator sent an action) becomes `NOT_YOUR_TURN`, and `NOT_PLAYING` (the game has not",
-    "started yet or is already over) becomes `ILLEGAL_ACTION`. So an action sent after `end` is answered with `ILLEGAL_ACTION`.",
+    "The WebSocket uses the same codes as the REST API (below), so the same error has the same code on both. New codes",
+    "may be added: handle an unknown one like `BAD_REQUEST`.",
     "",
     "REST errors use HTTP status codes with the body `{ \"error\": { \"code\": \"...\", \"message\": \"...\" } }`.",
     "Codes: `BAD_REQUEST` (400), `UNKNOWN_GAME` (400), `ILLEGAL_ACTION` (400), `UNAUTHORIZED` (401), `NOT_HOST` (403),",
@@ -473,8 +513,8 @@ function buildGuide(): string {
     "You may resign at any time while the game is `playing`, even when it is not your turn. By default you lose, all",
     "other players win, and the game ends immediately (`end` with `reason: \"resign\"`). Some games define their own",
     "handling (for example, only your seat drops out and the game goes on); see the game's rules. It cannot be undone.",
-    "Resigning before the game starts or after it ended is rejected (`ILLEGAL_ACTION` on the WebSocket,",
-    "`NOT_PLAYING` 409 over REST). Spectators cannot resign. A resignation is recorded in `/rooms/{id}/log` as",
+    "Resigning before the game starts or after it ended is rejected with `NOT_PLAYING` (409 over REST).",
+    "Spectators cannot resign (`UNAUTHORIZED`). A resignation is recorded in `/rooms/{id}/log` as",
     "`{ player: null, action: null, resign: \"p1\" }` and takes up one `turn`, like a timeout.",
     "",
     "### 1.9 End of game",
@@ -526,8 +566,8 @@ function buildGuide(): string {
     "",
     "- Back off between attempts: about 1 s, 2 s, 4 s, ... up to 30 s, with random jitter. Reset the delay once a",
     "  connection opens. Turns last minutes by default, so a short outage does not cost the game.",
-    "- Forget which `turn` you already answered. If the first `state` still offers `legal` for that turn, your action was",
-    "  lost: send it again. Had it been applied, the turn would have moved on.",
+    "- Forget which `turn` you already answered. If the first `state` still has that `turn` and lists you in",
+    "  `currentPlayers`, your action was lost: send it again. Had it been applied, the turn would have moved on.",
     "- Stop after an `end` message. A browser cannot see why an upgrade failed (see 1.4), so after a few failed attempts",
     "  call `GET /rooms/{id}/state` with the token: 404 (unknown room) or 401 (invalid token) means stop; anything else",
     "  means keep retrying with backoff.",
@@ -553,11 +593,11 @@ function buildGuide(): string {
     "",
     "| method | path | auth | purpose |",
     "|---|---|---|---|",
-    "| GET | `/games` | - | list games (`id`, `rulesVersion`, `viewVersion`, `minPlayers`, `maxPlayers`, `summary`, `rulesUrl`) |",
+    "| GET | `/games` | - | list games (`id`, `rulesVersion`, `viewVersion`, `minPlayers`, `maxPlayers`, `listsLegalActions`, `hasOptions`, `summary`, `rulesUrl`) |",
     "| GET | `/games/{id}/rules` · `/games/{id}/rules.md` | - | rules, view fields, action schema (JSON / Markdown) |",
-    "| POST | `/quickmatch` | optional `X-Api-Key` | `{ game, options?: { turnTimeMs } }` -> `{ roomId, playerId, token, created }` |",
+    "| POST | `/quickmatch` | optional `X-Api-Key` | `{ game, options?: { turnTimeMs }, gameOptions? }` -> `{ roomId, playerId, token, created }` |",
     "| GET | `/rooms` | - | public rooms: `?status=waiting` (default, free seats) or `playing`; `&game=&limit=` |",
-    "| POST | `/rooms` | - | `{ game, options? }` -> `{ roomId, hostToken }` |",
+    "| POST | `/rooms` | - | `{ game, options?, gameOptions? }` -> `{ roomId, hostToken }` |",
     "| POST | `/rooms/{id}/join` | optional `X-Api-Key` | -> `{ playerId, token }` |",
     "| POST | `/rooms/{id}/start` | Bearer hostToken | start the game |",
     "| POST | `/rooms/{id}/leave` | Bearer token | leave before the game starts (undo join) |",
@@ -572,8 +612,8 @@ function buildGuide(): string {
     "| GET | `/users/{id}` | - | user and results |",
     "| GET | `/matches` | - | finished matches (`?game=&limit=`) |",
     "",
-    "`GET /rooms/{id}/state` and `POST /rooms/{id}/action` return the same shape as the `state` message plus",
-    "`game` and `result` (`{ winners, scores } | null`), without the `type` field.",
+    "`GET /rooms/{id}/state`, `POST /rooms/{id}/action`, `/start`, `/resign` and `/leave` return the same object as the",
+    "`state` message, without the `type` field.",
     `Full OpenAPI spec: [${BASE}/openapi.json](${BASE}/openapi.json).`,
     "",
     "## 4. Spectating, replays and results",
@@ -607,7 +647,8 @@ function buildGuide(): string {
     "",
     "- [ ] Tokens are sent only in the `Authorization` header or the WebSocket subprotocol, never in the URL.",
     "- [ ] Every action carries the `turn` of the latest `state`, and at most one action is sent per `turn`.",
-    "- [ ] Actions are taken from `legal` (or match the game's action schema exactly).",
+    "- [ ] Whether you may act is decided by `currentPlayers`; actions are taken from `legal` (or match the game's action",
+    "  schema exactly, for games that do not list legal moves).",
     "- [ ] `STALE_TURN` and other errors do not crash the client; it waits for the next `state`.",
     "- [ ] REST responses that are not JSON (or are 5xx) are retried later instead of crashing the JSON parser.",
     "- [ ] The UI handles `status: \"waiting\"` (before start) and `view` fields that only some viewers receive.",
@@ -651,9 +692,10 @@ function buildGuide(): string {
     "  strings and lists today's values in the description. Treat an unknown `reason` like `normal`, an unknown",
     "  `outcome` as neither a win nor a loss, and an unknown `status` as neither `waiting` nor `finished` (keep",
     "  listening for the next `state`). This does not apply to values inside a game's `view`, which follow `viewVersion`.",
-    "- New WebSocket message `type`s (skip them) and new error codes (over WebSocket handle them like `BAD_REQUEST`;",
-    "  over REST go by the HTTP status).",
-    "- New games, endpoints, and optional request fields or room options.",
+    "- New WebSocket message `type`s (skip them) and new error codes (handle them like `BAD_REQUEST` over the",
+    "  WebSocket; over REST go by the HTTP status).",
+    "- New games (including games that take `gameOptions` or do not list legal moves), endpoints, and optional request",
+    "  fields, room options or game options.",
     "- Rewording of this guide, the rules text or error messages. Do not match on `message` text; use `code`.",
     "",
     "**Breaking changes**: removing or renaming a field, changing its type or meaning, making a request field",

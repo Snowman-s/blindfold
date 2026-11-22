@@ -18,6 +18,7 @@ export interface BotOptions {
 
 /**
  * WebSocket で状態を受け取り、行動できるときだけ合法手を送る Bot。
+ * legal を使うので、合法手を列挙するゲーム（/games の listsLegalActions: true）専用。
  * error（STALE_TURN など）は無視して次の state を待つ。end を受け取ると解決する。
  */
 export function runBot(ws: SocketLike, opts: BotOptions): Promise<GameResult> {

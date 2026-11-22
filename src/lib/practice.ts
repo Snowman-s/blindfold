@@ -7,6 +7,6 @@ import type { Rng } from "./rng";
  */
 export function practiceAction(game: AnyGame, s: unknown, pid: string, rng: Rng): { action: unknown } | undefined {
   if (game.practiceAction) return { action: game.practiceAction(s, pid, rng) };
-  const legal = game.legalActions(s, pid);
+  const legal = game.legalActions?.(s, pid) ?? [];
   return legal.length ? { action: legal[rng.int(legal.length)] } : undefined;
 }

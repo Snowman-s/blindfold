@@ -28,10 +28,15 @@ export interface GameDocs {
   view: string;
   /** 行動の例。actionSchema を満たすこと（テストで検証する）。 */
   examples: { action: unknown; meaning: string }[];
+  /** Markdown。ゲーム固有のオプション（optionsSchema）の各項目の意味と既定値。optionsSchema を定義したゲームは必須（テストで検証する）。 */
+  options?: string;
 }
 
-/** すべてのゲームが実装する。副作用なしの純粋関数にすること。 */
-export interface GameDefinition<S, A> {
+/**
+ * すべてのゲームが実装する。副作用なしの純粋関数にすること。
+ * O はゲーム固有のオプション（optionsSchema の出力）。オプションを持たないゲームは null。
+ */
+export interface GameDefinition<S, A, O = null> {
   id: string;
   /**
    * ルールの版（1 から始める整数）。「シード + 行動ログで試合を再現できる」ことが崩れる変更をしたら必ず上げる：
@@ -59,10 +64,25 @@ export interface GameDefinition<S, A> {
    */
   viewSchema: z.ZodType;
   docs: GameDocs;
-  /** seed は文字列（サーバーは 128 ビットの乱数を発行する）。乱数は createRng(seed) で作る。 */
-  init(players: string[], seed: Seed): S;
+  /**
+   * ゲーム固有のオプション（任意）。ルーム作成時の gameOptions をこれで検証し（未知のキーは拒否したいので strictObject にする）、
+   * 既定値を補った値を init に渡す。その値はルームの meta・/log・D1 の matches に記録され、「シード + オプション + ログ」で試合を再現する。
+   * 未定義のゲームに gameOptions を渡すと 400。オプションの意味を変える変更（既定値の変更も）は rulesVersion を上げる。
+   * 空のオブジェクト {} を受け付けること（gameOptions を省略したときは {} を parse する）。
+   */
+  optionsSchema?: z.ZodType<O>;
+  /**
+   * seed は文字列（サーバーは 128 ビットの乱数を発行する）。乱数は createRng(seed) で作る。
+   * options は optionsSchema で parse した値（optionsSchema が無ければ null）。
+   */
+  init(players: string[], seed: Seed, options: O): S;
   currentPlayers(s: S): string[];
-  legalActions(s: S, pid: string): A[];
+  /**
+   * pid が今打てる合法手の一覧（任意）。定義すると state の legal として配る。
+   * 合法手を列挙できない・しきれないゲームでは定義しない。そのときは legal を送らず、行動は apply だけで検証する
+   * （その場合 practiceAction は必須。all-games テストで検証する）。
+   */
+  legalActions?(s: S, pid: string): A[];
   /** 不正な手は GameError を throw。s は変更せず新しい状態を返す。 */
   apply(s: S, pid: string, a: A, rng: Rng): S;
   /** 隠し情報を除去。null は観戦者。 */
@@ -81,11 +101,12 @@ export interface GameDefinition<S, A> {
    */
   onResign?(s: S, pid: string, rng: Rng): S;
   /**
-   * 練習相手（options.practice）の打ち方（任意）。pid が今行動できるときだけ呼ばれ、合法手を返すこと。
-   * 未定義のゲームは合法手からランダムに選ぶ。ランダムでは決着しにくいゲームは、決着に向かう簡単な打ち方を定義する。
+   * 練習相手（options.practice）の打ち方。pid が今行動できるときだけ呼ばれ、合法手を返すこと。
+   * 未定義のゲームは合法手（legalActions）からランダムに選ぶ。legalActions を定義しないゲームでは必須。
+   * ランダムでは決着しにくいゲームは、決着に向かう簡単な打ち方を定義する。
    */
   practiceAction?(s: S, pid: string, rng: Rng): A;
 }
 
 // メソッド記法のパラメータは双変なので、個別のゲームを unknown 版として登録できる。
-export type AnyGame = GameDefinition<unknown, unknown>;
+export type AnyGame = GameDefinition<unknown, unknown, unknown>;

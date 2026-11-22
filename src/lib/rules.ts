@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { AnyGame } from "../games/types";
 import { sha256Hex } from "./auth";
 import { compactJson, gameExamples, type EndMessage, type ExampleState } from "./examples";
+import { API_VERSION, outputJsonSchema } from "./version";
 
 /**
  * ゲームの説明（GET /games/:id/rules）を組み立てる。Bot 上の LLM がプロンプトに入れて読むことを想定する。
@@ -21,11 +22,13 @@ const COMMON = [
   "- Error codes: `ILLEGAL_ACTION` (illegal move), `NOT_YOUR_TURN` (you may not act now), `STALE_TURN` (outdated turn), `BAD_REQUEST` (malformed message), `INTERNAL` (server failure; resend if the turn is still current).",
   '- To give up, send `{ "type": "resign" }` (or `POST /rooms/{id}/resign`). Allowed at any time during play, even when it is not your turn. Unless this game\'s rules say otherwise, you lose, all other players win, and the game ends.',
   "- When the game ends you receive an `end` message with `winners` (empty for a draw), `scores` and `reason` (`normal`, `timeout` or `resign`).",
+  "- New fields, message `type`s and error codes may be added at any time. Ignore fields you do not know (the `view` schema does not forbid extra fields), skip unknown message types, and treat an unknown error code like `BAD_REQUEST`.",
 ].join("\n");
 
 export interface GameRules {
   id: string;
   version: string;
+  apiVersion: string;
   minPlayers: number;
   maxPlayers: number;
   summary: string;
@@ -49,12 +52,13 @@ export function gameRules(game: AnyGame): Promise<GameRules> {
       const ex = gameExamples(game);
       const body = {
         id: game.id,
+        apiVersion: API_VERSION,
         minPlayers: game.minPlayers,
         maxPlayers: game.maxPlayers,
         summary: game.docs.summary,
         rules: game.docs.rules,
         view: game.docs.view,
-        viewSchema: z.toJSONSchema(game.viewSchema),
+        viewSchema: outputJsonSchema(game.viewSchema),
         actionSchema: z.toJSONSchema(game.actionSchema),
         examples: game.docs.examples,
         stateExamples: ex.states,
@@ -74,7 +78,7 @@ export function rulesMarkdown(r: GameRules): string {
   const json = (v: unknown) => ["```json", compactJson(v), "```"].join("\n");
   const states = r.stateExamples.map((e) => `${e.title}:\n${json(e.message)}`).join("\n\n");
   return [
-    `# ${r.id} (${r.minPlayers === r.maxPlayers ? r.minPlayers : `${r.minPlayers}-${r.maxPlayers}`} players, version ${r.version})`,
+    `# ${r.id} (${r.minPlayers === r.maxPlayers ? r.minPlayers : `${r.minPlayers}-${r.maxPlayers}`} players, version ${r.version}, API ${r.apiVersion})`,
     "",
     r.summary,
     "",
@@ -84,7 +88,7 @@ export function rulesMarkdown(r: GameRules): string {
     "## Reading `view`",
     r.view,
     "",
-    "JSON Schema of `view` (a union of all viewers: fields that only some viewers receive are optional):",
+    "JSON Schema of `view` (a union of all viewers: fields that only some viewers receive are optional; fields may be added later, so ignore unknown ones):",
     json(r.viewSchema),
     "",
     "## Action format",

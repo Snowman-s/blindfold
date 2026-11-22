@@ -124,6 +124,18 @@ describe("OpenAPI", () => {
       expect(r.endExample.type).toBe("end");
     }
   });
+
+  it("配布する viewSchema は未知のフィールドを禁止しない（フィールドの追加は非破壊な変更）", async () => {
+    const openapi = await (await SELF.fetch(`${BASE}/openapi.json`)).json<{ info: { version: string } }>();
+    for (const id of Object.keys(games)) {
+      const r = await (await SELF.fetch(`${BASE}/games/${id}/rules`)).json<{ apiVersion: string; viewSchema: unknown }>();
+      expect(JSON.stringify(r.viewSchema)).not.toContain('"additionalProperties":false');
+      expect(r.apiVersion).toBe(openapi.info.version);
+    }
+    const md = await (await SELF.fetch(`${BASE}/guide.md`)).text();
+    expect(md).toContain(`API version   ${openapi.info.version}`);
+    expect(md).toContain("## 9. Versions and compatibility");
+  });
 });
 
 describe("CORS", () => {

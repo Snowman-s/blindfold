@@ -3,6 +3,7 @@ import type { Context } from "hono";
 import { cors } from "hono/cors";
 import { HTTPException } from "hono/http-exception";
 import { guide, renderGuide } from "./lib/guide";
+import { API_VERSION } from "./lib/version";
 import { routes } from "./routes/rooms";
 import { errBody, validationHook } from "./routes/schemas";
 import { userRoutes } from "./routes/users";
@@ -68,7 +69,7 @@ app.doc31("/openapi.json", {
   openapi: "3.1.0",
   info: {
     title: "apigames API",
-    version: "0.2.0",
+    version: API_VERSION,
     description:
       "An API for playing and watching turn-based games without a screen. All game logic runs on the server. " +
       "Client developer guide: `/guide.md`.\n\n" +

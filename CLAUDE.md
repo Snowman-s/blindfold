@@ -152,6 +152,22 @@ export interface GameDefinition<S, A> {
 - `now` はメッセージを作った時点のサーバー時刻（epoch ms）。クライアントは `deadline - now` で残り時間を出す（クライアントの時計ずれ対策）。
 - 投了・時間切れはサーバーが書くログの行（`player = ""`、`action = {"$resign":"p1"}` / `{"$timeout":[...]}`）として1ターン進める。既定（`onTimeout` / `onResign` 未定義）は状態を変えず、決着は meta の `forfeit`。それで試合が終わったときだけ理由を `endReason`（D1 の `matches.reason`）に残す。
 
+### 互換性方針
+
+版を表す値は3種類ある。混同しない。
+
+| 名前 | 場所 | 意味 |
+|---|---|---|
+| `version` | ガイド・rules の見出し、`/games/:id/rules` の `version`、ETag | 内容のハッシュ。誤字1つ直しても変わる。**キャッシュの鍵でしかなく、互換性の合図ではない** |
+| `apiVersion` | `src/lib/version.ts` の `API_VERSION`。OpenAPI の `info.version`・ガイドの TL;DR・rules の `apiVersion` が同じ値を参照する | API の版（semver） |
+| ルールの版（未実装。名前は `rulesVersion`） | `GameDefinition` | ゲームのルール・action の形の版。「シード + ログで再現できる」保証に関わる |
+
+- **0.x の間は実験段階**。破壊的変更は予告なしで出してよい（マイナーを上げる）。changelog は事後に書く。1.0.0 からは破壊的変更でメジャーを上げる。
+- **非破壊（いつでもやる。クライアントは許容する義務がある）**：REST レスポンス・WS メッセージ・`view` へのフィールド追加、新しい WS メッセージ `type`、新しいエラー `code`、新しいゲーム・エンドポイント・省略可能な入力やルームオプション、ガイド・rules・エラーメッセージの文言変更。クライアントの義務（未知のフィールド・`type`・`code` を無視する）はガイドの 9 節・チェックリスト・rules の `COMMON` に書いてある。
+- **破壊的**：フィールドの削除・改名・型や意味の変更、入力を必須にすること、認証方式の変更、ゲームのルール・action の形の変更。
+- **出力の JSON Schema は未知のフィールドを禁止しない**。`viewSchema` は内部では `strictObject`（all-games テストで余計なフィールドが無いことを確かめる用）だが、`/rules` で配るときは `outputJsonSchema()` で `additionalProperties: false` を外す。入力（action・ルームオプション）の Schema は余計なフィールドを拒否するので `z.toJSONSchema` のまま。
+- **告知**：`apiVersion` と `/changelog.md`（未実装。コードから配信し ETag を付ける予定）。廃止を段階的に進めるときに限り、該当するレスポンスに `Deprecation` / `Sunset` ヘッダー（RFC 9745 / 8594）をベストエフォートで付ける（0.x では付かないまま壊すこともある）。
+
 ## 無料枠の制約（設計時に必ず守る）
 
 - Workers Free：**1日10万リクエスト**（UTC 0時にリセット）。超えるとエラーになる（課金はされない）。

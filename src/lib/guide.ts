@@ -6,6 +6,7 @@ import { DEFAULT_TURN_TIME_MS, roomOptions, WAITING_LIST_TTL_MS } from "./option
 import { compactJson, gameExamples } from "./examples";
 import { CLOSE_LEFT_ROOM, WS_ERROR_CODES } from "./protocol";
 import { replayFrames } from "./replay";
+import { API_VERSION } from "./version";
 
 /**
  * クライアント開発者（主にコーディングエージェント）向けのガイド（GET /guide.md, /llms.txt）。
@@ -290,6 +291,7 @@ function buildGuide(): string {
         "End           `end` message: { winners, scores, reason }",
         "Leave         POST /rooms/{id}/leave (Bearer token): undo a join before the game starts",
         "Rematch       POST /rooms/{id}/rematch (Bearer token) after the end -> { roomId, playerId, token } in a new room",
+        `API version   ${API_VERSION}   (0.x: may change without notice; ignore unknown fields. Section 9)`,
       ].join("\n"),
     ),
     "",
@@ -600,12 +602,41 @@ function buildGuide(): string {
     "- [ ] Countdowns use `deadline - now` from the `state`, not the local clock.",
     "- [ ] `roomId`, `playerId` and `token` are saved; an unexpected `close` leads to a reconnect with backoff.",
     "- [ ] While the socket is open, `{\"type\":\"ping\"}` is sent about every 30 seconds.",
+    "- [ ] Unknown fields, unknown message `type`s and unknown error codes are ignored, not treated as fatal.",
     "",
     "## 8. Response reference (logs, replays, users, matches)",
     "",
     "Needed for replay viewers and result pages, not for playing. Full schemas are in the OpenAPI spec.",
     "",
     responseShapes(),
+    "",
+    "## 9. Versions and compatibility",
+    "",
+    "There are two different version strings. Do not confuse them:",
+    "",
+    "| Name | Where | Meaning |",
+    "|---|---|---|",
+    "| `version` | heading of this guide and of `/games/{id}/rules.md`, `version` in `/games/{id}/rules`, `ETag` | Hash of the content. Changes on any edit, even a typo fix. Use it only as a cache key (`If-None-Match` returns 304 while it is unchanged) |",
+    `| \`apiVersion\` | TL;DR above, \`apiVersion\` in \`/games/{id}/rules\`, \`info.version\` in \`/openapi.json\` | Version of the API, in semver. Currently \`${API_VERSION}\` |`,
+    "",
+    "The API is experimental while `apiVersion` is `0.x`: breaking changes may be released without notice, with only a",
+    "minor version bump. From `1.0.0`, breaking changes bump the major version.",
+    "",
+    "**Changes that are not breaking** (made at any time, so clients must tolerate them):",
+    "",
+    "- New fields in REST responses, in WebSocket messages and in a game's `view`. Ignore fields you do not know. The",
+    "  `viewSchema` in `/games/{id}/rules` describes today's fields and does not forbid extra ones; do not make your",
+    "  parser reject them.",
+    "- New WebSocket message `type`s (skip them) and new error codes (over WebSocket handle them like `BAD_REQUEST`;",
+    "  over REST go by the HTTP status).",
+    "- New games, endpoints, and optional request fields or room options.",
+    "- Rewording of this guide, the rules text or error messages. Do not match on `message` text; use `code`.",
+    "",
+    "**Breaking changes**: removing or renaming a field, changing its type or meaning, making a request field",
+    "required, changing authentication, and changing a game's rules or its `action` format.",
+    "",
+    "To stay up to date, cache this guide and `/games/{id}/rules` with their `ETag`. When the content changes, compare",
+    "`apiVersion` with the one you built against. A long-running bot can re-check the rules of its game when it starts.",
     "",
   ].join("\n");
 }

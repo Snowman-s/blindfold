@@ -94,13 +94,18 @@ const GameIdParam = z.object({
 const GameRulesSchema = z
   .object({
     id: z.string(),
-    version: z.string().describe("Hash of the content (also sent as ETag). Tells whether a cached copy is outdated"),
+    version: z
+      .string()
+      .describe("Hash of the content (also sent as ETag). Changes on any edit, even a typo fix; it is a cache key, not a compatibility signal"),
+    apiVersion: z.string().describe("API version (semver), the same as in the guide and the OpenAPI spec"),
     minPlayers: z.number().int(),
     maxPlayers: z.number().int(),
     summary: z.string(),
     rules: z.string().describe("Markdown: goal, turns, how the game is decided, timeouts"),
     view: z.string().describe("Markdown: meaning of each field of view, and how it differs by viewer"),
-    viewSchema: z.unknown().describe("JSON Schema of view (fields that only some viewers receive are optional)"),
+    viewSchema: z
+      .unknown()
+      .describe("JSON Schema of view (fields that only some viewers receive are optional). Does not forbid extra fields: new ones may be added"),
     actionSchema: z.unknown().describe("JSON Schema of action"),
     examples: z.array(z.object({ action: z.unknown(), meaning: z.string() })),
     stateExamples: z

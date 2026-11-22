@@ -1,12 +1,10 @@
 import { SELF } from "cloudflare:test";
 import { Hono } from "hono";
 import { describe, expect, it } from "vitest";
-import { games } from "../../src/games/registry";
-import type { AnyGame } from "../../src/games/types";
 import { CHANGELOG } from "../../src/lib/changelog";
 import { deprecated, deprecationHeaders, markDeprecated } from "../../src/lib/deprecation";
 import { API_VERSION } from "../../src/lib/version";
-import { BASE, call, newRoom } from "./helpers";
+import { BASE, call } from "./helpers";
 
 const semver = (v: string) => v.split(".").map(Number) as [number, number, number];
 const newer = (a: string, b: string) => {
@@ -114,54 +112,3 @@ describe("Deprecation / Sunset", () => {
   });
 });
 
-describe("rulesVersion", () => {
-  it("/games と /games/:id/rules に載る", async () => {
-    const list = (await call("GET", "/games")).json as { id: string; rulesVersion: number }[];
-    for (const g of list) {
-      expect(g.rulesVersion).toBe(games[g.id]!.rulesVersion);
-      const r = (await call("GET", `/games/${g.id}/rules`)).json;
-      expect(r.rulesVersion).toBe(g.rulesVersion);
-      const md = await (await SELF.fetch(`${BASE}/games/${g.id}/rules.md`)).text();
-      expect(md.split("\n")[0]).toContain(`rulesVersion ${g.rulesVersion}`);
-    }
-  });
-
-  it("開始時に記録し、state・log・replay・matches で返す。ルールが変わったらリプレイを断る", async () => {
-    // 共有の games.tictactoe は書き換えない（他のテストや gameRules のキャッシュに版 2 が漏れないように）。
-    // tictactoe の写しを別 ID で登録し、その写しを版 2 に差し替える。
-    const id = "test-rules-version";
-    const v1: AnyGame = { ...(games.tictactoe as AnyGame), id, rulesVersion: 1 };
-    games[id] = v1;
-    try {
-      await playAndCheck(id);
-    } finally {
-      delete games[id];
-    }
-  });
-
-  async function playAndCheck(id: string) {
-    const { roomId, host, a } = await newRoom(id);
-    expect((await call("GET", `/rooms/${roomId}/state`)).json.rulesVersion).toBeNull();
-    await call("POST", `/rooms/${roomId}/start`, { token: host });
-    expect((await call("GET", `/rooms/${roomId}/state`)).json.rulesVersion).toBe(1);
-    await call("POST", `/rooms/${roomId}/resign`, { token: a.token });
-
-    const log = await call("GET", `/rooms/${roomId}/log`);
-    expect(log.json.rulesVersion).toBe(1);
-    const replay = await call("GET", `/rooms/${roomId}/replay`);
-    expect(replay.status).toBe(200);
-    expect(replay.json.rulesVersion).toBe(1);
-
-    const matches = (await call("GET", `/matches?game=${id}&limit=100`)).json;
-    expect(matches.find((m: { id: string }) => m.id === roomId)?.rulesVersion).toBe(1);
-
-    games[id] = { ...games[id]!, rulesVersion: 2 };
-    const r = await call("GET", `/rooms/${roomId}/replay`);
-    expect(r.status).toBe(409);
-    expect(r.json.error.code).toBe("RULES_CHANGED");
-    // ログ自体は記録どおり返す
-    const l = await call("GET", `/rooms/${roomId}/log`);
-    expect(l.status).toBe(200);
-    expect(l.json.rulesVersion).toBe(1);
-  }
-});

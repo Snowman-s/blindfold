@@ -13,8 +13,7 @@ import { elimination, type ElimState } from "../fixtures/elimination";
 const PLAYERS = ["p1", "p2"];
 
 /** ランダム Bot で1試合。同時手番でも、行動できるプレイヤーからランダムに選ぶ。 */
-function playRandom(gameId: string, seed: string) {
-  const game = games[gameId]!;
+function playRandom(game: AnyGame, seed: string) {
   const r = createRng(`bot:${seed}`);
   let state = game.init(PLAYERS, seed);
   const actions: LogEntry[] = [];
@@ -39,7 +38,7 @@ describe.each(Object.keys(games))("%s", (gameId) => {
 
   it("ランダム Bot で 100 試合が例外なく終わる", () => {
     for (let seed = 0; seed < 100; seed++) {
-      const { state } = playRandom(gameId, String(seed));
+      const { state } = playRandom(game, String(seed));
       const res = game.result(state);
       expect(res).not.toBeNull();
       expect(game.currentPlayers(state)).toEqual([]);
@@ -64,7 +63,7 @@ describe.each(Object.keys(games))("%s", (gameId) => {
 
   it("初期シード + 行動ログだけで完全に再現できる（JSON 往復を経ても）", () => {
     for (let seed = 0; seed < 100; seed++) {
-      const { state, actions } = playRandom(gameId, String(seed));
+      const { state, actions } = playRandom(game, String(seed));
       const log = JSON.parse(JSON.stringify({ game: gameId, rulesVersion: game.rulesVersion, seed: String(seed), players: PLAYERS, actions }));
       const r = replay(game, log);
       expect(r.state).toEqual(state);
@@ -89,7 +88,7 @@ describe.each(Object.keys(games))("%s", (gameId) => {
 
   it("view は全局面・全視点で viewSchema を満たす（余計なフィールドも無い）", () => {
     for (let seed = 0; seed < 100; seed++) {
-      const { actions } = playRandom(gameId, String(seed));
+      const { actions } = playRandom(game, String(seed));
       let state = game.init(PLAYERS, String(seed));
       const check = () => {
         for (const pid of [...PLAYERS, null]) {
@@ -201,7 +200,7 @@ describe("highcard: 隠し情報", () => {
   });
 
   it("全ラウンドで ROUNDS 回の対戦になる", () => {
-    const { state } = playRandom("highcard", "3");
+    const { state } = playRandom(highcard as AnyGame, "3");
     expect((state as { history: unknown[] }).history).toHaveLength(ROUNDS);
   });
 });

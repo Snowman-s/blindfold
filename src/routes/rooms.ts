@@ -11,6 +11,7 @@ import {
   bearerSecurity,
   errBody,
   errors,
+  openEnum,
   ResultSchema,
   RoomIdParam,
   RoomStateSchema,
@@ -58,7 +59,11 @@ const ApiKeyHeader = z.object({ "x-api-key": z.string().optional() });
 const GameInfo = z
   .object({
     id: z.string(),
-    rulesVersion: z.number().int().describe("Version of the game's rules (an integer, bumped whenever a change could make an old log replay differently)"),
+    rulesVersion: z.number().int().describe("Version of the game's rules (an integer, bumped whenever a change could make an old log replay differently). Rooms started with an older version fail with GAME_REMOVED"),
+    viewVersion: z
+      .number()
+      .int()
+      .describe("Version of the shape of view (an integer, bumped when a view field is removed, renamed, changes type or meaning, or gets a new value in a fixed set; not when a field is added)"),
     minPlayers: z.number().int(),
     maxPlayers: z.number().int(),
     summary: z.string(),
@@ -80,6 +85,7 @@ routes.openapi(
       Object.values(games).map((g) => ({
         id: g.id,
         rulesVersion: g.rulesVersion,
+        viewVersion: g.viewVersion,
         minPlayers: g.minPlayers,
         maxPlayers: g.maxPlayers,
         summary: g.docs.summary,
@@ -100,7 +106,11 @@ const GameRulesSchema = z
       .string()
       .describe("Hash of the content (also sent as ETag). Changes on any edit, even a typo fix; it is a cache key, not a compatibility signal"),
     apiVersion: z.string().describe("API version (semver), the same as in the guide and the OpenAPI spec"),
-    rulesVersion: z.number().int().describe("Version of the game's rules (an integer, bumped whenever a change could make an old log replay differently)"),
+    rulesVersion: z.number().int().describe("Version of the game's rules (an integer, bumped whenever a change could make an old log replay differently). Rooms started with an older version fail with GAME_REMOVED"),
+    viewVersion: z
+      .number()
+      .int()
+      .describe("Version of the shape of view (an integer, bumped when a view field is removed, renamed, changes type or meaning, or gets a new value in a fixed set; not when a field is added)"),
     minPlayers: z.number().int(),
     maxPlayers: z.number().int(),
     summary: z.string(),
@@ -225,7 +235,7 @@ const RoomSummary = z
   .object({
     roomId: z.string(),
     game: z.string(),
-    status: z.enum(["waiting", "playing"]),
+    status: openEnum(["waiting", "playing"], "Same as status in the room state."),
     players: z.number().int().describe("Number of players who have joined"),
     maxPlayers: z.number().int(),
     autoStart: z.boolean().describe("If true, the game starts by itself once the room is full"),
@@ -388,6 +398,7 @@ routes.openapi(
       },
       401: errors[401],
       404: errors[404],
+      410: errors[410],
       409: errors[409],
     },
   }),
@@ -414,6 +425,7 @@ routes.openapi(
       401: errors[401],
       403: errors[403],
       404: errors[404],
+      410: errors[410],
       409: errors[409],
     },
   }),
@@ -434,6 +446,7 @@ routes.openapi(
       200: { description: "Current state", content: { "application/json": { schema: RoomStateSchema } } },
       401: errors[401],
       404: errors[404],
+      410: errors[410],
     },
   }),
   async (c) => respond(c, await room(c).getState(extractToken(c.req.raw))),
@@ -467,6 +480,7 @@ routes.openapi(
       401: errors[401],
       403: errors[403],
       404: errors[404],
+      410: errors[410],
       409: errors[409],
     },
   }),
@@ -492,6 +506,7 @@ routes.openapi(
       200: { description: "State after resigning (status is finished, unless the game goes on without you)", content: { "application/json": { schema: RoomStateSchema } } },
       401: errors[401],
       404: errors[404],
+      410: errors[410],
       409: errors[409],
     },
   }),
@@ -515,6 +530,7 @@ routes.openapi(
       200: { description: "Left", content: { "application/json": { schema: RoomStateSchema } } },
       401: errors[401],
       404: errors[404],
+      410: errors[410],
       409: errors[409],
     },
   }),
@@ -548,6 +564,7 @@ routes.openapi(
       401: errors[401],
       403: errors[403],
       404: errors[404],
+      410: errors[410],
       409: errors[409],
     },
   }),
@@ -571,7 +588,7 @@ export const LogSchema = z
     rulesVersion: z
       .number()
       .int()
-      .describe("Rules version the game was played with. If it differs from rulesVersion in /games/{id}/rules, the current engine may not reproduce this log"),
+      .describe("Rules version the game was played with. If it differs from rulesVersion in /games/{id}/rules, the rules changed later and /replay is no longer available for this game"),
     seed: z.string().describe("Initial seed (128 bits, 32 hex characters)"),
     players: z.array(z.string()),
     actions: z.array(LogEntrySchema).describe("Every entry in turn order; actions[i].turn === i"),
@@ -581,7 +598,7 @@ export const LogSchema = z
 export const ReplaySchema = z
   .object({
     game: z.string(),
-    rulesVersion: z.number().int().describe("Rules version the game was played with (always equal to the current one; otherwise the replay is refused)"),
+    rulesVersion: z.number().int().describe("Rules version the game was played with (always the current one; older games fail with GAME_REMOVED)"),
     seed: z.string(),
     players: z.array(z.string()),
     frames: z
@@ -625,8 +642,8 @@ routes.openapi(
     operationId: "getReplay",
     summary: "Spectator view for every turn, reproduced from the log",
     description:
-      "Available only after the game has ended. Fails with `RULES_CHANGED` (409) if the game's rules have changed since it was played " +
-      "(its `rulesVersion` differs from the current one); `/rooms/{id}/log` still returns the log.",
+      "Available only after the game has ended. Fails with `GAME_REMOVED` (410) if the game's rules have changed since it was played " +
+      "(its `rulesVersion` is older than the current one), because the server keeps only the current rules; `/rooms/{id}/log` still returns the log.",
     request: { params: RoomIdParam },
     responses: {
       200: {
@@ -637,6 +654,7 @@ routes.openapi(
       },
       403: errors[403],
       404: errors[404],
+      410: errors[410],
       409: errors[409],
     },
   }),
@@ -653,7 +671,8 @@ routes.openAPIRegistry.registerPath({
   description:
     `To connect as a player, pass the subprotocols \`["${WS_PROTOCOL}", "${WS_TOKEN_PROTOCOL_PREFIX}<token>"]\`` +
     ` (e.g. \`new WebSocket(url, ["${WS_PROTOCOL}", "${WS_TOKEN_PROTOCOL_PREFIX}" + token])\`). ` +
-    `The server answers with the \`${WS_PROTOCOL}\` subprotocol. Clients that can set headers may send \`Authorization: Bearer\` instead. ` +
+    `The server answers with the \`${WS_PROTOCOL}\` subprotocol. Clients that can set headers may send \`Authorization: Bearer\` instead of the token subprotocol. ` +
+    `The \`${WS_PROTOCOL}\` subprotocol (the version of the WebSocket messages) is required, also for spectators and with Bearer. ` +
     "Without a token you are a spectator. `?token=` is rejected with 400.\n\n" +
     "Server -> client: `state` / `error` / `end` / `pong`. " +
     'Client -> server: `{"type":"action","turn":N,"action":{...}}`, `{"type":"resign"}` and `{"type":"ping"}`.',
@@ -663,6 +682,7 @@ routes.openAPIRegistry.registerPath({
     400: errors[400],
     401: errors[401],
     404: errors[404],
+    410: errors[410],
     426: errors[426],
   },
 });

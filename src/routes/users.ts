@@ -1,7 +1,7 @@
 import { createRoute, OpenAPIHono, z } from "@hono/zod-openapi";
 import { newApiKey, newUserId, sha256Hex } from "../lib/auth";
 import { END_REASONS, type EndReason } from "../lib/protocol";
-import { errBody, errors, validationHook } from "./schemas";
+import { errBody, errors, openEnum, validationHook } from "./schemas";
 
 export const UserSchema = z
   .object({
@@ -97,14 +97,15 @@ export const MatchSchema = z
     players: z.array(z.string()),
     startedAt: z.number().describe("epoch ms"),
     finishedAt: z.number().describe("epoch ms"),
-    reason: z.enum(END_REASONS).describe("normal = decided by the game's rules"),
+    reason: openEnum(END_REASONS, "Why the game ended. normal = decided by the game's rules. Treat an unknown value like normal."),
     results: z.array(
       z.object({
         playerId: z.string(),
         userId: z.string().nullable().describe("The user who joined with X-Api-Key, or null"),
-        outcome: z
-          .enum(OUTCOMES)
-          .describe("draw only for a game decided as a draw by its rules. If everyone timed out, everyone gets loss"),
+        outcome: openEnum(
+          OUTCOMES,
+          "draw only for a game decided as a draw by its rules. If everyone timed out, everyone gets loss. Treat an unknown value as neither a win nor a loss.",
+        ),
         score: z.number().nullable().describe("scores[playerId] of the result, or null if the game has no scores"),
       }),
     ),

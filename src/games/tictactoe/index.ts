@@ -43,6 +43,7 @@ const viewSchema = z.strictObject({
 export const tictactoe: GameDefinition<TicTacToeState, TicTacToeAction> = {
   id: "tictactoe",
   rulesVersion: 1,
+  viewVersion: 1,
   minPlayers: 2,
   maxPlayers: 2,
   actionSchema,

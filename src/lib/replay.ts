@@ -15,7 +15,7 @@ export interface LogEntry {
 
 export interface ReplayLog {
   game: string;
-  /** 試合の開始時に記録したルールの版（GameDefinition.rulesVersion）。今のエンジンと違えば再現できるとは限らない。 */
+  /** 試合の開始時に記録したルールの版（GameDefinition.rulesVersion）。再現はこの版のエンジン（getGame(game, rulesVersion)）で行う。 */
   rulesVersion: number;
   seed: Seed;
   players: string[];

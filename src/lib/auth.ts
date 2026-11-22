@@ -1,5 +1,11 @@
-/** WS でトークンを渡すサブプロトコルの接頭辞。`apigames.token.<token>` の形で送る。 */
-export const WS_PROTOCOL = "apigames";
+/**
+ * WS のサブプロトコル（プロトコルの版）。クライアントは対応する版を1つ以上提示し、サーバーはその中で最も新しいものを選んで応答する。
+ * 1.0 以降に WS の破壊的変更をするときは新しい版（apigames.v2）を足し、古い版はしばらく並べて残す。
+ * 新しい順に並べる。WS_PROTOCOL は今の最新版。
+ */
+export const WS_PROTOCOLS = ["apigames.v1"] as const;
+export const WS_PROTOCOL = WS_PROTOCOLS[0];
+/** WS でトークンを渡すサブプロトコルの接頭辞。`apigames.token.<token>` の形で送る（版を含まない）。 */
 export const WS_TOKEN_PROTOCOL_PREFIX = "apigames.token.";
 
 /**
@@ -14,14 +20,15 @@ export function extractToken(req: Request): string | null {
 }
 
 export type WsAuth =
-  | { ok: true; token: string | null; protocol: string | null }
+  | { ok: true; token: string | null; protocol: string }
   | { ok: false; message: string };
 
 /**
  * WS 用: ブラウザの WebSocket はヘッダーを付けられないので、サブプロトコルでトークンを受け取る。
- *   new WebSocket(url, ["apigames", "apigames.token.<token>"])
- * 応答ではトークンを含まない "apigames" を選ぶ（トークンを応答ヘッダーに載せないため）。
- * サブプロトコルが無ければ Authorization: Bearer（Node などヘッダーを付けられるクライアント向け）。
+ *   new WebSocket(url, ["apigames.v1", "apigames.token.<token>"])
+ * 版のサブプロトコルは必須（未指定を v1 とみなすと、v1 を外したときに黙って壊れるため）。
+ * 応答ではトークンを含まない版のサブプロトコルを選ぶ（トークンを応答ヘッダーに載せないため）。
+ * トークンのサブプロトコルが無ければ Authorization: Bearer（Node などヘッダーを付けられるクライアント向け）。
  */
 export function extractWsAuth(req: Request): WsAuth {
   const offered = (req.headers.get("Sec-WebSocket-Protocol") ?? "")
@@ -30,10 +37,9 @@ export function extractWsAuth(req: Request): WsAuth {
     .filter((s) => s.length > 0);
   const tokens = offered.filter((p) => p.startsWith(WS_TOKEN_PROTOCOL_PREFIX));
   if (tokens.length > 1) return { ok: false, message: "multiple token subprotocols" };
-  const protocol = offered.includes(WS_PROTOCOL) ? WS_PROTOCOL : null;
-  if (offered.length > 0 && protocol === null) {
-    // サブプロトコルを提示したクライアントは、応答で1つ選ばれないと接続に失敗する
-    return { ok: false, message: `offer the "${WS_PROTOCOL}" subprotocol` };
+  const protocol = WS_PROTOCOLS.find((p) => offered.includes(p));
+  if (!protocol) {
+    return { ok: false, message: `offer the "${WS_PROTOCOL}" subprotocol (supported: ${WS_PROTOCOLS.join(", ")})` };
   }
   const fromProtocol = tokens[0]?.slice(WS_TOKEN_PROTOCOL_PREFIX.length) ?? null;
   if (fromProtocol === "") return { ok: false, message: "empty token subprotocol" };

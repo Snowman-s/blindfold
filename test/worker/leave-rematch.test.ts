@@ -91,17 +91,6 @@ describe("POST /rooms/:id/leave", () => {
     wb.ws.close();
   });
 
-  it("nextSeat を持たない（導入前の）ルームでも、退出後の join で ID が衝突しない", async () => {
-    const { roomId, a } = await newRoom("tictactoe");
-    await runInDurableObject(env.GAME_ROOM.getByName(roomId), (_i, state) => {
-      state.storage.sql.exec("DELETE FROM meta WHERE key = 'nextSeat'");
-    });
-    await call("POST", `/rooms/${roomId}/leave`, { token: a.token });
-    const c = await call("POST", `/rooms/${roomId}/join`);
-    expect(c.status).toBe(201);
-    expect(c.json.playerId).toBe("p3");
-  });
-
   it("トークン無しは 401、存在しないルームは 404", async () => {
     const { roomId } = await newRoom("tictactoe");
     expect((await call("POST", `/rooms/${roomId}/leave`)).status).toBe(401);

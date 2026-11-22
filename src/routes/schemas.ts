@@ -30,9 +30,19 @@ export const errors = {
   401: errorResponse("Invalid token or API key (UNAUTHORIZED)"),
   403: errorResponse("Not allowed, or not available yet (NOT_HOST, NOT_YOUR_TURN, NOT_FINISHED, ROOM_RESERVED)"),
   404: errorResponse("Not found (ROOM_NOT_FOUND, NOT_FOUND)"),
-  409: errorResponse("Not possible in the current state (ALREADY_STARTED, ROOM_FULL, NOT_ENOUGH_PLAYERS, NOT_PLAYING, STALE_TURN, RULES_CHANGED)"),
+  409: errorResponse("Not possible in the current state (ALREADY_STARTED, ROOM_FULL, NOT_ENOUGH_PLAYERS, NOT_PLAYING, STALE_TURN)"),
+  410: errorResponse("The game this room was created with, or the rules version it was started with, is no longer available on this server (GAME_REMOVED)"),
   426: errorResponse("A WebSocket upgrade is required (UPGRADE_REQUIRED)"),
 } as const;
+
+/**
+ * 出力の enum。互換性方針で値は増えうるので、JSON Schema では閉じた enum にせず string にし、今ある値は説明に書く
+ * （型生成したクライアントが新しい値で落ちないように）。入力の enum は z.enum のままにする。
+ */
+export const openEnum = (values: readonly string[], description: string) =>
+  z
+    .string()
+    .describe(`${description} Currently one of ${values.map((v) => `\`${v}\``).join(", ")}; more values may be added.`);
 
 export const ResultSchema = z
   .object({
@@ -49,7 +59,7 @@ export const RoomStateSchema = z
       .int()
       .nullable()
       .describe("Rules version this game is played with (recorded at start). null while waiting"),
-    status: z.enum(ROOM_STATUSES),
+    status: openEnum(ROOM_STATUSES, "Room lifecycle. Treat an unknown value as neither waiting nor finished: keep listening for the next state."),
     turn: z.number().int().describe("Number of actions applied so far. Send this value with your action"),
     players: z.array(z.string()),
     currentPlayers: z.array(z.string()),

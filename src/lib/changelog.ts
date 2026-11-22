@@ -20,6 +20,24 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.4.0",
+    date: "2026-11-22",
+    breaking: [
+      "The WebSocket subprotocol is now versioned and required: offer `apigames.v1` (instead of `apigames`), also when " +
+        "spectating or when sending the token with `Authorization: Bearer`. The server answers with `apigames.v1`. " +
+        "The token subprotocol `apigames.token.<token>` is unchanged.",
+      "In `/openapi.json`, `status`, `reason` and `outcome` in responses are typed as strings instead of closed enums; " +
+        "their descriptions list today's values. New values may be added (guide, section 9).",
+      "`RULES_CHANGED` is replaced by `GAME_REMOVED` (410). When a game's `rulesVersion` goes up, rooms started with an " +
+        "older version (in progress or finished) fail with `GAME_REMOVED` everywhere except `/rooms/{id}/log`.",
+    ],
+    added: [
+      "`GAME_REMOVED` (410): the game, or the rules version a room was started with, is no longer available on the " +
+        "server. `/rooms/{id}/log` keeps working.",
+      "`viewVersion` in `GET /games` and `/games/{id}/rules`: bumped on breaking changes to a game's `view`.",
+    ],
+  },
+  {
     version: "0.3.0",
     date: "2026-11-22",
     added: [

@@ -23,6 +23,8 @@ const COMMON = [
   '- To give up, send `{ "type": "resign" }` (or `POST /rooms/{id}/resign`). Allowed at any time during play, even when it is not your turn. Unless this game\'s rules say otherwise, you lose, all other players win, and the game ends.',
   "- When the game ends you receive an `end` message with `winners` (empty for a draw), `scores` and `reason` (`normal`, `timeout` or `resign`).",
   "- New fields, message `type`s and error codes may be added at any time. Ignore fields you do not know (the `view` schema does not forbid extra fields), skip unknown message types, and treat an unknown error code like `BAD_REQUEST`.",
+  "- Enum-like fields outside `view` may get new values: treat an unknown `reason` like `normal`, and an unknown `status` as neither `waiting` nor `finished` (wait for the next `state`).",
+  "- When the rules below change, `rulesVersion` goes up and rooms started with an older version can no longer be played or replayed (`GAME_REMOVED`; their `/log` stays available). Breaking changes to `view` bump `viewVersion`.",
 ].join("\n");
 
 export interface GameRules {
@@ -30,6 +32,7 @@ export interface GameRules {
   version: string;
   apiVersion: string;
   rulesVersion: number;
+  viewVersion: number;
   minPlayers: number;
   maxPlayers: number;
   summary: string;
@@ -55,6 +58,7 @@ export function gameRules(game: AnyGame): Promise<GameRules> {
         id: game.id,
         apiVersion: API_VERSION,
         rulesVersion: game.rulesVersion,
+        viewVersion: game.viewVersion,
         minPlayers: game.minPlayers,
         maxPlayers: game.maxPlayers,
         summary: game.docs.summary,
@@ -80,7 +84,7 @@ export function rulesMarkdown(r: GameRules): string {
   const json = (v: unknown) => ["```json", compactJson(v), "```"].join("\n");
   const states = r.stateExamples.map((e) => `${e.title}:\n${json(e.message)}`).join("\n\n");
   return [
-    `# ${r.id} (${r.minPlayers === r.maxPlayers ? r.minPlayers : `${r.minPlayers}-${r.maxPlayers}`} players, rulesVersion ${r.rulesVersion}, apiVersion ${r.apiVersion}, version ${r.version})`,
+    `# ${r.id} (${r.minPlayers === r.maxPlayers ? r.minPlayers : `${r.minPlayers}-${r.maxPlayers}`} players, rulesVersion ${r.rulesVersion}, viewVersion ${r.viewVersion}, apiVersion ${r.apiVersion}, version ${r.version})`,
     "",
     r.summary,
     "",

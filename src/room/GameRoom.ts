@@ -16,10 +16,11 @@ import {
 import { applyResign, applyTimeout, replayFrames, type LogEntry, type ReplayLog } from "../lib/replay";
 import { practiceAction } from "../lib/practice";
 import { createRng, rngForTurn, type Seed } from "../lib/rng";
+import { createTables, migrateSchema } from "./schema";
 
 export type RoomError = {
   ok: false;
-  status: 400 | 401 | 403 | 404 | 409 | 500;
+  status: 400 | 401 | 403 | 404 | 409 | 410 | 500;
   code: string;
   message: string;
 };
@@ -73,9 +74,9 @@ export interface ReplayFrames {
 /**
  * WS に持たせる情報。token は接続時に使ったトークン（サーバー内にだけ保存され、クライアントには送らない）。
  * 再戦ルームでは退出した席に同じ ID で座り直せるので、ID だけでなくトークンも一致する接続だけをその席として扱う。
- * token が無いのはこの仕組みの導入前に繋いだ接続で、ID だけで判定する。
+ * protocol は交渉したサブプロトコル（apigames.v1 など）。版ごとに配信を変えるときに使う。
  */
-type Attachment = { playerId: string | null; token?: string };
+type Attachment = { playerId: null; protocol: string } | { playerId: string; token: string; protocol: string };
 
 /**
  * サーバーが書くログの行は player = "" で表す（プレイヤー ID と衝突しない）。
@@ -139,6 +140,8 @@ export class GameRoom extends DurableObject<Env> {
     // テーブルは init() で初めて作る。存在しないルーム ID へのアクセスでストレージを書かないよう、ここでは読むだけ。
     this.ready =
       this.sql.exec("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'").toArray().length > 0;
+    // 既存のルームのスキーマを今の版まで移行する（移行が済むまで他のイベントを受け付けない）
+    if (this.ready) void ctx.blockConcurrencyWhile(async () => migrateSchema(ctx.storage));
     // ping は DO を起こさずに自動応答する（受信リクエスト数の節約）
     ctx.setWebSocketAutoResponse(
       new WebSocketRequestResponsePair('{"type":"ping"}', JSON.stringify({ type: "pong" } satisfies ServerMessage)),
@@ -147,13 +150,9 @@ export class GameRoom extends DurableObject<Env> {
 
   // ---- 内部ヘルパー ----
 
+  /** テーブルの形は schema.ts（列やテーブルを足すときは MIGRATIONS に書く）。 */
   private createTables(): void {
-    this.sql.exec(`
-      CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
-      CREATE TABLE IF NOT EXISTS players(id TEXT PRIMARY KEY, token TEXT NOT NULL, seq INTEGER NOT NULL, user_id TEXT);
-      CREATE TABLE IF NOT EXISTS actions(turn INTEGER, player TEXT, action TEXT, at INTEGER);
-      CREATE TABLE IF NOT EXISTS snapshot(id INTEGER PRIMARY KEY CHECK (id = 1), turn INTEGER, state TEXT);
-    `);
+    createTables(this.sql);
     this.ready = true;
   }
 
@@ -183,17 +182,10 @@ export class GameRoom extends DurableObject<Env> {
   /**
    * 新しい席の ID を払い出す（p1, p2, ... の連番。退出しても番号は再利用しない）。
    * 再利用すると、閉じ損ねた退出者の WS（attachment に playerId を持つ）が新しい参加者の view を受け取れてしまう。
-   * seq は番号と揃える（手番の順 = ORDER BY seq）。nextSeat が無いのはこの仕組みの導入前に作ったルームで、
-   * 既存の席は p(seq+1) なので、最大の seq の次から払い出す（退出で行数が減っていても衝突しない）。
-   * write の中（トランザクション内）で呼ぶこと。
+   * seq は番号と揃える（手番の順 = ORDER BY seq）。nextSeat は init で書く。write の中（トランザクション内）で呼ぶこと。
    */
   private allocateSeat(): { id: string; seq: number } {
-    const fallback = () => {
-      const r = this.sql.exec("SELECT MAX(seq) AS m FROM players").toArray()[0];
-      return r?.m === null || r?.m === undefined ? 1 : Number(r.m) + 2;
-    };
-    const stored = this.getMeta("nextSeat");
-    const n = stored !== null ? Number(stored) : fallback();
+    const n = Number(this.getMeta("nextSeat")!);
     this.setMeta("nextSeat", String(n + 1));
     return { id: `p${n}`, seq: n - 1 };
   }
@@ -232,6 +224,12 @@ export class GameRoom extends DurableObject<Env> {
     return Number(this.getMeta("rulesVersion")!);
   }
 
+  /** 記録したルールの版（waiting の間は null）。 */
+  private recordedRulesVersion(): number | null {
+    const v = this.getMeta("rulesVersion");
+    return v === null ? null : Number(v);
+  }
+
   private status(): RoomStatus {
     return this.getMeta("status") as RoomStatus;
   }
@@ -241,8 +239,33 @@ export class GameRoom extends DurableObject<Env> {
     return this.getMeta("gameId") !== null;
   }
 
+  /**
+   * このルームのエンジン。開始後は記録した rulesVersion と今の版が一致するときだけ返す（古い state を新しいルールで
+   * 動かさない）。waiting の間は今の版（開始時にその版を記録する）。無ければ null（GAME_REMOVED）。
+   */
+  private engine(): AnyGame | null {
+    const v = this.recordedRulesVersion();
+    return getGame(this.getMeta("gameId")!, v ?? undefined) ?? null;
+  }
+
+  /** check() を通った後で使う。 */
   private game(): AnyGame {
-    return getGame(this.getMeta("gameId")!)!;
+    const g = this.engine();
+    if (!g) throw new Error(`engine for ${this.getMeta("gameId")} is not available`);
+    return g;
+  }
+
+  /** RPC の入口で呼ぶ：ルームが無ければ ROOM_NOT_FOUND、エンジンが無ければ GAME_REMOVED。 */
+  private check(): RoomError | null {
+    if (!this.exists()) return NOT_FOUND;
+    if (this.engine()) return null;
+    const v = this.recordedRulesVersion();
+    return fail(
+      410,
+      "GAME_REMOVED",
+      `the game ${this.getMeta("gameId")}${v === null ? "" : ` (rules version ${v})`} is no longer available on this server` +
+        (v === null ? "" : "; the log is still available from /rooms/{id}/log"),
+    );
   }
 
   /** ゲーム自身の結果。なければ時間切れ・投了による決着（forfeit）。 */
@@ -253,11 +276,10 @@ export class GameRoom extends DurableObject<Env> {
     return f ? (JSON.parse(f) as GameResult) : null;
   }
 
-  /** 試合が終わった理由。endReason が無いのは通常の決着か、endReason 導入前の時間切れ。 */
+  /** 試合が終わった理由。時間切れ・投了で終わったときは recordForfeit が書く。無ければ通常の決着。 */
   private endReason(): EndReason {
     const r = this.getMeta("endReason");
-    if (r === "timeout" || r === "resign") return r;
-    return this.getMeta("forfeit") !== null ? "timeout" : "normal";
+    return r === "timeout" || r === "resign" ? r : "normal";
   }
 
   private deadline(): number | null {
@@ -353,9 +375,8 @@ export class GameRoom extends DurableObject<Env> {
    */
   private socketPlayer(ws: WebSocket, seats: Map<string, string>): string | null {
     const att = ws.deserializeAttachment() as Attachment | null;
-    const pid = att?.playerId ?? null;
-    if (pid === null || !seats.has(pid)) return null;
-    return att?.token === undefined || att.token === seats.get(pid) ? pid : null;
+    if (!att || att.playerId === null) return null;
+    return att.token === seats.get(att.playerId) ? att.playerId : null;
   }
 
   /** 席 ID → 今のトークン。 */
@@ -510,6 +531,8 @@ export class GameRoom extends DurableObject<Env> {
    */
   private async ensureAlarm(): Promise<void> {
     try {
+      // エンジンが無いルームでは張らない（alarm が毎回失敗して再試行のたびにリクエストを消費しないように）
+      if (!this.engine()) return;
       const status = this.status();
       const needsAlarm =
         (status === "playing" && this.getMeta("deadline") !== null) ||
@@ -686,7 +709,8 @@ export class GameRoom extends DurableObject<Env> {
 
   /** 参加。プレイヤー ID は参加順に p1, p2, ...（退出した席の番号は再利用しない） */
   async join(userId: string | null = null): Promise<RoomResult<{ playerId: string; token: string }>> {
-    if (!this.exists()) return NOT_FOUND;
+    const bad = this.check();
+    if (bad) return bad;
     if (this.reservedSeats()) return fail(403, "ROOM_RESERVED", "this room is reserved for a rematch");
     if (this.status() !== "waiting") return fail(409, "ALREADY_STARTED", "game already started");
     const n = this.playerIds().length;
@@ -713,7 +737,8 @@ export class GameRoom extends DurableObject<Env> {
     origin: string,
     userId: string | null,
   ): Promise<RoomResult<{ playerId: string; token: string }>> {
-    if (!this.exists()) return NOT_FOUND;
+    const bad = this.check();
+    if (bad) return bad;
     const reserved = this.reservedSeats();
     const seat = reserved?.[origin];
     if (!reserved || !seat) return fail(403, "ROOM_RESERVED", "no seat is reserved for this player");
@@ -734,7 +759,8 @@ export class GameRoom extends DurableObject<Env> {
    * 再戦ルームでは席は予約されたまま（元のルームの rematch をもう一度呼べば座り直せる）。返すのは観戦視点。
    */
   async leave(token: string | null): Promise<RoomResult<RoomState>> {
-    if (!this.exists()) return NOT_FOUND;
+    const bad = this.check();
+    if (bad) return bad;
     const pid = this.playerByToken(token);
     if (!pid) return fail(401, "UNAUTHORIZED", "valid player token required");
     if (this.status() !== "waiting") return fail(409, "ALREADY_STARTED", "game already started (resign instead)");
@@ -761,7 +787,8 @@ export class GameRoom extends DurableObject<Env> {
    * 同じプレイヤーが何度呼んでも同じ { roomId, playerId, token } が返る。
    */
   async rematch(token: string | null): Promise<RoomResult<{ roomId: string; playerId: string; token: string }>> {
-    if (!this.exists()) return NOT_FOUND;
+    const bad = this.check();
+    if (bad) return bad;
     const pid = this.playerByToken(token);
     if (!pid) return fail(401, "UNAUTHORIZED", "valid player token required");
     if (this.status() !== "finished") return fail(403, "NOT_FINISHED", "rematch is available after the game has finished");
@@ -798,7 +825,8 @@ export class GameRoom extends DurableObject<Env> {
 
   /** 試合開始（作成者 = POST /rooms で受け取った hostToken を持つ者のみ）。返すのは観戦視点。 */
   async start(token: string | null): Promise<RoomResult<RoomState>> {
-    if (!this.exists()) return NOT_FOUND;
+    const bad = this.check();
+    if (bad) return bad;
     if (!token) return fail(401, "UNAUTHORIZED", "host token required");
     if (token !== this.getMeta("hostToken")) {
       return this.playerByToken(token)
@@ -841,7 +869,8 @@ export class GameRoom extends DurableObject<Env> {
 
   /** 状態取得。token があればそのプレイヤー視点、なければ観戦視点。 */
   async getState(token: string | null): Promise<RoomResult<RoomState>> {
-    if (!this.exists()) return NOT_FOUND;
+    const bad = this.check();
+    if (bad) return bad;
     await this.ensureAlarm();
     let pid: string | null = null;
     if (token) {
@@ -853,7 +882,8 @@ export class GameRoom extends DurableObject<Env> {
 
   /** REST の行動。turn が現在のターンと一致しなければ STALE_TURN。 */
   async act(token: string | null, turn: number, rawAction: unknown): Promise<RoomResult<RoomState>> {
-    if (!this.exists()) return NOT_FOUND;
+    const bad = this.check();
+    if (bad) return bad;
     const pid = this.playerByToken(token);
     if (!pid) return fail(401, "UNAUTHORIZED", "valid player token required");
     const r = await this.actAs(pid, turn, rawAction);
@@ -862,7 +892,8 @@ export class GameRoom extends DurableObject<Env> {
 
   /** REST の投了。 */
   async resign(token: string | null): Promise<RoomResult<RoomState>> {
-    if (!this.exists()) return NOT_FOUND;
+    const bad = this.check();
+    if (bad) return bad;
     const pid = this.playerByToken(token);
     if (!pid) return fail(401, "UNAUTHORIZED", "valid player token required");
     const r = await this.resignAs(pid);
@@ -998,17 +1029,11 @@ export class GameRoom extends DurableObject<Env> {
   async getReplay(): Promise<RoomResult<ReplayFrames>> {
     const log = await this.getLog();
     if (!log.ok) return log;
-    const game = getGame(log.data.game)!;
-    // ルールが変わったエンジンで古いログを再生すると、別の試合が再現されたり例外になったりする。
-    // ログ自体（/log）は正しい記録なので返し続け、再現だけを断る。
-    if (log.data.rulesVersion !== game.rulesVersion) {
-      return fail(
-        409,
-        "RULES_CHANGED",
-        `this game was played with rules version ${log.data.rulesVersion}, but the server now runs version ${game.rulesVersion}; ` +
-          "the log is still available from /rooms/{id}/log",
-      );
-    }
+    // 記録した版のエンジンでだけ再生する（今の版で古いログを再生すると、別の試合が再現されたり例外になったりする）。
+    // ルールの版が上がっていれば断る。ログ自体（/log）は正しい記録なので返し続ける。
+    const bad = this.check();
+    if (bad) return bad;
+    const game = this.game();
     const { frames, result } = replayFrames(game, log.data);
     return ok({
       game: game.id,
@@ -1033,7 +1058,8 @@ export class GameRoom extends DurableObject<Env> {
     if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
       return error(426, "UPGRADE_REQUIRED", "expected WebSocket upgrade");
     }
-    if (!this.exists()) return error(NOT_FOUND.status, NOT_FOUND.code, NOT_FOUND.message);
+    const bad = this.check();
+    if (bad) return error(bad.status, bad.code, bad.message);
     await this.ensureAlarm();
     const auth = extractWsAuth(request);
     if (!auth.ok) return error(400, "BAD_REQUEST", auth.message);
@@ -1046,14 +1072,17 @@ export class GameRoom extends DurableObject<Env> {
     const pair = new WebSocketPair();
     const [client, server] = [pair[0], pair[1]];
     this.ctx.acceptWebSocket(server); // Hibernation API。server.accept() は使わない
-    server.serializeAttachment((pid ? { playerId: pid, token: auth.token! } : { playerId: null }) satisfies Attachment);
+    server.serializeAttachment(
+      (pid
+        ? { playerId: pid, token: auth.token!, protocol: auth.protocol }
+        : { playerId: null, protocol: auth.protocol }) satisfies Attachment,
+    );
 
     const s = this.buildState(pid);
     this.send(server, this.stateMessage(s));
     if (s.status === "finished" && s.result) this.send(server, this.endMessage(s.result));
-    // 応答で選ぶのはトークンを含まない "apigames"（トークンを応答ヘッダーに載せない）
-    const headers: HeadersInit = auth.protocol ? { "Sec-WebSocket-Protocol": auth.protocol } : {};
-    return new Response(null, { status: 101, webSocket: client, headers });
+    // 応答で選ぶのはトークンを含まない版のサブプロトコル（トークンを応答ヘッダーに載せない）
+    return new Response(null, { status: 101, webSocket: client, headers: { "Sec-WebSocket-Protocol": auth.protocol } });
   }
 
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
@@ -1075,7 +1104,8 @@ export class GameRoom extends DurableObject<Env> {
 
       const pid = this.socketPlayer(ws, this.seatTokens());
       const r =
-        msg.data.type === "resign" ? await this.resignAs(pid) : await this.actAs(pid, msg.data.turn, msg.data.action);
+        this.check() ??
+        (msg.data.type === "resign" ? await this.resignAs(pid) : await this.actAs(pid, msg.data.turn, msg.data.action));
       if (!r.ok) this.send(ws, { type: "error", code: toWsErrorCode(r.code), message: r.message });
       // 成功時の state は afterChange の broadcast で全員に届く
     } catch (e) {
@@ -1104,6 +1134,12 @@ export class GameRoom extends DurableObject<Env> {
   // ---- Alarm（持ち時間） ----
 
   async alarm(): Promise<void> {
+    if (!this.exists()) return;
+    if (!this.engine()) {
+      // 例外にすると alarm が再試行され続ける（1回 = 1リクエスト）ので、記録して止める
+      console.error(`alarm skipped: ${this.check()?.message}`);
+      return;
+    }
     const status = this.status();
     if (status === "finished") return this.retryPersist();
     if (status !== "playing") return;

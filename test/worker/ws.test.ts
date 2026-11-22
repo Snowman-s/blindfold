@@ -50,16 +50,16 @@ class Conn implements SocketLike {
   }
 }
 
-/** ブラウザと同じく、トークンはサブプロトコルで渡す。 */
+/** ブラウザと同じく、トークンはサブプロトコルで渡す。版のサブプロトコルは観戦でも必須。 */
 const wsHeaders = (token?: string): Record<string, string> => ({
   Upgrade: "websocket",
-  ...(token ? { "Sec-WebSocket-Protocol": `${WS_PROTOCOL}, ${WS_TOKEN_PROTOCOL_PREFIX}${token}` } : {}),
+  "Sec-WebSocket-Protocol": token ? `${WS_PROTOCOL}, ${WS_TOKEN_PROTOCOL_PREFIX}${token}` : WS_PROTOCOL,
 });
 
 async function connect(roomId: string, token?: string): Promise<Conn> {
   const res = await SELF.fetch(`${BASE}/rooms/${roomId}/ws`, { headers: wsHeaders(token) });
   expect(res.status).toBe(101);
-  if (token) expect(res.headers.get("Sec-WebSocket-Protocol")).toBe(WS_PROTOCOL); // トークンは応答に載せない
+  expect(res.headers.get("Sec-WebSocket-Protocol")).toBe(WS_PROTOCOL); // トークンは応答に載せない
   const ws = res.webSocket!;
   ws.accept(); // クライアント側の accept（DO 側は Hibernation API）
   open.push(ws);
@@ -698,29 +698,40 @@ describe("ルームの存在確認・入力の制限", () => {
     expect(((await res.json()) as any).error.code).toBe("BAD_REQUEST");
   });
 
-  it("サブプロトコルに apigames が無い・トークンが複数あるなら 400", async () => {
+  it("版のサブプロトコル（apigames.v1）が無い・知らない版だけ・トークンが複数あるなら 400", async () => {
     const { roomId, a, b } = await newRoom("tictactoe");
-    const only = await SELF.fetch(`${BASE}/rooms/${roomId}/ws`, {
-      headers: { Upgrade: "websocket", "Sec-WebSocket-Protocol": `apigames.token.${a.token}` },
+    const upgrade = (protocols?: string) =>
+      SELF.fetch(`${BASE}/rooms/${roomId}/ws`, {
+        headers: { Upgrade: "websocket", ...(protocols !== undefined ? { "Sec-WebSocket-Protocol": protocols } : {}) },
+      });
+    expect((await upgrade()).status).toBe(400); // 観戦でも版は必須
+    expect((await upgrade(`apigames.token.${a.token}`)).status).toBe(400);
+    const unversioned = await upgrade(`apigames, apigames.token.${a.token}`); // 版の無い旧名
+    expect(unversioned.status).toBe(400);
+    expect(((await unversioned.json()) as any).error.message).toContain(WS_PROTOCOL);
+    expect((await upgrade("apigames.v999")).status).toBe(400);
+    expect((await upgrade(`${WS_PROTOCOL}, apigames.token.${a.token}, apigames.token.${b.token}`)).status).toBe(400);
+  });
+
+  it("知っている版と知らない版を並べて提示したら、知っている版を選ぶ", async () => {
+    const { roomId } = await newRoom("tictactoe");
+    const res = await SELF.fetch(`${BASE}/rooms/${roomId}/ws`, {
+      headers: { Upgrade: "websocket", "Sec-WebSocket-Protocol": `apigames.v999, ${WS_PROTOCOL}` },
     });
-    expect(only.status).toBe(400);
-    const two = await SELF.fetch(`${BASE}/rooms/${roomId}/ws`, {
-      headers: {
-        Upgrade: "websocket",
-        "Sec-WebSocket-Protocol": `apigames, apigames.token.${a.token}, apigames.token.${b.token}`,
-      },
-    });
-    expect(two.status).toBe(400);
+    expect(res.status).toBe(101);
+    expect(res.headers.get("Sec-WebSocket-Protocol")).toBe(WS_PROTOCOL);
+    res.webSocket!.accept();
+    open.push(res.webSocket!);
   });
 
   it("ヘッダーを付けられるクライアントは Authorization: Bearer でも WS に接続できる", async () => {
     const { roomId, host, b } = await newRoom("tictactoe");
     await call("POST", `/rooms/${roomId}/start`, { token: host });
     const res = await SELF.fetch(`${BASE}/rooms/${roomId}/ws`, {
-      headers: { Upgrade: "websocket", Authorization: `Bearer ${b.token}` },
+      headers: { Upgrade: "websocket", "Sec-WebSocket-Protocol": WS_PROTOCOL, Authorization: `Bearer ${b.token}` },
     });
     expect(res.status).toBe(101);
-    expect(res.headers.get("Sec-WebSocket-Protocol")).toBeNull(); // 提示されていないので選ばない
+    expect(res.headers.get("Sec-WebSocket-Protocol")).toBe(WS_PROTOCOL);
     const ws = res.webSocket!;
     ws.accept();
     open.push(ws);

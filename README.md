@@ -22,7 +22,7 @@ Games currently on the table:
 |---|---|
 | `tictactoe` | Three in a row. Included mostly so the protocol has something simple to stand on. |
 | `highcard` | Two players, hidden hands, both play a card at the same time. The higher card wins the round. |
-| `frontier` | 2-4 players on an abstract graph. Everyone secretly orders troops between nodes at once, and the orders resolve together. Nodes have no positions or names, so every client draws its own map. Optional fog of war. |
+| `frontier` | 2-4 players on an abstract graph. Everyone secretly orders troops between nodes at once, and the orders resolve together. Nodes have no positions or names, so every client draws its own map. Optional fog of war. Rooms seat 4 unless you pass `options.seats` (e.g. `2`). |
 
 ## Getting started
 
@@ -51,6 +51,8 @@ pnpm tsx bots/random-bot.ts --url https://blindfold.snowesamosc.workers.dev --qu
 
 Run the last line twice and the two bots will find each other. Neither of them
 will notice that nobody is watching.
+The random bot picks from `legal`, so it only plays games that list their legal moves
+(`listsLegalActions: true` in `/games`), not `frontier`.
 
 ## Watching
 

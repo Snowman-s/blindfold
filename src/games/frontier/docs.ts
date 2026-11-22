@@ -35,7 +35,8 @@ export const docs: GameDocs = {
     "- When a player leaves for any reason, their nodes become neutral and keep their troops as a garrison. Orders they sent this round are discarded.",
     "",
     "### Notes",
-    "- The platform `turn` goes up by one each time any player sends orders. If you get `STALE_TURN` while the round has not changed (`round` is the same), just resend the same orders with the latest `turn`.",
+    "- The platform `turn` goes up by one each time any player sends orders, so several `state` messages arrive within one `round`. Within a round only `turn` and `submitted` change, so there is nothing to recompute: when you send, use the `turn` of the newest `state` you have received, not the one you started thinking from. Every `STALE_TURN` counts toward the connection's error limit.",
+    "- Quick match and `options.autoStart` wait until the room is full, which is 4 players by default. For a 2- or 3-player game pass `options.seats` (for example `{\"game\":\"frontier\",\"options\":{\"seats\":2}}`).",
     "- This game does not list legal moves (`legal` is never sent); build orders from the rules above. An `ILLEGAL_ACTION` message names the bad order, and you may send corrected orders for the same round.",
   ].join("\n"),
   view: [
@@ -51,7 +52,7 @@ export const docs: GameDocs = {
     "- `myOrders` (players only): your orders for this round, or `null` if you have not sent them.",
     "",
     "Viewpoints: without fog everyone sees every troop count. With fog on, a player sees troop counts only on their own nodes and the nodes next to them, and only `lastMoves` that start or end at such a node (plus their own).",
-    "Spectators and players who are out see no troop counts and no `lastMoves` while fog is on. After the game ends, everything is shown to everyone.",
+    "Spectators and players who are out see no troop counts and no `lastMoves` while fog is on. After the game ends, everything is shown to everyone (in `GET /rooms/{id}/replay`, which shows the spectator view of each turn, only the final frame is unfogged).",
     "Owners, production and the graph are always public.",
     "",
     "**Presentation:** nodes have no coordinates, names or theme on purpose. Lay out the graph however you like and dress it",

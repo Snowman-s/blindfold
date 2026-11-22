@@ -241,7 +241,8 @@ export class GameRoom extends DurableObject<Env> {
     const rulesVersion = this.store.rulesVersion();
     if (status === "waiting") {
       return {
-        game, status, rulesVersion, gameOptions, players, snap: null, currentPlayers: [], deadline: null, result: null, rematch: null,
+        game, status, rulesVersion, gameOptions, players, snap: null, currentPlayers: [], deadline: null, phaseTurn: null, result: null,
+        rematch: null,
       };
     }
     const snap = this.store.loadSnapshot();
@@ -254,6 +255,8 @@ export class GameRoom extends DurableObject<Env> {
       snap,
       currentPlayers: status === "playing" ? game.currentPlayers(snap.state) : [],
       deadline: this.deadline(),
+      // 記録の無いルームは、turn の完全一致だけを受け付けるのと揃えて今の turn
+      phaseTurn: status === "playing" ? (this.store.getMeta("phaseTurn") ?? snap.turn) : null,
       // 終了後は確定した結果（playing の間は決着していないので null）
       result: status === "finished" ? this.store.result() : null,
       rematch: status === "finished" ? this.store.rematchInfo() : null,

@@ -76,6 +76,12 @@ export interface RoomState {
   legal?: unknown[];
   /** 現在の手番の締め切り（epoch ms）。playing 以外は null */
   deadline: number | null;
+  /**
+   * 今の手番が始まったターン。同時手番では誰かが出すたびに turn が進むが、phaseTurn は同時手番の間は変わらない
+   * （同時手番でなければ turn と同じ）。自分が送った turn が phaseTurn 以上なのに currentPlayers に自分がいる state は、
+   * 自分の手より前に作られて行き違いで届いたもの。playing 以外は null
+   */
+  phaseTurn: number | null;
   /** サーバーの現在時刻（epoch ms）。クライアントは deadline - now で残り時間を出す（時計ずれ対策） */
   now: number;
   result: GameResult | null;

@@ -4,6 +4,7 @@ import { practiceAction } from "./practice";
 import type { LogEntry, ReplayLog } from "./replay";
 import { createRng, rngForTurn } from "./rng";
 import type { ServerMessage } from "./protocol";
+import { sameSimultaneousTurn } from "./turns";
 
 /**
  * ガイド・ルール説明に載せる例を実際のエンジンから作る（view の形が変わっても例が古くならない）。
@@ -51,6 +52,7 @@ function stateMessage(
   turn: number,
   pid: string | null,
   status: "playing" | "finished",
+  phaseTurn: number = turn,
 ): StateMessage {
   const current = status === "playing" ? game.currentPlayers(state) : [];
   const legal = pid && current.includes(pid) ? game.legalActions?.(state, pid) : undefined;
@@ -66,6 +68,7 @@ function stateMessage(
     view: game.view(state, pid),
     ...(legal ? { legal } : {}),
     deadline: status === "playing" ? EXAMPLE_DEADLINE : null,
+    phaseTurn: status === "playing" ? phaseTurn : null,
     now: EXAMPLE_NOW,
     result: game.result(state),
   };
@@ -94,8 +97,10 @@ export function gameExamples(game: AnyGame): GameExamples {
   const firstAction = firstActionOf(game, s0, first, seed);
   const s1 = game.apply(s0, first, firstAction, rngForTurn(seed, 0));
   const actor = game.currentPlayers(s1)[0] ?? first;
-  const player = stateMessage(game, s1, 1, actor, "playing");
-  const spectator = stateMessage(game, s1, 1, null, "playing");
+  // 1手目で同時手番が続いていれば、今の手番は turn 0 に始まったまま（GameRoom の settle と同じ判定）
+  const phase1 = sameSimultaneousTurn(game.currentPlayers(s0), EXAMPLE_DEADLINE, game.currentPlayers(s1)) ? 0 : 1;
+  const player = stateMessage(game, s1, 1, actor, "playing", phase1);
+  const spectator = stateMessage(game, s1, 1, null, "playing", phase1);
 
   const states: ExampleState[] = [
     { title: `Start of the game (turn 0), as **${first}** (may act now)`, message: stateMessage(game, s0, 0, first, "playing") },
@@ -106,7 +111,7 @@ export function gameExamples(game: AnyGame): GameExamples {
   ];
   // 今打った人の視点が観戦視点と違う（同時手番で伏せた札が見えるなど）ときだけ載せる
   if (actor !== first) {
-    const mover = stateMessage(game, s1, 1, first, "playing");
+    const mover = stateMessage(game, s1, 1, first, "playing", phase1);
     if (JSON.stringify(mover.view) !== JSON.stringify(spectator.view) || mover.legal) {
       states.push({ title: `The same moment as **${first}**, who has just acted`, message: mover });
     }

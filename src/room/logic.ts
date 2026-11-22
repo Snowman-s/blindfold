@@ -3,6 +3,7 @@ import type { EndReason, RematchInfo, RoomState, RoomStatus, ServerMessage } fro
 import { applyResign, applyTimeout } from "../lib/replay";
 import { FINISHED_ROOM_TTL_MS, WAITING_ROOM_TTL_MS, type RoomOptions } from "../lib/options";
 import { rngForTurn, type Seed } from "../lib/rng";
+import { sameSimultaneousTurn } from "../lib/turns";
 
 /**
  * GameRoom の状態遷移と、配る状態の組み立て（純粋関数）。
@@ -50,13 +51,15 @@ export type RoomCore = {
   snap: Snapshot | null;
   currentPlayers: string[];
   deadline: number | null;
+  /** 今の手番が始まったターン（playing 以外は null） */
+  phaseTurn: number | null;
   result: GameResult | null;
   rematch: RematchInfo | null;
 };
 
 /** pid（観戦者は null）から見た状態。legal は pid が今行動でき、ゲームが合法手を列挙するときだけ付ける。 */
 export function roomState(core: RoomCore, pid: string | null, now: number): RoomState {
-  const { game, status, rulesVersion, gameOptions, players, snap, currentPlayers, deadline, result, rematch } = core;
+  const { game, status, rulesVersion, gameOptions, players, snap, currentPlayers, deadline, phaseTurn, result, rematch } = core;
   const out: RoomState = {
     game: game.id,
     rulesVersion,
@@ -67,6 +70,7 @@ export function roomState(core: RoomCore, pid: string | null, now: number): Room
     currentPlayers,
     view: snap ? game.view(snap.state, pid) : null,
     deadline,
+    phaseTurn,
     now,
     result,
   };
@@ -172,25 +176,6 @@ export function decideTimeout(
   const pending = game.currentPlayers(snap.state);
   return { pending, resolution: resolution(game, applyTimeout(game, snap.state, pending, players, seed, snap.turn), "timeout") };
 }
-
-/**
- * 同じ同時手番が続いているか：prev（変更前に行動できたプレイヤー）から、行動できるプレイヤーが減っただけ
- * （同時手番で誰かが出した・抜けた）なら true。手番が移ったとき・新しいラウンドに入ったときは false。
- * unchangedKeeps は「行動できるプレイヤーが変わらなかった」ときも true にするか。投了のときだけ true：
- * 通常の手で同じ顔ぶれになるのは新しいラウンド（全員が出し終えた）だが、もう出した人や手番でない人の投了では
- * 顔ぶれが変わらないまま同じ手番が続く（締め切りを延ばしたり、送信中の手を STALE_TURN にしたりしない）。
- */
-export const sameSimultaneousTurn = (
-  prev: string[] | null,
-  prevDeadline: number | null,
-  pending: string[],
-  unchangedKeeps = false,
-): boolean =>
-  prev !== null &&
-  prevDeadline !== null &&
-  pending.length > 0 &&
-  (pending.length < prev.length || (unchangedKeeps && pending.length === prev.length)) &&
-  pending.every((p) => prev.includes(p));
 
 /** 次の締め切り。同じ同時手番が続いているなら前の締め切りのまま、そうでなければ持ち時間をリセットする。 */
 export function nextDeadline(

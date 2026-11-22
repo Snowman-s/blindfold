@@ -4,6 +4,7 @@ import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { games, getGame } from "../games/registry";
 import { extractToken, isRoomId, newRoomId, sha256Hex, WS_PROTOCOL, WS_TOKEN_PROTOCOL_PREFIX } from "../lib/auth";
 import {
+  checkSeats,
   DEFAULT_TURN_TIME_MS,
   FINISHED_ROOM_TTL_MS,
   gameOptionsKey,
@@ -241,8 +242,9 @@ routes.openapi(
     summary: "Create a room",
     description:
       "`options.turnTimeMs` (1000-86400000) sets the time limit per turn; the default is 5 minutes. By default a player who times out loses. " +
-      "With `options.practice: true`, server-side practice bots fill the empty seats (up to minPlayers) when the game starts (how they play depends on the game; practice games are not recorded). " +
-      "With `options.autoStart: true`, the game starts as soon as maxPlayers have joined (cannot be combined with practice). " +
+      "`options.seats` (between the game's minPlayers and maxPlayers; default maxPlayers) is the number of seats: the room is full at that many players. " +
+      "With `options.practice: true`, server-side practice bots fill the empty seats (up to `seats`, or minPlayers if `seats` is omitted) when the game starts (how they play depends on the game; practice games are not recorded). " +
+      "With `options.autoStart: true`, the game starts as soon as the room is full (cannot be combined with practice). " +
       "Rooms are listed in `GET /rooms` by default; pass `options.unlisted: true` to hide a room (practice rooms are never listed). " +
       "Unknown options are rejected with 400. " +
       "`gameOptions` are options specific to the game (see `optionsSchema` in `/games/{id}/rules`; games without options reject them with 400). " +
@@ -293,7 +295,7 @@ const RoomSummary = z
     gameOptions: z.unknown().describe("Game-specific options of the room (defaults filled in). null for games without options"),
     status: openEnum(["waiting", "playing"], "Same as status in the room state."),
     players: z.number().int().describe("Number of players who have joined"),
-    maxPlayers: z.number().int(),
+    maxPlayers: z.number().int().describe("Number of seats in this room (its `seats` option, default the game's maxPlayers)"),
     autoStart: z.boolean().describe("If true, the game starts by itself once the room is full"),
     turnTimeMs: z.number().int(),
     createdAt: z.number(),
@@ -370,7 +372,7 @@ routes.openapi(
     operationId: "quickMatch",
     summary: "Quick match (join an open room, or create one)",
     description:
-      "Joins the oldest public auto-start room of the same game, game options and turn time that has a free seat, or creates such a room (`autoStart: true`) and joins it. " +
+      "Joins the oldest public auto-start room of the same game, game options, turn time and number of seats that has a free seat, or creates such a room (`autoStart: true`) and joins it. " +
       "The game starts by itself once the room is full, so connect the WebSocket with the returned `token` right away and wait (you receive `status: \"waiting\"` states, then `playing`). " +
       "`created` tells whether a new room was created. No `hostToken` is returned (nobody can start early). Send `X-Api-Key` to record the result on your user.",
     request: {
@@ -381,7 +383,12 @@ routes.openapi(
           "application/json": {
             schema: z.object({
               game: z.string().openapi({ example: "tictactoe" }),
-              options: z.strictObject({ turnTimeMs: turnTimeMs.optional() }).optional(),
+              options: z
+                .strictObject({
+                  turnTimeMs: turnTimeMs.optional(),
+                  seats: z.number().int().min(1).optional().describe("Number of seats, as in `POST /rooms` (default the game's maxPlayers)"),
+                })
+                .optional(),
               gameOptions: GAME_OPTIONS_IN,
             }),
           },
@@ -414,6 +421,9 @@ routes.openapi(
     const userId = await resolveUser(c);
     if (userId === undefined) return c.json(errBody("UNAUTHORIZED", "invalid api key"), 401);
     const time = body.options?.turnTimeMs ?? DEFAULT_TURN_TIME_MS;
+    const seatsError = checkSeats(game, body.options?.seats);
+    if (seatsError) return c.json(errBody("BAD_REQUEST", seatsError), 400);
+    const seats = body.options?.seats ?? game.maxPlayers;
     // 既定値を補った値で照合する（省略と、既定値を明示したものは同じルームに入る）
     const gopts = parseGameOptions(game, body.gameOptions);
     if (!gopts.ok) return c.json(errBody("BAD_REQUEST", gopts.message), 400);
@@ -422,10 +432,10 @@ routes.openapi(
     const candidates = await c.env.DB.prepare(
       `SELECT id FROM rooms
        WHERE status = 'waiting' AND game = ? AND game_options = ? AND auto_start = 1 AND turn_time_ms = ?
-         AND players < max_players AND updated_at > ?
+         AND max_players = ? AND players < max_players AND updated_at > ?
        ORDER BY created_at, id LIMIT ?`,
     )
-      .bind(game.id, gameOptionsKey(gopts.value), time, Date.now() - WAITING_LIST_TTL_MS, QUICKMATCH_CANDIDATES)
+      .bind(game.id, gameOptionsKey(gopts.value), time, seats, Date.now() - WAITING_LIST_TTL_MS, QUICKMATCH_CANDIDATES)
       .all<{ id: string }>();
     for (const { id } of candidates.results) {
       const r = await c.env.GAME_ROOM.getByName(id).join(userId);
@@ -435,7 +445,7 @@ routes.openapi(
 
     const roomId = newRoomId();
     const stub = c.env.GAME_ROOM.getByName(roomId);
-    const init = await stub.init(roomId, game.id, { autoStart: true, turnTimeMs: time }, gopts.value);
+    const init = await stub.init(roomId, game.id, { autoStart: true, turnTimeMs: time, seats }, gopts.value);
     if (!init.ok) return respond(c, init);
     const r = await stub.join(userId);
     return r.ok ? c.json({ roomId, ...r.data, created: true }, 201) : respond(c, r);

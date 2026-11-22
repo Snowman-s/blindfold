@@ -1,7 +1,7 @@
 import { GameError, type AnyGame, type GameResult } from "../games/types";
 import type { EndReason, RematchInfo, RoomState, RoomStatus, ServerMessage } from "../lib/protocol";
 import { applyResign, applyTimeout } from "../lib/replay";
-import { FINISHED_ROOM_TTL_MS, WAITING_ROOM_TTL_MS } from "../lib/options";
+import { FINISHED_ROOM_TTL_MS, WAITING_ROOM_TTL_MS, type RoomOptions } from "../lib/options";
 import { rngForTurn, type Seed } from "../lib/rng";
 
 /**
@@ -298,6 +298,9 @@ export function rematchSeats(humans: string[]): Record<string, string> {
   return Object.fromEntries(humans.map((p, i) => [p, `p${((i + n - 1) % n) + 1}`]));
 }
 
-/** 開始時に座らせる練習相手の数（参加者の後ろの空席を minPlayers まで埋める）。 */
-export const practiceBotCount = (game: AnyGame, joined: number, practice: boolean): number =>
-  practice ? Math.max(0, game.minPlayers - joined) : 0;
+/**
+ * 開始時に座らせる練習相手の数。参加者の後ろの空席を、seats を指定した部屋はその数まで、省略した部屋は minPlayers まで埋める
+ * （省略時に maxPlayers まで埋めると、多人数ゲームの練習がいつも最大人数になってしまう）。
+ */
+export const practiceBotCount = (game: AnyGame, joined: number, opts: RoomOptions): number =>
+  opts.practice ? Math.max(0, (opts.seats ?? game.minPlayers) - joined) : 0;

@@ -104,10 +104,14 @@ describe("その他", () => {
     expect(rematchSeats(["p1", "p2"])).toEqual({ p1: "p2", p2: "p1" });
     expect(rematchSeats(["p1", "p2", "p3"])).toEqual({ p1: "p3", p2: "p1", p3: "p2" });
   });
-  it("練習相手の数は minPlayers までの空席", () => {
-    expect(practiceBotCount(ttt, 1, true)).toBe(1);
-    expect(practiceBotCount(ttt, 2, true)).toBe(0);
-    expect(practiceBotCount(ttt, 1, false)).toBe(0);
+  it("練習相手の数は seats（省略時は minPlayers）までの空席", () => {
+    expect(practiceBotCount(ttt, 1, { practice: true })).toBe(1);
+    expect(practiceBotCount(ttt, 2, { practice: true })).toBe(0);
+    expect(practiceBotCount(ttt, 1, {})).toBe(0);
+    const elim = elimination as AnyGame; // 2〜3人
+    expect(practiceBotCount(elim, 1, { practice: true })).toBe(1);
+    expect(practiceBotCount(elim, 1, { practice: true, seats: 3 })).toBe(2);
+    expect(practiceBotCount(elim, 3, { practice: true, seats: 3 })).toBe(0);
   });
   it("結果：forfeit に引き分けはない", () => {
     expect(outcomeOf({ winners: [] }, false, "p1")).toBe("draw");

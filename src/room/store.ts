@@ -55,6 +55,8 @@ const META = {
   cleanupAt: num,
   /** 現在の手番の締め切り */
   deadline: num,
+  /** 今の同時手番が始まったターン（これ以降の turn で送られた行動は、送った人がまだ行動できれば受け付ける。acceptsTurn） */
+  phaseTurn: num,
   /** 次に払い出す席の番号（allocateSeat） */
   nextSeat: num,
   /** 再戦ルームの予約席：元のルームのプレイヤー ID → このルームの席 ID */
@@ -154,6 +156,7 @@ export class RoomStore {
         return;
       case "playing":
         this.setMeta("deadline", s.deadline);
+        this.setMeta("phaseTurn", s.phaseTurn);
         return;
       case "finished":
         this.setMeta("status", "finished");

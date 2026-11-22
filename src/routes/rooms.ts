@@ -541,7 +541,7 @@ routes.openapi(
     description:
       "A secondary option. REST has no way to wait for the other players, so use the WebSocket (`/rooms/{id}/ws`) to play a full game. " +
       "Do not poll `/state` (it uses up the free-tier request budget). " +
-      "If `turn` is not the current turn, the action is rejected with `STALE_TURN` (409). " +
+      "If `turn` is not the current turn, the action is rejected with `STALE_TURN` (409), except that on a simultaneous turn an older `turn` of the same simultaneous turn is accepted while the player may still act. " +
       "An action that arrives after the deadline also gets `STALE_TURN`, after the timeout is resolved on the spot.",
     security: bearerSecurity,
     request: {

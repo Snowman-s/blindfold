@@ -19,6 +19,7 @@ import {
   type AlarmFacts,
   type RoomCore,
 } from "../../src/room/logic";
+import { createRng } from "../../src/lib/rng";
 import { elimination } from "../fixtures/elimination";
 import { guess } from "../fixtures/guess";
 import { FINISHED_ROOM_TTL_MS, WAITING_ROOM_TTL_MS } from "../../src/lib/options";
@@ -121,13 +122,13 @@ describe("その他", () => {
 });
 
 describe("settle", () => {
-  const base = { game: ttt, forfeit: null, prev: null, prevDeadline: null, turnTimeMs: 1000 };
+  const base = { game: ttt, forfeit: null, prev: null, prevDeadline: null, turnTimeMs: 1000, turn: 3, prevPhaseTurn: null };
   it("待機中は最後の変更から WAITING_ROOM_TTL_MS で消す", () => {
     expect(settle({ status: "waiting" }, 10)).toEqual({ kind: "waiting", cleanupAt: 10 + WAITING_ROOM_TTL_MS });
   });
   it("決着していなければ締め切り、決着（forfeit も）していれば終了から FINISHED_ROOM_TTL_MS で消す", () => {
     const state = ttt.init(P, "s", null);
-    expect(settle({ status: "playing", ...base, state }, 10)).toEqual({ kind: "playing", deadline: 1010 });
+    expect(settle({ status: "playing", ...base, state }, 10)).toEqual({ kind: "playing", deadline: 1010, phaseTurn: 3 });
     const forfeit = { winners: ["p2"] };
     expect(settle({ status: "playing", ...base, state, forfeit }, 10)).toEqual({
       kind: "finished",
@@ -135,6 +136,41 @@ describe("settle", () => {
       finishedAt: 10,
       cleanupAt: 10 + FINISHED_ROOM_TTL_MS,
     });
+  });
+});
+
+describe("同時手番の phaseTurn と acceptsTurn", () => {
+  const hc = highcard as AnyGame;
+  const s0 = highcard.init(P, "s", null);
+  const card = s0.hands["p1"]![0]!;
+  const s1 = highcard.apply(s0, "p1", { card }, createRng("1")); // p1 が出し、p2 だけが残る
+  const base = { game: hc, forfeit: null, prevDeadline: 5000, turnTimeMs: 1000 };
+
+  it("行動できる人が減っただけなら phaseTurn と締め切りを引き継ぎ、手番が変われば今のターンから数え直す", () => {
+    expect(settle({ status: "playing", ...base, state: s1, prev: P, turn: 5, prevPhaseTurn: 4 }, 10)).toEqual({
+      kind: "playing",
+      deadline: 5000,
+      phaseTurn: 4,
+    });
+    // 新しいラウンド（両者が行動できる）
+    expect(settle({ status: "playing", ...base, state: s0, prev: ["p2"], turn: 6, prevPhaseTurn: 4 }, 10)).toMatchObject({
+      phaseTurn: 6,
+    });
+    // 記録の無いルームは今のターン
+    expect(settle({ status: "playing", ...base, state: s1, prev: P, turn: 5, prevPhaseTurn: null }, 10)).toMatchObject({
+      phaseTurn: 5,
+    });
+  });
+
+  it("同じ同時手番の中の古い turn は、送った人がまだ行動できれば受け付ける。二重送信・前の手番の turn は STALE_TURN", () => {
+    const snap = { turn: 5, state: s1 };
+    const p2card = s0.hands["p2"]![0]!;
+    expect(decideAction(hc, snap, "p2", 4, { card: p2card }, "s", 4).ok).toBe(true);
+    expect(decideAction(hc, snap, "p1", 4, { card: s1.hands["p1"]![0]! }, "s", 4)).toMatchObject({ code: "STALE_TURN" });
+    expect(decideAction(hc, snap, "p2", 3, { card: p2card }, "s", 4)).toMatchObject({ code: "STALE_TURN" });
+    expect(decideAction(hc, snap, "p2", 6, { card: p2card }, "s", 4)).toMatchObject({ code: "STALE_TURN" });
+    // phaseTurn を渡さなければ完全一致だけ
+    expect(decideAction(hc, snap, "p2", 4, { card: p2card }, "s")).toMatchObject({ code: "STALE_TURN" });
   });
 });
 

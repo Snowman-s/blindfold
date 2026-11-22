@@ -26,6 +26,9 @@ export const CHANGELOG: ChangelogEntry[] = [
       "New game `frontier`: 2-4 players on a generated graph. Every round all players send troop orders at the same " +
         "time and they resolve together. It has game options (`maxRounds`, `nodesPerPlayer`, `fog`), does not list " +
         "legal moves, and keeps playing when one player resigns or times out. See `/games/frontier/rules.md`.",
+      "On a simultaneous turn, an action whose `turn` is older than the current one but from the same simultaneous turn " +
+        "(other players acted in between) is accepted while the sender may still act, instead of failing with `STALE_TURN`. " +
+        "Duplicates and turns from before the simultaneous turn still get `STALE_TURN`.",
     ],
   },
   {

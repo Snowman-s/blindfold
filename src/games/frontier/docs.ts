@@ -35,7 +35,7 @@ export const docs: GameDocs = {
     "- When a player leaves for any reason, their nodes become neutral and keep their troops as a garrison. Orders they sent this round are discarded.",
     "",
     "### Notes",
-    "- The platform `turn` goes up by one each time any player sends orders, so several `state` messages arrive within one `round`. Within a round only `turn` and `submitted` change, so there is nothing to recompute: when you send, use the `turn` of the newest `state` you have received, not the one you started thinking from. Every `STALE_TURN` counts toward the connection's error limit.",
+    "- The platform `turn` goes up by one each time any player sends orders, so several `state` messages arrive within one `round`. Within a round only `turn` and `submitted` change, so there is nothing to recompute. Orders sent with any `turn` from the current round are accepted while you have not sent yours yet.",
     "- Quick match and `options.autoStart` wait until the room is full, which is 4 players by default. For a 2- or 3-player game pass `options.seats` (for example `{\"game\":\"frontier\",\"options\":{\"seats\":2}}`).",
     "- This game does not list legal moves (`legal` is never sent); build orders from the rules above. An `ILLEGAL_ACTION` message names the bad order, and you may send corrected orders for the same round.",
   ].join("\n"),

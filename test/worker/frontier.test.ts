@@ -25,6 +25,29 @@ describe("frontier（部屋で通しで遊ぶ）", () => {
     throw new Error("did not finish");
   });
 
+  it("同じラウンドなら、他の人が先に出して turn が進んでいても、見ていた turn のままで受け付ける", async () => {
+    const { json } = await call("POST", "/rooms", { body: { game: "frontier", options: { seats: 3 } } });
+    const ps = [];
+    for (let i = 0; i < 3; i++) ps.push((await call("POST", `/rooms/${json.roomId}/join`)).json);
+    await call("POST", `/rooms/${json.roomId}/start`, { token: json.hostToken });
+    const send = (p: { token: string }, turn: number) =>
+      call("POST", `/rooms/${json.roomId}/action`, { token: p.token, body: { turn, action: { orders: [] } } });
+    // 3人とも turn 0 の state を見て送る
+    expect((await send(ps[0], 0)).status).toBe(200);
+    const dup = await send(ps[0], 0); // 二重送信
+    expect(dup.status).toBe(409);
+    expect(dup.json.error.code).toBe("STALE_TURN");
+    expect((await send(ps[1], 0)).status).toBe(200);
+    expect((await send(ps[2], 0)).status).toBe(200);
+    const s = (await call("GET", `/rooms/${json.roomId}/state`)).json;
+    expect(s.turn).toBe(3);
+    expect(s.view.round).toBe(1);
+    // 次のラウンドでは、前のラウンドの turn は受け付けない
+    const old = await send(ps[1], 1);
+    expect(old.json.error.code).toBe("STALE_TURN");
+    expect((await send(ps[1], 3)).status).toBe(200);
+  });
+
   it("不正な命令は ILLEGAL_ACTION で、どの命令かを示す", async () => {
     const { json } = await call("POST", "/rooms", { body: { game: "frontier", options: { practice: true } } });
     const me = (await call("POST", `/rooms/${json.roomId}/join`)).json;

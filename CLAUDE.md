@@ -173,7 +173,7 @@ Server → client:
 { "type": "end", "winners": ["p1"], "scores": { ... }, "reason": "normal" | "timeout" | "resign" }
 ```
 
-- Actions whose `turn` doesn't match the current turn are rejected with `STALE_TURN` (prevents double sends and stale moves).
+- Actions whose `turn` doesn't match the current turn are rejected with `STALE_TURN` (prevents double sends and stale moves). Exception: within one simultaneous turn (a run of turns where `currentPlayers` only shrinks; the same test as keeping the deadline, `sameSimultaneousTurn` in `room/logic.ts`), an older `turn` is accepted while the sender is still in `currentPlayers` (`acceptsTurn`). The turn where that run began is `meta.phaseTurn`, written by `settle` with the deadline. Otherwise every other player's move would make in-flight actions stale.
 - Actions arriving after the deadline also settle the timeout on the spot, without waiting for the Alarm, and are then rejected with `STALE_TURN`.
 - `state` is the same object as REST `GET /rooms/:id/state` plus `type` (`RoomState` is the single definition, in `src/lib/protocol.ts`).
 - `error` `code`s are the same codes as REST, unchanged (no remapping).

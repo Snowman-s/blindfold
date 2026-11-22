@@ -366,21 +366,23 @@ export class GameRoom extends DurableObject<Env> {
     const out = this.ctx.storage.transactionSync((): Settlement => {
       const s = this.store;
       const prevDeadline = s.deadline();
+      const prevPhaseTurn = s.getMeta("phaseTurn");
       write();
-      const settled = settle(
-        s.status() === "waiting"
-          ? { status: "waiting" }
-          : {
-              status: "playing",
-              game: this.game(),
-              state: s.loadSnapshot().state,
-              forfeit: s.forfeit(),
-              prev,
-              prevDeadline,
-              turnTimeMs: s.options().turnTimeMs ?? DEFAULT_TURN_TIME_MS,
-            },
-        Date.now(),
-      );
+      const playing = () => {
+        const snap = s.loadSnapshot(); // 待機中はまだ無いので、試合中だけ読む
+        return {
+          status: "playing" as const,
+          game: this.game(),
+          state: snap.state,
+          turn: snap.turn,
+          forfeit: s.forfeit(),
+          prev,
+          prevDeadline,
+          prevPhaseTurn,
+          turnTimeMs: s.options().turnTimeMs ?? DEFAULT_TURN_TIME_MS,
+        };
+      };
+      const settled = settle(s.status() === "waiting" ? { status: "waiting" } : playing(), Date.now());
       s.recordSettlement(settled);
       return settled;
     });
@@ -936,7 +938,7 @@ export class GameRoom extends DurableObject<Env> {
     }
     const game = this.game();
     const snap = this.store.loadSnapshot();
-    const r = decideAction(game, snap, pid, turn, rawAction, this.store.seed());
+    const r = decideAction(game, snap, pid, turn, rawAction, this.store.seed(), this.store.getMeta("phaseTurn") ?? snap.turn);
     if (!r.ok) return r;
     // ログ追記・スナップショット・締め切りは commit 内の1トランザクションで確定する
     await this.commit(() => {

@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import { games, getGame } from "../../src/games/registry";
 import type { AnyGame } from "../../src/games/types";
 import { WS_PROTOCOL } from "../../src/lib/auth";
+import { FINISHED_ROOM_TTL_MS } from "../../src/lib/options";
 import { migrateSchema, SCHEMA_VERSION } from "../../src/room/schema";
 import { BASE, call, newRoom } from "./helpers";
 
@@ -101,12 +102,21 @@ describe("rulesVersion / viewVersion", () => {
     });
     expect(ws.status).toBe(410);
 
-    // 締め切りの alarm が残っていても、例外にせず（再試行を繰り返さず）抜け、張り直さない
+    // 締め切りの alarm が残っていても、例外にせず（再試行を繰り返さず）抜け、締め切りは張り直さない。
+    // 代わりに掃除の alarm を1つだけ張る（終了したルームと同じ期間の後に消す）
     const stub = env.GAME_ROOM.getByName(playing.roomId);
     await runInDurableObject(stub, (_i, state) => state.storage.setAlarm(Date.now() + 60_000));
     expect(await runDurableObjectAlarm(stub)).toBe(true);
     await call("GET", `/rooms/${playing.roomId}/state`); // ensureAlarm を通す
-    await runInDurableObject(stub, async (_i, state) => expect(await state.storage.getAlarm()).toBeNull());
+    const alarm = await runInDurableObject(stub, (_i, state) => state.storage.getAlarm());
+    expect(alarm).toBeGreaterThan(Date.now() + FINISHED_ROOM_TTL_MS - 60_000);
+    // 期限が来たら消える
+    await runInDurableObject(stub, (_i, state) => {
+      state.storage.sql.exec("UPDATE meta SET value = ? WHERE key = 'cleanupAt'", String(Date.now() - 1));
+      return state.storage.setAlarm(Date.now() + 60_000);
+    });
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect((await call("GET", `/rooms/${playing.roomId}/log`)).status).toBe(404);
   });
 });
 

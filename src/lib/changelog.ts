@@ -23,6 +23,13 @@ export const CHANGELOG: ChangelogEntry[] = [
     version: "0.5.0",
     date: "2026-11-22",
     breaking: [
+      "Rooms are deleted: a waiting room 24 hours after its last change, a finished room 7 days after the end " +
+        "(its `state`, `/log` and `/replay` then answer 404 `ROOM_NOT_FOUND`; `GET /matches` keeps the result). " +
+        "Open sockets are closed with code 4001.",
+      "A room ID that is not 12 lowercase hex characters gets 404 `ROOM_NOT_FOUND` on every `/rooms/{id}/...` path.",
+      "A user can take only one seat per room: a second join with the same `X-Api-Key` gets 409 `ALREADY_JOINED` " +
+        "(quick match skips rooms where you already sit).",
+      "Rematch: calling it again after leaving the new room returns the same token as before (was a new one).",
       "WebSocket `error` messages now carry the same `code` as the REST API instead of a reduced set. A spectator's " +
         "action or resignation gets `UNAUTHORIZED` (was `NOT_YOUR_TURN`), an action or resignation before the start or " +
         "after the end gets `NOT_PLAYING` (was `ILLEGAL_ACTION`), and other REST codes such as `GAME_REMOVED` are no " +
@@ -38,6 +45,9 @@ export const CHANGELOG: ChangelogEntry[] = [
       "The WebSocket `state` message has the same fields as `GET /rooms/{id}/state`: `game`, `rulesVersion`, " +
         "`gameOptions` and `result` were added to it (and `gameOptions` to the REST state).",
       "`listsLegalActions` in `GET /games` and `/games/{id}/rules`.",
+      "Per-IP rate limits on `POST /users`, `POST /rooms`, `POST /quickmatch`, `POST /rooms/{id}/join` and " +
+        "`POST /rooms/{id}/rematch`: over the limit they fail with 429 `RATE_LIMITED` and a `Retry-After` header.",
+      "`POST /users/{id}/key` issues a new API key; the old one stops working.",
     ],
   },
   {

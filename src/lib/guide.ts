@@ -2,9 +2,9 @@ import { z } from "zod";
 import { games } from "../games/registry";
 import type { AnyGame } from "../games/types";
 import { sha256Hex, WS_PROTOCOL, WS_TOKEN_PROTOCOL_PREFIX } from "./auth";
-import { DEFAULT_TURN_TIME_MS, roomOptions, WAITING_LIST_TTL_MS } from "./options";
+import { DEFAULT_TURN_TIME_MS, FINISHED_ROOM_TTL_MS, roomOptions, WAITING_LIST_TTL_MS, WAITING_ROOM_TTL_MS } from "./options";
 import { compactJson, gameExamples } from "./examples";
-import { CLOSE_LEFT_ROOM } from "./protocol";
+import { CLOSE_LEFT_ROOM, CLOSE_ROOM_DELETED } from "./protocol";
 import { replayFrames } from "./replay";
 import { API_VERSION } from "./version";
 
@@ -151,10 +151,13 @@ function responseShapes(): string {
     "### 8.3 `GET /users/{id}` and `GET /matches`",
     "",
     "`POST /users` with `{\"name\":\"alice\"}` returns `{ userId, name, apiKey }` (201). The `apiKey` is shown only once.",
+    "If it may have leaked, `POST /users/{userId}/key` with the current key as `X-Api-Key` returns `{ userId, apiKey }`",
+    "with a new key; the old one is rejected from then on. A lost key cannot be recovered.",
     "`GET /users/{id}` counts the recorded games joined with that user's `X-Api-Key` (practice games are not recorded):",
     code("json", json(r.user)),
     "`GET /matches?game=&limit=` lists finished games, newest first. `id` is the room ID, so `/rooms/{id}/log` and",
-    "`/replay` work with it. `userId` is null for a seat joined without `X-Api-Key`. `outcome` is `win`, `loss` or",
+    `\`/replay\` work with it for ${FINISHED_ROOM_TTL_MS / 86400000} days after the end (then the room is deleted; the match stays listed).`,
+    "`userId` is null for a seat joined without `X-Api-Key`. `outcome` is `win`, `loss` or",
     "`draw`; `draw` only for a game its rules decided as a draw (if everyone timed out, everyone gets `loss` and",
     "`winners` is empty). `score` is the game's score for that seat, or null if the game has none.",
     code("json", json([r.match])),
@@ -237,7 +240,8 @@ function connect(roomId, token, onMessage, delay = 1000, failures = 0) {
   });
   ws.addEventListener("close", async (ev) => {
     clearInterval(pinger);
-    if (ended || ev.code === ${CLOSE_LEFT_ROOM}) return; // ${CLOSE_LEFT_ROOM} = you left the room (1.2)
+    // ${CLOSE_LEFT_ROOM} = you left the room (1.2), ${CLOSE_ROOM_DELETED} = the room was deleted (1.10)
+    if (ended || ev.code === ${CLOSE_LEFT_ROOM} || ev.code === ${CLOSE_ROOM_DELETED}) return;
     if (!opened && ++failures % 3 === 0) {
       // A refused upgrade looks like any other drop (code 1006). Ask REST why, and stop for good on 401 / 404.
       const res = await fetch(\`\${BASE}/rooms/\${roomId}/state\`, { headers: { Authorization: \`Bearer \${token}\` } }).catch(() => null);
@@ -396,6 +400,7 @@ function buildGuide(): string {
     "",
     "- Player IDs are assigned in join order: `p1`, `p2`, ... Keep `token` secret; it identifies the seat.",
     "- Joining fails with `ROOM_FULL` or `ALREADY_STARTED` (409), or `ROOM_RESERVED` (403) for a rematch room (1.9).",
+    "  With `X-Api-Key`, a user can take only one seat per room: a second join with the same key gets `ALREADY_JOINED` (409).",
     `- **Leaving:** before the game starts, \`POST /rooms/{roomId}/leave\` with \`Authorization: Bearer <token>\` frees your`,
     `  seat. Your token stops working and the server closes your WebSockets to that room with close code ${CLOSE_LEFT_ROOM}`,
     "  (do not reconnect). Seat numbers are not reused, so the next player to join gets a new ID and `players` can have",
@@ -475,12 +480,16 @@ function buildGuide(): string {
     "",
     "REST errors use HTTP status codes with the body `{ \"error\": { \"code\": \"...\", \"message\": \"...\" } }`.",
     "Codes: `BAD_REQUEST` (400), `UNKNOWN_GAME` (400), `ILLEGAL_ACTION` (400), `UNAUTHORIZED` (401), `NOT_HOST` (403),",
-    "`NOT_YOUR_TURN` (403), `NOT_FINISHED` (403), `ROOM_RESERVED` (403), `ROOM_NOT_FOUND` (404, unknown room), `NOT_FOUND` (404: unknown",
-    "route, unknown game in `/games/{id}/rules`, unknown user in `/users/{id}`), `ALREADY_STARTED` / `ROOM_FULL` /",
+    "`NOT_YOUR_TURN` (403), `NOT_FINISHED` (403), `ROOM_RESERVED` (403), `ROOM_NOT_FOUND` (404: unknown or deleted room, or",
+    "an ID that is not 12 lowercase hex characters), `NOT_FOUND` (404: unknown",
+    "route, unknown game in `/games/{id}/rules`, unknown user in `/users/{id}`), `ALREADY_STARTED` / `ROOM_FULL` / `ALREADY_JOINED` /",
     "`NOT_ENOUGH_PLAYERS` / `NOT_PLAYING` / `STALE_TURN` (409), `GAME_REMOVED` (410: the game, or the rules version the",
     "room was started with, is no longer on the server; nothing can be done in that room, but `/log` still works),",
-    "`UPGRADE_REQUIRED` (426), `INTERNAL` (500).",
+    "`UPGRADE_REQUIRED` (426), `RATE_LIMITED` (429), `INTERNAL` (500).",
     "",
+    "- Creating users, creating or joining rooms, quick match and rematch are rate-limited per IP address. Over the",
+    "  limit they fail with 429 `RATE_LIMITED` and a `Retry-After` header (seconds): wait that long before retrying.",
+    "  Normal play is not affected; actions and state go over the WebSocket, which is not limited.",
     "- `GET /rooms/{id}/state` with an **invalid** token fails with 401 `UNAUTHORIZED`. It does not fall back to the",
     "  spectator view; to spectate, send no `Authorization` header at all.",
     "- **Not every error response is JSON.** When the service's daily request limit is used up (it resets at 00:00 UTC),",
@@ -528,8 +537,8 @@ function buildGuide(): string {
     "caller there and returns `{ roomId, playerId, token }` for the **new** room. Connect to it right away (1.4): it",
     "starts by itself once every player has called rematch, and you receive `waiting` states until then. Seats are",
     "rotated by one, so your `playerId` changes (in a two-player game, first and second player swap). The seat order is",
-    "fixed when the room is created; it does not depend on who calls rematch first. Calling again",
-    "returns the same seat and token. Only players of the old room can sit there (others get `ROOM_RESERVED`), and",
+    "fixed when the room is created; it does not depend on who calls rematch first. Calling again (also after",
+    "leaving the new room) returns the same seat and token. Only players of the old room can sit there (others get `ROOM_RESERVED`), and",
     "the room is not listed. Practice bots are added again when it starts, so a practice rematch starts at once.",
     "Before the end you get `NOT_FINISHED` (403).",
     "",
@@ -557,7 +566,8 @@ function buildGuide(): string {
     "",
     "**When the server closes a socket.** In normal operation the server never closes a socket by itself, not even after",
     "`end`; that is up to you. It closes one only when it echoes a close you started, when you left the room",
-    `(close code ${CLOSE_LEFT_ROOM}; do not reconnect), or when the platform reports an error on the socket (close code 1011).`,
+    `(close code ${CLOSE_LEFT_ROOM}; do not reconnect), when the room is deleted (close code ${CLOSE_ROOM_DELETED}; do not reconnect, see below),`,
+    "or when the platform reports an error on the socket (close code 1011).",
     "A socket can also drop without a close frame (code 1006 in browsers) when",
     "the network fails or the service is redeployed. Treat every unexpected `close` the same way: reconnect.",
     "",
@@ -579,11 +589,13 @@ function buildGuide(): string {
     "process can reconnect and continue. Keep them private: anyone with the token plays your seat. `hostToken` is needed",
     "only until `start`.",
     "",
-    "**How long rooms live.** Rooms are currently never deleted: a waiting room stays joinable, and a finished room keeps",
-    "its `state`, `/log` and `/replay`, for as long as the service runs. This is not a promise; download",
-    "`/rooms/{id}/log` (or `/replay`) after the game if you need a permanent record. A waiting room drops out of",
-    `\`GET /rooms\` and quick match ${WAITING_LIST_TTL_MS / 60000} minutes after its last update, but can still be joined by \`roomId\`.`,
-    "An abandoned game in progress ends by itself as its deadlines run out.",
+    "**How long rooms live.** Rooms are deleted after a while; then every endpoint of the room answers 404",
+    `\`ROOM_NOT_FOUND\` and open sockets are closed with code ${CLOSE_ROOM_DELETED}.`,
+    `- A waiting room is deleted ${WAITING_ROOM_TTL_MS / 3600000} hours after its last change (creation, join or leave). It drops out of`,
+    `  \`GET /rooms\` and quick match much earlier, ${WAITING_LIST_TTL_MS / 60000} minutes after its last update, but can be joined by \`roomId\` until it is deleted.`,
+    "- A game in progress is never deleted; an abandoned one ends by itself as its deadlines run out.",
+    `- A finished room keeps its \`state\`, \`/log\` and \`/replay\` for ${FINISHED_ROOM_TTL_MS / 86400000} days after the end. Download`,
+    "  `/rooms/{id}/log` within that time if you need a permanent record. `GET /matches` and `GET /users/{id}` keep the result.",
     "",
     "## 2. Message reference (WebSocket)",
     "",
@@ -609,6 +621,7 @@ function buildGuide(): string {
     "| GET | `/rooms/{id}/log` | - | action log (after the game ends) |",
     "| GET | `/rooms/{id}/replay` | - | spectator view for every turn (after the game ends) |",
     "| POST | `/users` | - | `{ name }` -> `{ userId, apiKey }` |",
+    "| POST | `/users/{id}/key` | `X-Api-Key` | -> `{ userId, apiKey }` with a new key (the old one stops working) |",
     "| GET | `/users/{id}` | - | user and results |",
     "| GET | `/matches` | - | finished matches (`?game=&limit=`) |",
     "",
@@ -651,6 +664,7 @@ function buildGuide(): string {
     "  schema exactly, for games that do not list legal moves).",
     "- [ ] `STALE_TURN` and other errors do not crash the client; it waits for the next `state`.",
     "- [ ] REST responses that are not JSON (or are 5xx) are retried later instead of crashing the JSON parser.",
+    "- [ ] A 429 `RATE_LIMITED` response waits for its `Retry-After` seconds before the same request is retried.",
     "- [ ] The UI handles `status: \"waiting\"` (before start) and `view` fields that only some viewers receive.",
     "- [ ] On `end`, the result is shown and the socket is closed.",
     "- [ ] Countdowns use `deadline - now` from the `state`, not the local clock.",

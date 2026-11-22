@@ -1,5 +1,6 @@
 import { createRoute, OpenAPIHono, z } from "@hono/zod-openapi";
 import { newApiKey, newUserId, sha256Hex } from "../lib/auth";
+import { FINISHED_ROOM_TTL_MS } from "../lib/options";
 import { END_REASONS, type EndReason } from "../lib/protocol";
 import { errBody, errors, openEnum, validationHook } from "./schemas";
 
@@ -37,6 +38,7 @@ userRoutes.openapi(
         content: { "application/json": { schema: z.object({ userId: z.string(), name: z.string(), apiKey: z.string() }) } },
       },
       400: errors[400],
+      429: errors[429],
     },
   }),
   async (c) => {
@@ -47,6 +49,45 @@ userRoutes.openapi(
       .bind(id, name, await sha256Hex(apiKey), Date.now())
       .run();
     return c.json({ userId: id, name, apiKey }, 201);
+  },
+);
+
+userRoutes.openapi(
+  createRoute({
+    method: "post",
+    path: "/users/{id}/key",
+    tags: ["users"],
+    operationId: "rotateApiKey",
+    summary: "Issue a new API key (the current one stops working)",
+    description:
+      "Send the current key as `X-Api-Key`. The response has a new `apiKey` (returned only once) and the old key is " +
+      "rejected from then on. Use it when a key may have leaked; to revoke a key, rotate it and keep the new one secret. " +
+      "Seats already taken with the old key keep recording their results. If the key is lost, the user cannot be recovered: register a new one.",
+    request: {
+      params: z.object({ id: z.string().openapi({ param: { name: "id", in: "path" } }) }),
+      headers: z.object({ "x-api-key": z.string().optional() }),
+    },
+    responses: {
+      200: {
+        description: "New key",
+        content: { "application/json": { schema: z.object({ userId: z.string(), apiKey: z.string() }) } },
+      },
+      401: errors[401],
+      429: errors[429],
+    },
+  }),
+  async (c) => {
+    const { id } = c.req.valid("param");
+    const key = c.req.header("x-api-key");
+    if (!key) return c.json(errBody("UNAUTHORIZED", "X-Api-Key required"), 401);
+    const apiKey = newApiKey();
+    // 古いキーの照合と差し替えを1文で行う（同時に2回呼ばれても、古いキーで成功するのは1回だけ）。
+    // キーが別のユーザーのものでも 401 にする（他人のユーザー ID とキーの組み合わせを探らせない）
+    const r = await c.env.DB.prepare("UPDATE users SET key_hash = ? WHERE id = ? AND key_hash = ?")
+      .bind(await sha256Hex(apiKey), id, await sha256Hex(key))
+      .run();
+    if (r.meta.changes !== 1) return c.json(errBody("UNAUTHORIZED", "invalid api key for this user"), 401);
+    return c.json({ userId: id, apiKey }, 200);
   },
 );
 
@@ -91,7 +132,11 @@ export const OUTCOMES = ["win", "loss", "draw"] as const;
 
 export const MatchSchema = z
   .object({
-    id: z.string().describe("Same as the roomId of the game (so /rooms/{id}/log and /replay work with it)"),
+    id: z
+      .string()
+      .describe(
+        `Same as the roomId of the game (so /rooms/{id}/log and /replay work with it until the finished room is deleted, ${FINISHED_ROOM_TTL_MS / 86400000} days after the end)`,
+      ),
     game: z.string(),
     rulesVersion: z.number().int().describe("Rules version the game was played with"),
     gameOptions: z.unknown().describe("Game-specific options the game was played with (defaults filled in). null for games without options"),

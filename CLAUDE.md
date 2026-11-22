@@ -67,6 +67,7 @@ src/
     guide.ts          # クライアント開発者向けガイド（/guide.md）の生成
     changelog.ts      # API の変更履歴（/changelog.md）。API_VERSION を上げたら先頭に足す
     deprecation.ts    # Deprecation / Sunset ヘッダーのヘルパー（deprecated() ミドルウェア、markDeprecated()）
+    ratelimit.ts      # 書き込み系の IP ごとのレート制限（Rate Limiting バインディング。429 RATE_LIMITED + Retry-After）
     examples.ts       # ガイド・rules に載せる state / end / ログの例（実エンジン + 固定シードから作る）
 bots/
   random-bot.ts       # 合法手からランダムに選ぶ Bot（Node で実行）
@@ -131,14 +132,18 @@ export interface GameDefinition<S, A, O = null> {    // O = ゲーム固有の�
 | POST | `/rooms/:id/action` | WS を使わない簡易 Bot 向け。`{ turn, action }`。相手の手を待つ手段はないので、単発の行動・デバッグ用（対戦は WS） |
 | GET | `/rooms/:id/log` | 行動ログ（リプレイ用。終了後のみ）。開始時に記録した `rulesVersion` と `gameOptions` 付き |
 | GET | `/rooms/:id/replay` | ログから再現した各ターンの観戦視点（終了後のみ）。記録した `rulesVersion` が今の版と違えば 410 `GAME_REMOVED`（`/log` は返す） |
-| POST | `/users` | `{ name }` → `{ userId, name, apiKey }`。join 時に `X-Api-Key` を付けると戦績が紐づく |
+| POST | `/users` | `{ name }` → `{ userId, name, apiKey }`。join 時に `X-Api-Key` を付けると戦績が紐づく。同じユーザーは1ルームに1席だけ（2席目は 409 `ALREADY_JOINED`） |
+| POST | `/users/:id/key` | API キーの再発行（今のキーを `X-Api-Key` で渡す）→ `{ userId, apiKey }`。古いキーはその場で失効（失効だけの API は無い。キーを失くしたら復旧できない） |
 | GET | `/users/:id` | ユーザーと戦績 |
 | GET | `/matches` | 終了した試合の一覧（`?game=&limit=`） |
 | GET | `/openapi.json` | 生成された OpenAPI 仕様 |
 | GET | `/rooms/:id/ws` | WebSocket へのアップグレード（サブプロトコル `["apigames.v1", "apigames.token.<token>"]`。トークンは Bearer でもよい。トークンが無ければ観戦。`apigames.v1` は観戦でも必須） |
 
 - トークンは URL に載せない（アクセスログ・ブラウザ履歴に残るため）。`?token=` は 400 で拒否する。
+- ルーム ID は `^[0-9a-f]{12}$`（`isRoomId`）。合わない ID は Worker 側で 404 `ROOM_NOT_FOUND`（`/ws` も含め DO を起こさない）。
+- プレイヤートークン・`hostToken` は DO にハッシュ（sha256）だけを保存する（`players.token`・`meta.hostTokenHash`・WS の attachment の `tokenHash`）。DO の各入口では状態を読む前にハッシュを取る（読んでから commit までに await を挟まないため）。再戦の席のトークンは元のトークンから導出する（`rematchToken`）ので、保存せずに何度でも同じものを返せる。
 - CORS は全オリジン許可（Cookie を使わず Bearer なので安全）。WS のアップグレードは対象外。
+- `POST /users`（RL_USERS）と `POST /rooms`・`/quickmatch`・`/rooms/:id/join`・`/rooms/:id/rematch`（RL_ROOMS、共有）は IP（`CF-Connecting-IP`）ごとにレート制限する。上限は `wrangler.jsonc` の `ratelimits`（拠点ごとの概算。period は 10 か 60）。ヘッダーが無い（Cloudflare の外・テスト）ときは制限しない。429 で返しても Worker は起動するので、無料枠の消費は防げない（それには WAF が要る）。
 - REST は `Authorization: Bearer`。WS はブラウザがヘッダーを付けられないのでサブプロトコルで渡し、サーバーはトークンを含まない版のサブプロトコル（`apigames.v1`）を選んで応答する。
 - WS のサブプロトコルは WS メッセージの版（`src/lib/auth.ts` の `WS_PROTOCOLS`。新しい順）。提示された中で最も新しいものを選ぶ。未指定を v1 とみなすフォールバックは置かない。1.0 以降の WS の破壊的変更は `apigames.v2` を足して交渉し、古い版はしばらく並べて残す。
 - エンジン（ゲーム、または開始時の `rulesVersion`）がレジストリに無いルームは、`/log` 以外が 410 `GAME_REMOVED`。alarm は例外にせず止める（再試行のたびにリクエストを消費しないように）。
@@ -211,10 +216,11 @@ export interface GameDefinition<S, A, O = null> {    // O = ゲーム固有の�
    - 何を書くかの判断（行動・投了・時間切れの解決、締め切り、配る状態）は `room/logic.ts` の純粋関数、SQL は `room/store.ts`、D1 の文は `room/d1.ts`。GameRoom は「判断 → `commit`（1トランザクション）→ 副作用」の順に呼ぶだけにする
 4. 持ち時間切れ（Alarm）時の処理：ゲームごとに定義する（自動パス／負け扱いなど）。デフォルトは負け扱い
 5. 終了時に D1 へ結果を書き込む
+6. 掃除：待機中は最後の変更から `WAITING_ROOM_TTL_MS`（24時間）、終了後は終了から `FINISHED_ROOM_TTL_MS`（7日）で `deleteAll()` し、D1 の `rooms` の行も消す（`matches`・`results` は残す）。時刻は `meta.cleanupAt`。alarm は1つなので、締め切り・D1 の再試行が無いときの行き先にする（`wantedAlarm()`）。試合中は消さない（エンジンが消えたルームは除く）。接続は close コード 4001 で閉じる
 
 SQLite テーブル（DO 内）：
-- `meta(key TEXT PRIMARY KEY, value TEXT)` … gameId、seed、rulesVersion、gameOptions、status、schemaVersion など
-- `players(id TEXT PRIMARY KEY, token TEXT NOT NULL, seq INTEGER NOT NULL, user_id TEXT)`
+- `meta(key TEXT PRIMARY KEY, value TEXT)` … gameId、seed、rulesVersion、gameOptions、status、schemaVersion、hostTokenHash、cleanupAt など
+- `players(id TEXT PRIMARY KEY, token TEXT NOT NULL, seq INTEGER NOT NULL, user_id TEXT)` … `token` はトークンのハッシュ
 - `actions(turn INTEGER, player TEXT, action TEXT, at INTEGER)`
 - `snapshot(id INTEGER PRIMARY KEY CHECK (id = 1), turn INTEGER, state TEXT)`
 - スキーマは `src/room/schema.ts`。新しいルームは BASE_SCHEMA（版 1）+ `MIGRATIONS` を順に流して作り、既存のルームはコンストラクタの `blockConcurrencyWhile` で `meta.schemaVersion` から1段ずつ移行する。列やテーブルを足すときは `MIGRATIONS` の末尾に足す（BASE_SCHEMA は書き換えない）。

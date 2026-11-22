@@ -4,6 +4,7 @@ import { cors } from "hono/cors";
 import { HTTPException } from "hono/http-exception";
 import { changelog } from "./lib/changelog";
 import { guide, renderGuide } from "./lib/guide";
+import { rateLimit } from "./lib/ratelimit";
 import { API_VERSION } from "./lib/version";
 import { routes } from "./routes/rooms";
 import { errBody, validationHook } from "./routes/schemas";
@@ -18,8 +19,9 @@ const corsMw = cors({
   origin: "*",
   allowMethods: ["GET", "POST", "OPTIONS"],
   allowHeaders: ["Authorization", "Content-Type", "X-Api-Key", "If-None-Match"],
-  // Deprecation / Sunset / Link は廃止予定の告知（src/lib/deprecation.ts）。ブラウザのクライアントにも読めるようにする
-  exposeHeaders: ["ETag", "Deprecation", "Sunset", "Link"],
+  // Deprecation / Sunset / Link は廃止予定の告知（src/lib/deprecation.ts）、Retry-After はレート制限（src/lib/ratelimit.ts）。
+  // ブラウザのクライアントにも読めるようにする
+  exposeHeaders: ["ETag", "Deprecation", "Sunset", "Link", "Retry-After"],
   maxAge: 86400,
 });
 app.use("*", async (c, next) => {
@@ -70,6 +72,13 @@ app.get("/", async (c) => {
     changelog: `${origin}/changelog.md`,
   });
 });
+// 書き込み系のレート制限（IP ごと）。ルートより先に登録する。period は wrangler.jsonc の ratelimits と合わせる
+const limitUsers = rateLimit((env) => env.RL_USERS, 60);
+const limitRooms = rateLimit((env) => env.RL_ROOMS, 60);
+app.use("/users", limitUsers);
+app.use("/users/:id/key", limitUsers);
+for (const path of ["/rooms", "/quickmatch", "/rooms/:id/join", "/rooms/:id/rematch"]) app.use(path, limitRooms);
+
 app.route("/", routes);
 app.route("/", userRoutes);
 

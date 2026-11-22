@@ -161,12 +161,14 @@ describe("POST /rooms/:id/rematch", () => {
     const n = await env.DB.prepare("SELECT COUNT(*) AS n FROM rooms WHERE id = ?").bind(r.roomId).first<{ n: number }>();
     expect(n?.n).toBe(0);
 
-    // 退出しても席は予約されたまま。もう一度 rematch を呼べば座り直せる（新しいトークン）
+    // 退出しても席は予約されたまま。もう一度 rematch を呼べば座り直せる（トークンは元のトークンから導出するので同じ）
     expect((await call("POST", `/rooms/${r.roomId}/leave`, { token: r.token })).status).toBe(200);
+    expect((await call("GET", `/rooms/${r.roomId}/state`, { token: r.token })).status).toBe(401); // 退出中は無効
     expect((await call("POST", `/rooms/${r.roomId}/join`)).status).toBe(403);
     const back = (await call("POST", `/rooms/${roomId}/rematch`, { token: a.token })).json;
     expect(back.playerId).toBe(r.playerId);
-    expect(back.token).not.toBe(r.token);
+    expect(back.token).toBe(r.token);
+    expect((await call("GET", `/rooms/${r.roomId}/state`, { token: r.token })).status).toBe(200);
   });
 
   it("座り直した席の古いトークンの WS は、その席として扱わない（view・legal を受け取れず、行動もできない）", async () => {

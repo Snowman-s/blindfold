@@ -1,9 +1,22 @@
 import { DurableObject } from "cloudflare:workers";
 import { getGame } from "../games/registry";
 import type { AnyGame, GameResult } from "../games/types";
-import { extractWsAuth, newRoomId, newToken, randomHex } from "../lib/auth";
-import { DEFAULT_TURN_TIME_MS, parseGameOptions, roomOptions } from "../lib/options";
-import { clientMessage, CLOSE_LEFT_ROOM, errBody, type RoomState, type ServerMessage } from "../lib/protocol";
+import { extractWsAuth, hashToken, newRoomId, newToken, randomHex, rematchToken, sha256Hex } from "../lib/auth";
+import {
+  DEFAULT_TURN_TIME_MS,
+  FINISHED_ROOM_TTL_MS,
+  parseGameOptions,
+  roomOptions,
+  WAITING_ROOM_TTL_MS,
+} from "../lib/options";
+import {
+  clientMessage,
+  CLOSE_LEFT_ROOM,
+  CLOSE_ROOM_DELETED,
+  errBody,
+  type RoomState,
+  type ServerMessage,
+} from "../lib/protocol";
 import { replayFrames, type LogEntry, type ReplayLog } from "../lib/replay";
 import { practiceAction } from "../lib/practice";
 import { createRng, rngForTurn, type Seed } from "../lib/rng";
@@ -56,11 +69,11 @@ export interface ReplayFrames {
 }
 
 /**
- * WS に持たせる情報。token は接続時に使ったトークン（サーバー内にだけ保存され、クライアントには送らない）。
+ * WS に持たせる情報。tokenHash は接続時に使ったトークンのハッシュ（attachment も保存されるので、トークンそのものは持たない）。
  * 再戦ルームでは退出した席に同じ ID で座り直せるので、ID だけでなくトークンも一致する接続だけをその席として扱う。
  * protocol は交渉したサブプロトコル（apigames.v1 など）。版ごとに配信を変えるときに使う。
  */
-type Attachment = { playerId: null; protocol: string } | { playerId: string; token: string; protocol: string };
+type Attachment = { playerId: null; protocol: string } | { playerId: string; tokenHash: string; protocol: string };
 
 /**
  * D1 への結果書き込みが失敗したときの再試行（alarm で指数バックオフ、最大1時間おき）。
@@ -81,7 +94,7 @@ const MAX_BOT_STEPS_PER_CALL = 32;
 
 /** commit() で確定した結果。確定後の副作用（alarm・配信・D1）に使う。 */
 type Committed =
-  | { kind: "waiting" }
+  | { kind: "waiting"; cleanupAt: number }
   | { kind: "playing"; deadline: number }
   | { kind: "finished"; result: GameResult };
 
@@ -188,7 +201,7 @@ export class GameRoom extends DurableObject<Env> {
   private socketPlayer(ws: WebSocket, seats: Map<string, string>): string | null {
     const att = ws.deserializeAttachment() as Attachment | null;
     if (!att || att.playerId === null) return null;
-    return att.token === seats.get(att.playerId) ? att.playerId : null;
+    return att.tokenHash === seats.get(att.playerId) ? att.playerId : null;
   }
 
   /**
@@ -198,7 +211,7 @@ export class GameRoom extends DurableObject<Env> {
   private broadcast(end?: GameResult): void {
     const core = this.loadCore();
     const now = Date.now();
-    const seats = this.store.seatTokens();
+    const seats = this.store.seatTokenHashes();
     const byViewer = new Map<string | null, string>();
     const endMsg = end ? JSON.stringify(endMessage(end, this.store.endReason())) : null;
     for (const ws of this.ctx.getWebSockets()) {
@@ -225,13 +238,20 @@ export class GameRoom extends DurableObject<Env> {
     const out = this.ctx.storage.transactionSync((): Committed => {
       const prevDeadline = this.store.deadline();
       write();
-      if (this.store.status() === "waiting") return { kind: "waiting" };
+      if (this.store.status() === "waiting") {
+        // 放置された待機中のルームは、最後の変更から WAITING_ROOM_TTL_MS で消す
+        const cleanupAt = Date.now() + WAITING_ROOM_TTL_MS;
+        this.store.setMeta("cleanupAt", String(cleanupAt));
+        return { kind: "waiting", cleanupAt };
+      }
       const { state } = this.store.loadSnapshot();
       const game = this.game();
       const result = this.resultNow(game, state);
       if (result) {
+        const now = Date.now();
         this.store.setMeta("status", "finished");
-        this.store.setMeta("finishedAt", String(Date.now()));
+        this.store.setMeta("finishedAt", String(now));
+        this.store.setMeta("cleanupAt", String(now + FINISHED_ROOM_TTL_MS));
         return { kind: "finished", result };
       }
       const turnTimeMs = this.store.options().turnTimeMs ?? DEFAULT_TURN_TIME_MS;
@@ -242,14 +262,13 @@ export class GameRoom extends DurableObject<Env> {
 
     // ここから先は確定済み。失敗はログに残すだけで、呼び出し元にはエラーを返さない。
     if (out.kind === "finished") {
-      await this.attempt("deleteAlarm", () => this.ctx.storage.deleteAlarm());
+      // 締め切りの alarm は、D1 の再試行か掃除の alarm で上書きする
       await this.attempt("broadcast", () => this.broadcast(out.result));
-      if (!(await this.persistResult(out.result))) await this.schedulePersistRetry();
+      if (await this.persistResult(out.result)) await this.armCleanup();
+      else await this.schedulePersistRetry();
       return;
     }
-    if (out.kind === "playing") {
-      await this.armAlarm(out.deadline);
-    }
+    await this.armAlarm(out.kind === "playing" ? out.deadline : out.cleanupAt);
     await this.attempt("broadcast", () => this.broadcast());
     if (out.kind === "playing") await this.runBots();
   }
@@ -332,19 +351,41 @@ export class GameRoom extends DurableObject<Env> {
    */
   private async ensureAlarm(): Promise<void> {
     try {
-      // エンジンが無いルームでは張らない（alarm が毎回失敗して再試行のたびにリクエストを消費しないように）
-      if (!this.engine()) return;
-      const status = this.store.status();
-      const deadline = this.store.deadline();
-      const needsAlarm =
-        (status === "playing" && deadline !== null) ||
-        (status === "finished" && this.store.getMeta("persisted") !== "1" && this.store.getMeta("roomId") !== null);
-      if (!needsAlarm || (await this.ctx.storage.getAlarm()) !== null) return;
-      // 締め切りが過ぎていれば即時発火し、alarm() が時間切れ処理（または D1 再試行）をする
-      await this.armAlarm(status === "playing" ? deadline! : Date.now());
+      const at = this.wantedAlarm();
+      if (at === null || (await this.ctx.storage.getAlarm()) !== null) return;
+      // 時刻が過ぎていれば即時発火し、alarm() が時間切れ処理（または D1 再試行・掃除）をする
+      await this.armAlarm(at);
     } catch (e) {
       console.error("ensureAlarm failed", e);
     }
+  }
+
+  /**
+   * 今張っておくべき alarm の時刻。playing なら手番の締め切り、終了後で D1 未書き込みなら今（再試行）、それ以外は掃除。
+   * エンジンが無いルームは時間切れも D1 の再試行もできないので掃除だけ（毎回失敗する alarm でリクエストを消費しないように）。
+   */
+  private wantedAlarm(): number | null {
+    const status = this.store.status();
+    if (this.engine()) {
+      if (status === "playing") return this.store.deadline();
+      if (status === "finished" && this.store.getMeta("persisted") !== "1" && !this.persistGaveUp()) return Date.now();
+    }
+    return this.cleanupDueAt();
+  }
+
+  /**
+   * 掃除の時刻。playing の間は（待機中に書いた値が残っていても）消さない。ただしエンジンが無いルームは
+   * 進めようがないので、終了したルームと同じ期間で消す。
+   */
+  private cleanupDueAt(): number | null {
+    if (this.store.status() === "playing" && this.engine()) return null;
+    return this.store.cleanupAt();
+  }
+
+  /** 掃除の alarm を張る（D1 への書き込みが済んだか、諦めた後）。 */
+  private async armCleanup(): Promise<void> {
+    const at = this.store.cleanupAt();
+    if (at !== null) await this.armAlarm(at);
   }
 
   /** 確定後の副作用を実行し、失敗はログに残すだけにする。 */
@@ -398,6 +439,8 @@ export class GameRoom extends DurableObject<Env> {
     const finishedAt = Number(this.store.getMeta("finishedAt") ?? Date.now());
     if (Date.now() - finishedAt > PERSIST_RETRY_WINDOW_MS) {
       console.error(`giving up persisting result of room ${this.store.getMeta("roomId")} after ${n} retries`);
+      this.store.setMeta("persistGaveUp", "1");
+      await this.armCleanup();
       return;
     }
     this.store.setMeta("persistAttempts", String(n + 1));
@@ -405,12 +448,43 @@ export class GameRoom extends DurableObject<Env> {
     await this.armAlarm(Date.now() + delay);
   }
 
-  /** 終了済みで D1 への書き込みが済んでいなければ再試行する（alarm から呼ぶ）。 */
+  /** D1 への書き込みを諦めたか（schedulePersistRetry が期限切れで止めた）。 */
+  private persistGaveUp(): boolean {
+    return this.store.getMeta("persistGaveUp") === "1";
+  }
+
+  /** 終了済みで D1 への書き込みが済んでいなければ再試行する（alarm から呼ぶ）。済んでいれば掃除の alarm を張る。 */
   private async retryPersist(): Promise<void> {
-    if (this.store.getMeta("persisted") === "1") return;
+    if (this.store.getMeta("persisted") === "1" || this.persistGaveUp()) return this.armCleanup();
     const result = this.resultNow(this.game(), this.store.loadSnapshot().state);
     if (!result) return;
-    if (!(await this.persistResult(result))) await this.schedulePersistRetry();
+    if (await this.persistResult(result)) await this.armCleanup();
+    else await this.schedulePersistRetry();
+  }
+
+  // ---- 掃除 ----
+
+  /**
+   * ルームを消す（DO のストレージをすべて消し、以後は ROOM_NOT_FOUND）。D1 の matches・results は残す。
+   * ストレージの削除を先に行う（ストレージ操作の間は他のイベントが入らないので、削除の途中で join などが割り込まない）。
+   * 一覧の索引（rooms）の行はその後で消す。失敗しても残るのは waiting / finished の古い行で、一覧・クイックマッチには出ない。
+   */
+  private async cleanup(): Promise<void> {
+    const id = this.store.getMeta("roomId");
+    const indexed = this.store.getMeta("indexRev") !== null;
+    for (const ws of this.ctx.getWebSockets()) {
+      try {
+        ws.close(CLOSE_ROOM_DELETED, "room deleted");
+      } catch {
+        // すでに閉じている
+      }
+    }
+    await this.ctx.storage.deleteAlarm();
+    await this.ctx.storage.deleteAll();
+    this.store = new RoomStore(this.ctx.storage.sql); // テーブルが無い状態として読み直す
+    if (id && indexed && this.env.DB) {
+      await this.attempt("delete room index", () => this.env.DB.prepare("DELETE FROM rooms WHERE id = ?").bind(id).run());
+    }
   }
 
   /**
@@ -466,6 +540,10 @@ export class GameRoom extends DurableObject<Env> {
     gameOptions: unknown = undefined,
     reserved: Record<string, string> | null = null,
   ): Promise<RoomResult<{ game: string; hostToken: string }>> {
+    // ハッシュは exists() の確認より前に取る（確認から transactionSync まで await を挟むと、
+    // 再戦で同時に呼ばれた init が両方とも確認を通り、hostTokenHash を上書きし合う）
+    const hostToken = newToken();
+    const hostTokenHash = await sha256Hex(hostToken);
     if (this.store.exists()) return fail(409, "ROOM_EXISTS", "room already exists");
     const game = getGame(gameId);
     if (!game) return fail(400, "UNKNOWN_GAME", `unknown game: ${gameId}`);
@@ -473,7 +551,6 @@ export class GameRoom extends DurableObject<Env> {
     if (!opts.success) return fail(400, "BAD_REQUEST", "invalid options");
     const gopts = parseGameOptions(game, gameOptions);
     if (!gopts.ok) return fail(400, "BAD_REQUEST", gopts.message);
-    const hostToken = newToken();
     this.ctx.storage.transactionSync(() => {
       const s = this.store;
       s.createTables();
@@ -481,19 +558,23 @@ export class GameRoom extends DurableObject<Env> {
       s.setMeta("gameId", gameId);
       s.setMeta("options", JSON.stringify(opts.data));
       s.setMeta("gameOptions", JSON.stringify(gopts.value));
-      s.setMeta("hostToken", hostToken);
+      s.setMeta("hostTokenHash", hostTokenHash);
       s.setMeta("status", "waiting");
       s.setMeta("createdAt", String(Date.now()));
+      s.setMeta("cleanupAt", String(Date.now() + WAITING_ROOM_TTL_MS));
       // 再戦ルームでは、練習相手などの追加の席は予約席の後ろから
       s.setMeta("nextSeat", String(reserved ? Object.keys(reserved).length + 1 : 1));
       if (reserved) s.setMeta("reserved", JSON.stringify(reserved));
     });
+    await this.armCleanup();
     await this.syncIndex();
     return ok({ game: gameId, hostToken });
   }
 
   /** 参加。プレイヤー ID は参加順に p1, p2, ...（退出した席の番号は再利用しない） */
   async join(userId: string | null = null): Promise<RoomResult<{ playerId: string; token: string }>> {
+    const token = newToken();
+    const tokenHash = await sha256Hex(token); // 状態を読む前に（ここから commit まで await を挟まない）
     const bad = this.check();
     if (bad) return bad;
     if (this.store.reservedSeats()) return fail(403, "ROOM_RESERVED", "this room is reserved for a rematch");
@@ -501,12 +582,15 @@ export class GameRoom extends DurableObject<Env> {
     const n = this.store.playerIds().length;
     const { maxPlayers } = this.game();
     if (n >= maxPlayers) return fail(409, "ROOM_FULL", "room is full");
-    const token = newToken();
+    // 同じユーザーが複数の席に座ると、自分どうしの対戦で戦績を水増しできる（API キー無しの参加は対象外）
+    if (userId !== null && this.store.hasUser(userId)) {
+      return fail(409, "ALREADY_JOINED", "this user already has a seat in this room");
+    }
     let playerId = "";
     await this.commit(() => {
       const seat = this.store.allocateSeat();
       playerId = seat.id;
-      this.store.addPlayer(seat.id, token, seat.seq, userId);
+      this.store.addPlayer(seat.id, tokenHash, seat.seq, userId);
     });
     // autoStart：満席になったらその場で開始する（ホストの start と競合しても startGame が status を見て1回だけ開始する）
     if (this.store.options().autoStart && n + 1 >= maxPlayers) await this.startGame();
@@ -516,23 +600,29 @@ export class GameRoom extends DurableObject<Env> {
 
   /**
    * 再戦ルームの予約席に座る（元のルームの rematch から呼ぶ。origin は元のルームでのプレイヤー ID）。
-   * 同じ origin で何度呼んでも同じ席・同じトークンを返す。予約席が全部埋まったら開始する。
+   * token は元のルームが元のトークンから導出した席のトークン（rematchToken）。同じ origin なら毎回同じ値が来るので、
+   * 何度呼んでも（退出した後でも）同じ席・同じトークンになる（ここではハッシュしか保存しない）。予約席が全部埋まったら開始する。
    */
   async joinReserved(
     origin: string,
     userId: string | null,
+    token: string,
   ): Promise<RoomResult<{ playerId: string; token: string }>> {
+    const tokenHash = await sha256Hex(token); // 状態を読む前に
     const bad = this.check();
     if (bad) return bad;
     const reserved = this.store.reservedSeats();
     const seat = reserved?.[origin];
     if (!reserved || !seat) return fail(403, "ROOM_RESERVED", "no seat is reserved for this player");
-    const existing = this.store.tokenOf(seat);
-    if (existing) return ok({ playerId: seat, token: existing });
+    const existing = this.store.tokenHashOf(seat);
+    if (existing) {
+      return existing === tokenHash
+        ? ok({ playerId: seat, token })
+        : fail(403, "ROOM_RESERVED", "this seat is taken with another token");
+    }
     if (this.store.status() !== "waiting") return fail(409, "ALREADY_STARTED", "game already started");
-    const token = newToken();
     await this.commit(() => {
-      this.store.addPlayer(seat, token, Number(seat.slice(1)) - 1, userId);
+      this.store.addPlayer(seat, tokenHash, Number(seat.slice(1)) - 1, userId);
     });
     if (this.store.playerIds().length >= Object.keys(reserved).length) await this.startGame();
     return ok({ playerId: seat, token });
@@ -543,9 +633,10 @@ export class GameRoom extends DurableObject<Env> {
    * 再戦ルームでは席は予約されたまま（元のルームの rematch をもう一度呼べば座り直せる）。返すのは観戦視点。
    */
   async leave(token: string | null): Promise<RoomResult<RoomState>> {
+    const tokenHash = await hashToken(token);
     const bad = this.check();
     if (bad) return bad;
-    const pid = this.store.playerByToken(token);
+    const pid = this.store.playerByTokenHash(tokenHash);
     if (!pid) return fail(401, "UNAUTHORIZED", "valid player token required");
     if (this.store.status() !== "waiting") return fail(409, "ALREADY_STARTED", "game already started (resign instead)");
     // ここから commit まで await を挟まない（start と入れ替わらない）
@@ -569,9 +660,10 @@ export class GameRoom extends DurableObject<Env> {
    * 同じプレイヤーが何度呼んでも同じ { roomId, playerId, token } が返る。
    */
   async rematch(token: string | null): Promise<RoomResult<{ roomId: string; playerId: string; token: string }>> {
+    const tokenHash = await hashToken(token);
     const bad = this.check();
     if (bad) return bad;
-    const pid = this.store.playerByToken(token);
+    const pid = this.store.playerByTokenHash(tokenHash);
     if (!pid) return fail(401, "UNAUTHORIZED", "valid player token required");
     if (this.store.status() !== "finished") return fail(403, "NOT_FINISHED", "rematch is available after the game has finished");
 
@@ -582,15 +674,28 @@ export class GameRoom extends DurableObject<Env> {
       this.store.setMeta("rematchRoomId", roomId);
     }
     const stub = this.env.GAME_ROOM.getByName(roomId);
-    if (this.store.getMeta("rematchReady") !== "1") {
+    const createRoom = async (): Promise<RoomError | null> => {
       const bots = this.store.bots();
       const reserved = rematchSeats(this.store.playerIds().filter((p) => !bots.includes(p)));
       const init = await stub.init(roomId, this.store.gameId()!, this.store.options(), this.store.gameOptions(), reserved);
       // ROOM_EXISTS は、同時に呼ばれたもう一方が作り終えたということ
       if (!init.ok && init.code !== "ROOM_EXISTS") return init;
       this.store.setMeta("rematchReady", "1");
+      return null;
+    };
+    if (this.store.getMeta("rematchReady") !== "1") {
+      const e = await createRoom();
+      if (e) return e;
     }
-    const seat = await stub.joinReserved(pid, this.store.userOf(pid));
+    const seatToken = await rematchToken(token!, roomId);
+    let seat = await stub.joinReserved(pid, this.store.userOf(pid), seatToken);
+    if (!seat.ok && seat.code === "ROOM_NOT_FOUND") {
+      // 再戦ルームが誰も来ないまま掃除された。同じ ID で作り直す（申し込みも数え直す）
+      this.store.setMeta("rematchRequested", "[]");
+      const e = await createRoom();
+      if (e) return e;
+      seat = await stub.joinReserved(pid, this.store.userOf(pid), seatToken);
+    }
     if (!seat.ok) return seat;
 
     const requested = this.store.rematchInfo()?.requestedBy ?? [];
@@ -604,11 +709,12 @@ export class GameRoom extends DurableObject<Env> {
 
   /** 試合開始（作成者 = POST /rooms で受け取った hostToken を持つ者のみ）。返すのは観戦視点。 */
   async start(token: string | null): Promise<RoomResult<RoomState>> {
+    const tokenHash = await hashToken(token);
     const bad = this.check();
     if (bad) return bad;
-    if (!token) return fail(401, "UNAUTHORIZED", "host token required");
-    if (token !== this.store.getMeta("hostToken")) {
-      return this.store.playerByToken(token)
+    if (!tokenHash) return fail(401, "UNAUTHORIZED", "host token required");
+    if (tokenHash !== this.store.getMeta("hostTokenHash")) {
+      return this.store.playerByTokenHash(tokenHash)
         ? fail(403, "NOT_HOST", "only the room creator can start the game")
         : fail(401, "UNAUTHORIZED", "invalid token");
     }
@@ -631,8 +737,8 @@ export class GameRoom extends DurableObject<Env> {
       // 練習相手は参加者の後ろの空席（minPlayers まで）に座る
       const botIds = Array.from({ length: botCount }, () => {
         const seat = s.allocateSeat();
-        // トークンは誰にも渡さない（練習相手の席には外から行動できない）
-        s.addPlayer(seat.id, newToken(), seat.seq, null);
+        // どのトークンのハッシュとも一致しない値を入れる（練習相手の席には外から行動できない）
+        s.addPlayer(seat.id, `bot:${randomHex(16)}`, seat.seq, null);
         return seat.id;
       });
       if (botIds.length) s.setMeta("bots", JSON.stringify(botIds));
@@ -640,6 +746,7 @@ export class GameRoom extends DurableObject<Env> {
       // init と同じトランザクションで記録する（この版のエンジンで始めた、という記録なので）
       s.setMeta("rulesVersion", String(game.rulesVersion));
       s.setMeta("startedAt", String(Date.now()));
+      s.deleteMeta("cleanupAt"); // 試合中は消さない（決着すると終了時から数え直す）
       s.saveSnapshot(0, game.init(s.playerIds(), seed, s.gameOptions()));
       s.setMeta("status", "playing");
     });
@@ -649,12 +756,13 @@ export class GameRoom extends DurableObject<Env> {
 
   /** 状態取得。token があればそのプレイヤー視点、なければ観戦視点。 */
   async getState(token: string | null): Promise<RoomResult<RoomState>> {
+    const tokenHash = await hashToken(token);
     const bad = this.check();
     if (bad) return bad;
     await this.ensureAlarm();
     let pid: string | null = null;
-    if (token) {
-      pid = this.store.playerByToken(token);
+    if (tokenHash) {
+      pid = this.store.playerByTokenHash(tokenHash);
       if (!pid) return fail(401, "UNAUTHORIZED", "invalid token");
     }
     return ok(this.buildState(pid));
@@ -662,9 +770,10 @@ export class GameRoom extends DurableObject<Env> {
 
   /** REST の行動。turn が現在のターンと一致しなければ STALE_TURN。 */
   async act(token: string | null, turn: number, rawAction: unknown): Promise<RoomResult<RoomState>> {
+    const tokenHash = await hashToken(token);
     const bad = this.check();
     if (bad) return bad;
-    const pid = this.store.playerByToken(token);
+    const pid = this.store.playerByTokenHash(tokenHash);
     if (!pid) return fail(401, "UNAUTHORIZED", "valid player token required");
     const r = await this.actAs(pid, turn, rawAction);
     return r.ok ? ok(this.buildState(pid)) : r;
@@ -672,9 +781,10 @@ export class GameRoom extends DurableObject<Env> {
 
   /** REST の投了。 */
   async resign(token: string | null): Promise<RoomResult<RoomState>> {
+    const tokenHash = await hashToken(token);
     const bad = this.check();
     if (bad) return bad;
-    const pid = this.store.playerByToken(token);
+    const pid = this.store.playerByTokenHash(tokenHash);
     if (!pid) return fail(401, "UNAUTHORIZED", "valid player token required");
     const r = await this.resignAs(pid);
     return r.ok ? ok(this.buildState(pid)) : r;
@@ -788,14 +898,15 @@ export class GameRoom extends DurableObject<Env> {
     if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
       return error(426, "UPGRADE_REQUIRED", "expected WebSocket upgrade");
     }
+    const auth = extractWsAuth(request);
+    const tokenHash = auth.ok ? await hashToken(auth.token) : null;
     const bad = this.check();
     if (bad) return error(bad.status, bad.code, bad.message);
     await this.ensureAlarm();
-    const auth = extractWsAuth(request);
     if (!auth.ok) return error(400, "BAD_REQUEST", auth.message);
     let pid: string | null = null;
-    if (auth.token) {
-      pid = this.store.playerByToken(auth.token);
+    if (tokenHash) {
+      pid = this.store.playerByTokenHash(tokenHash);
       if (!pid) return error(401, "UNAUTHORIZED", "invalid token");
     }
 
@@ -804,7 +915,7 @@ export class GameRoom extends DurableObject<Env> {
     this.ctx.acceptWebSocket(server); // Hibernation API。server.accept() は使わない
     server.serializeAttachment(
       (pid
-        ? { playerId: pid, token: auth.token!, protocol: auth.protocol }
+        ? { playerId: pid, tokenHash: tokenHash!, protocol: auth.protocol }
         : { playerId: null, protocol: auth.protocol }) satisfies Attachment,
     );
 
@@ -832,7 +943,7 @@ export class GameRoom extends DurableObject<Env> {
       }
       if (msg.data.type === "ping") return this.send(ws, { type: "pong" });
 
-      const pid = this.socketPlayer(ws, this.store.seatTokens());
+      const pid = this.socketPlayer(ws, this.store.seatTokenHashes());
       const r =
         this.check() ??
         (msg.data.type === "resign" ? await this.resignAs(pid) : await this.actAs(pid, msg.data.turn, msg.data.action));
@@ -866,14 +977,25 @@ export class GameRoom extends DurableObject<Env> {
 
   async alarm(): Promise<void> {
     if (!this.store.exists()) return;
+    const cleanupAt = this.cleanupDueAt();
+    if (cleanupAt !== null && Date.now() >= cleanupAt) return this.cleanup();
     if (!this.engine()) {
-      // 例外にすると alarm が再試行され続ける（1回 = 1リクエスト）ので、記録して止める
+      // 例外にすると alarm が再試行され続ける（1回 = 1リクエスト）ので、記録して掃除だけ予約する。
+      // 進行中だったルームは cleanupAt が無い（待機中の値は使わない）ので、ここで決める
       console.error(`alarm skipped: ${this.check()?.message}`);
+      if (this.store.status() === "playing") {
+        this.store.setMeta("cleanupAt", String(Date.now() + FINISHED_ROOM_TTL_MS));
+      }
+      await this.armCleanup();
       return;
     }
     const status = this.store.status();
     if (status === "finished") return this.retryPersist();
-    if (status !== "playing") return;
+    if (status !== "playing") {
+      // 早すぎた（待機中に更新された）掃除の alarm。今の時刻で張り直す
+      if (cleanupAt !== null) await this.armAlarm(cleanupAt);
+      return;
+    }
     // 練習相手の続き（runBots が1回の上限に達して張った alarm）
     if (this.pendingBot() && !this.deadlinePassed()) {
       await this.runBots();

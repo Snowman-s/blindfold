@@ -30,6 +30,15 @@ export type RoomOptions = z.infer<typeof roomOptions>;
 /** 待機中のルームを一覧・クイックマッチに出す期間（最後の更新から）。放置された部屋に人を集めないため。 */
 export const WAITING_LIST_TTL_MS = 30 * 60 * 1000;
 
+/** 待機中のルームを消すまでの期間（最後の作成・join・退出から）。DO のストレージごと消す。 */
+export const WAITING_ROOM_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * 終了したルームを消すまでの期間（終了から）。state・/log・/replay はこの間だけ取れる（D1 の matches・results は残る）。
+ * D1 への結果の書き込みの再試行（終了から 26 時間）より長くすること。
+ */
+export const FINISHED_ROOM_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
 /**
  * ゲーム固有のオプション（POST /rooms の gameOptions）を検証し、既定値を補った値にする。
  * optionsSchema の無いゲームは null（gameOptions を渡したら拒否）。省略したときは {} を parse する。

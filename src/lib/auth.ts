@@ -60,9 +60,29 @@ export function newRoomId(): string {
   return crypto.randomUUID().replace(/-/g, "").slice(0, 12);
 }
 
+/** ルーム ID の形式（newRoomId が作る形）。これに合わない ID では DO を起こさない。 */
+export const ROOM_ID_RE = /^[0-9a-f]{12}$/;
+
+export function isRoomId(id: string): boolean {
+  return ROOM_ID_RE.test(id);
+}
+
 export async function sha256Hex(s: string): Promise<string> {
   const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
   return toHex(new Uint8Array(d));
+}
+
+/** トークンの保存用ハッシュ（DO にはトークンそのものを保存しない）。null はそのまま。 */
+export async function hashToken(token: string | null): Promise<string | null> {
+  return token === null ? null : sha256Hex(token);
+}
+
+/**
+ * 再戦ルームの席のトークン。元のルームのトークンから導出するので、どこにも保存せずに「何度呼んでも同じトークン」を返せる。
+ * 元のトークンを持つ人は rematch を呼べば同じものを受け取れるので、導出できても権限は増えない。
+ */
+export async function rematchToken(oldToken: string, newRoomId: string): Promise<string> {
+  return (await sha256Hex(`rematch:${newRoomId}:${oldToken}`)).slice(0, 48);
 }
 
 export function newApiKey(): string {

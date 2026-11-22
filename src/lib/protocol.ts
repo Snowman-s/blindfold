@@ -21,6 +21,9 @@ export type EndReason = (typeof END_REASONS)[number];
 /** WS の close コード：退出したプレイヤーの接続をサーバーが閉じるとき（再接続しても無駄なことを伝える）。 */
 export const CLOSE_LEFT_ROOM = 4000;
 
+/** WS の close コード：ルームが削除されたとき（放置・終了から一定期間後の掃除。再接続しても ROOM_NOT_FOUND）。 */
+export const CLOSE_ROOM_DELETED = 4001;
+
 /** REST / DO 共通のエラーレスポンスの本体。 */
 export const errBody = (code: string, message: string) => ({ error: { code, message } });
 

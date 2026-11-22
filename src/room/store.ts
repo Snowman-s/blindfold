@@ -51,6 +51,10 @@ export class RoomStore {
     this.sql.exec("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", key, value);
   }
 
+  deleteMeta(key: string): void {
+    this.sql.exec("DELETE FROM meta WHERE key = ?", key);
+  }
+
   private getJson<T>(key: string, fallback: T): T {
     const v = this.getMeta(key);
     return v === null ? fallback : (JSON.parse(v) as T);
@@ -97,6 +101,11 @@ export class RoomStore {
   /** 現在の手番の締め切り（epoch ms）。status は見ない。 */
   deadline(): number | null {
     return this.getNumber("deadline");
+  }
+
+  /** このルームを消す時刻（epoch ms）。待機中は最後の変更から、終了後は終了から数える。 */
+  cleanupAt(): number | null {
+    return this.getNumber("cleanupAt");
   }
 
   /** 練習相手（サーバー側の Bot）のプレイヤー ID。 */
@@ -154,24 +163,32 @@ export class RoomStore {
       .map((r) => ({ id: r.id as string, userId: (r.user_id as string | null) ?? null }));
   }
 
+  /** このユーザーがすでに席にいるか。 */
+  hasUser(userId: string): boolean {
+    return this.sql.exec("SELECT 1 FROM players WHERE user_id = ?", userId).toArray().length > 0;
+  }
+
   userOf(pid: string): string | null {
     const row = this.sql.exec("SELECT user_id FROM players WHERE id = ?", pid).toArray()[0];
     return (row?.user_id as string | null | undefined) ?? null;
   }
 
-  playerByToken(token: string | null): string | null {
-    if (!token) return null;
-    const rows = this.sql.exec("SELECT id FROM players WHERE token = ?", token).toArray();
+  // players.token にはトークンのハッシュ（hashToken）を入れる。トークンそのものは保存しない。
+
+  /** トークンのハッシュから席を引く。 */
+  playerByTokenHash(hash: string | null): string | null {
+    if (!hash) return null;
+    const rows = this.sql.exec("SELECT id FROM players WHERE token = ?", hash).toArray();
     return rows.length ? (rows[0]!.id as string) : null;
   }
 
-  tokenOf(pid: string): string | null {
+  tokenHashOf(pid: string): string | null {
     const row = this.sql.exec("SELECT token FROM players WHERE id = ?", pid).toArray()[0];
     return (row?.token as string | undefined) ?? null;
   }
 
-  /** 席 ID → 今のトークン。 */
-  seatTokens(): Map<string, string> {
+  /** 席 ID → 今のトークンのハッシュ。 */
+  seatTokenHashes(): Map<string, string> {
     return new Map(
       this.sql
         .exec("SELECT id, token FROM players")
@@ -180,8 +197,8 @@ export class RoomStore {
     );
   }
 
-  addPlayer(id: string, token: string, seq: number, userId: string | null): void {
-    this.sql.exec("INSERT INTO players(id, token, seq, user_id) VALUES (?, ?, ?, ?)", id, token, seq, userId);
+  addPlayer(id: string, tokenHash: string, seq: number, userId: string | null): void {
+    this.sql.exec("INSERT INTO players(id, token, seq, user_id) VALUES (?, ?, ?, ?)", id, tokenHash, seq, userId);
   }
 
   removePlayer(id: string): void {

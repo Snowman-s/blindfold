@@ -1,5 +1,6 @@
 import { z } from "@hono/zod-openapi";
 import type { Context } from "hono";
+import { ROOM_ID_RE } from "../lib/auth";
 import { errBody, ROOM_STATUSES } from "../lib/protocol";
 
 export { errBody };
@@ -29,10 +30,13 @@ export const errors = {
   400: errorResponse("Bad request (BAD_REQUEST, UNKNOWN_GAME, ILLEGAL_ACTION)"),
   401: errorResponse("Invalid token or API key (UNAUTHORIZED)"),
   403: errorResponse("Not allowed, or not available yet (NOT_HOST, NOT_YOUR_TURN, NOT_FINISHED, ROOM_RESERVED)"),
-  404: errorResponse("Not found (ROOM_NOT_FOUND, NOT_FOUND)"),
-  409: errorResponse("Not possible in the current state (ALREADY_STARTED, ROOM_FULL, NOT_ENOUGH_PLAYERS, NOT_PLAYING, STALE_TURN)"),
+  404: errorResponse("Not found (ROOM_NOT_FOUND: unknown, deleted or malformed room ID; NOT_FOUND)"),
+  409: errorResponse("Not possible in the current state (ALREADY_STARTED, ROOM_FULL, ALREADY_JOINED, NOT_ENOUGH_PLAYERS, NOT_PLAYING, STALE_TURN)"),
   410: errorResponse("The game this room was created with, or the rules version it was started with, is no longer available on this server (GAME_REMOVED)"),
   426: errorResponse("A WebSocket upgrade is required (UPGRADE_REQUIRED)"),
+  429: errorResponse(
+    "Too many requests from your IP address (RATE_LIMITED). Wait for the number of seconds in the Retry-After header before retrying",
+  ),
 } as const;
 
 /**
@@ -85,7 +89,11 @@ export const RoomStateSchema = z
   .openapi("RoomState");
 
 export const RoomIdParam = z.object({
-  id: z.string().openapi({ param: { name: "id", in: "path" }, example: "a1b2c3d4e5f6" }),
+  id: z
+    .string()
+    .regex(ROOM_ID_RE)
+    .describe("Room ID (12 lowercase hex characters). Any other value gets ROOM_NOT_FOUND (404)")
+    .openapi({ param: { name: "id", in: "path" }, example: "a1b2c3d4e5f6" }),
 });
 
 export const bearerSecurity = [{ bearerAuth: [] }];

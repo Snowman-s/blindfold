@@ -825,7 +825,7 @@ describe("OpenAPI", () => {
     const paths = Object.keys(r.json.paths);
     for (const p of [
       "/games", "/games/{id}/rules", "/games/{id}/rules.md", "/rooms", "/rooms/{id}/join", "/rooms/{id}/start", "/rooms/{id}/state", "/rooms/{id}/action",
-      "/rooms/{id}/log", "/rooms/{id}/replay", "/rooms/{id}/ws", "/users", "/matches",
+      "/rooms/{id}/log", "/rooms/{id}/replay", "/rooms/{id}/ws", "/users", "/users/{id}/key", "/matches",
     ]) {
       expect(paths).toContain(p);
     }

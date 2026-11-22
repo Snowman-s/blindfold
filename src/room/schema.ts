@@ -9,6 +9,7 @@
  * 移行は1段ずつ「変更 + schemaVersion の更新」を1トランザクションで行うので、途中で落ちても次に起きたとき続きから流れる。
  */
 
+// players.token はトークンのハッシュ（sha256 の 16 進）。meta.hostTokenHash も同じ
 const BASE_SCHEMA = `
   CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
   CREATE TABLE IF NOT EXISTS players(id TEXT PRIMARY KEY, token TEXT NOT NULL, seq INTEGER NOT NULL, user_id TEXT);

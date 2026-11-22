@@ -2,14 +2,16 @@ import { createRoute, OpenAPIHono, z } from "@hono/zod-openapi";
 import type { Context } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { games, getGame } from "../games/registry";
-import { extractToken, newRoomId, sha256Hex, WS_PROTOCOL, WS_TOKEN_PROTOCOL_PREFIX } from "../lib/auth";
+import { extractToken, isRoomId, newRoomId, sha256Hex, WS_PROTOCOL, WS_TOKEN_PROTOCOL_PREFIX } from "../lib/auth";
 import {
   DEFAULT_TURN_TIME_MS,
+  FINISHED_ROOM_TTL_MS,
   gameOptionsKey,
   parseGameOptions,
   roomOptions,
   turnTimeMs,
   WAITING_LIST_TTL_MS,
+  WAITING_ROOM_TTL_MS,
 } from "../lib/options";
 import { actionBody, CLOSE_LEFT_ROOM } from "../lib/protocol";
 import { gameRules, rulesMarkdown, type GameRules } from "../lib/rules";
@@ -41,6 +43,13 @@ routes.use("/rooms/*", async (c, next) => {
       400,
     );
   }
+  await next();
+});
+
+// 形式に合わないルーム ID では DO を起こさない（存在しない ID でも DO の起動は1リクエストとして数えられ、
+// インスタンスも作られるため）。/ws も含む。DO の ROOM_NOT_FOUND と同じコードを返す。
+routes.use("/rooms/:id/*", async (c, next) => {
+  if (!isRoomId(c.req.param("id") ?? "")) return c.json(errBody("ROOM_NOT_FOUND", "invalid room id"), 404);
   await next();
 });
 
@@ -255,6 +264,7 @@ routes.openapi(
         },
       },
       400: errors[400],
+      429: errors[429],
     },
   }),
   async (c) => {
@@ -381,6 +391,7 @@ routes.openapi(
       },
       400: errors[400],
       401: errors[401],
+      429: errors[429],
     },
   }),
   async (c) => {
@@ -427,7 +438,8 @@ routes.openapi(
     summary: "Join a room",
     description:
       "Player IDs are assigned in join order: p1, p2, ... (numbers of seats that were left are not reused). Seat order (= `players`) is the turn order. " +
-      "Rematch rooms cannot be joined here (`ROOM_RESERVED` 403; use `POST /rooms/{id}/rematch` on the finished room). Send `X-Api-Key` to record the result on that user.",
+      "Rematch rooms cannot be joined here (`ROOM_RESERVED` 403; use `POST /rooms/{id}/rematch` on the finished room). Send `X-Api-Key` to record the result on that user; " +
+      `a user can take only one seat per room (\`ALREADY_JOINED\` 409). A waiting room is deleted ${WAITING_ROOM_TTL_MS / 3600000} hours after its last join or leave.`,
     request: {
       params: RoomIdParam,
       headers: ApiKeyHeader,
@@ -441,6 +453,7 @@ routes.openapi(
       404: errors[404],
       410: errors[410],
       409: errors[409],
+      429: errors[429],
     },
   }),
   async (c) => {
@@ -590,7 +603,7 @@ routes.openapi(
       "every call seats the caller there and returns the new `roomId`, `playerId` and `token`. Seats are rotated by one " +
       "(in a two-player game, first and second player swap). Only the players of this room can take those seats (others get `ROOM_RESERVED` 403). " +
       "The new game starts by itself once every player has called rematch (practice bots are added again at start). " +
-      "Calling again returns the same seat and token. The finished room's `state` gets `rematch: { roomId, requestedBy }`, pushed over the WebSocket, " +
+      "Calling again (also after leaving the new room) returns the same seat and token. The finished room's `state` gets `rematch: { roomId, requestedBy }`, pushed over the WebSocket, " +
       "so the other players can see the offer (`requestedBy` lists everyone who has asked at least once). " +
       "The others may never answer: if the new room does not start within a time you choose, leave it. To decline after accepting, leave the new room (`POST /rooms/{newId}/leave`). Before the end: `NOT_FINISHED` 403.",
     security: bearerSecurity,
@@ -607,6 +620,7 @@ routes.openapi(
       404: errors[404],
       410: errors[410],
       409: errors[409],
+      429: errors[429],
     },
   }),
   async (c) => respond(c, await room(c).rematch(extractToken(c.req.raw))),
@@ -666,7 +680,9 @@ routes.openapi(
     tags: ["rooms"],
     operationId: "getLog",
     summary: "Action log (for replays)",
-    description: "Available only after the game has ended, so that the seed cannot reveal hidden information. `seed` + `gameOptions` + `actions` reproduce the game exactly.",
+    description:
+      "Available only after the game has ended, so that the seed cannot reveal hidden information. `seed` + `gameOptions` + `actions` reproduce the game exactly. " +
+      `Finished rooms are deleted ${FINISHED_ROOM_TTL_MS / 86400000} days after the end (then 404 \`ROOM_NOT_FOUND\`); download the log before that if you need to keep it.`,
     request: { params: RoomIdParam },
     responses: {
       200: { description: "Action log", content: { "application/json": { schema: LogSchema } } },

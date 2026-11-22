@@ -3,11 +3,13 @@ import { getGame } from "../games/registry";
 import type { AnyGame, GameResult } from "../games/types";
 import { extractWsAuth, hashToken, newRoomId, newToken, randomHex, rematchToken, sha256Hex } from "../lib/auth";
 import {
+  checkSeats,
   DEFAULT_TURN_TIME_MS,
   FINISHED_ROOM_TTL_MS,
   parseGameOptions,
   PLAYING_INDEX_REFRESH_MS,
   roomOptions,
+  roomSeats,
   WAITING_ROOM_TTL_MS,
 } from "../lib/options";
 import {
@@ -624,7 +626,7 @@ export class GameRoom extends DurableObject<Env> {
       gameOptions: this.store.gameOptions(),
       status: this.store.status(),
       players: this.store.playerIds().length,
-      maxPlayers: game.maxPlayers,
+      maxPlayers: roomSeats(game, opts),
       autoStart: opts.autoStart ?? false,
       turnTimeMs: opts.turnTimeMs ?? DEFAULT_TURN_TIME_MS,
       createdAt: this.store.getMeta("createdAt") ?? now,
@@ -668,6 +670,8 @@ export class GameRoom extends DurableObject<Env> {
     if (!game) return fail(400, "UNKNOWN_GAME", `unknown game: ${gameId}`);
     const opts = roomOptions.safeParse(options ?? {});
     if (!opts.success) return fail(400, "BAD_REQUEST", "invalid options");
+    const seatsError = checkSeats(game, opts.data.seats);
+    if (seatsError) return fail(400, "BAD_REQUEST", seatsError);
     const gopts = parseGameOptions(game, gameOptions);
     if (!gopts.ok) return fail(400, "BAD_REQUEST", gopts.message);
     const now = Date.now();
@@ -701,8 +705,8 @@ export class GameRoom extends DurableObject<Env> {
     if (this.store.reservedSeats()) return fail(403, "ROOM_RESERVED", "this room is reserved for a rematch");
     if (this.store.status() !== "waiting") return fail(409, "ALREADY_STARTED", "game already started");
     const n = this.store.playerIds().length;
-    const { maxPlayers } = this.game();
-    if (n >= maxPlayers) return fail(409, "ROOM_FULL", "room is full");
+    const seats = roomSeats(this.game(), this.store.options());
+    if (n >= seats) return fail(409, "ROOM_FULL", "room is full");
     // 同じユーザーが複数の席に座ると、自分どうしの対戦で戦績を水増しできる（API キー無しの参加は対象外）
     if (userId !== null && this.store.hasUser(userId)) {
       return fail(409, "ALREADY_JOINED", "this user already has a seat in this room");
@@ -714,7 +718,7 @@ export class GameRoom extends DurableObject<Env> {
       this.store.addPlayer(seat.id, tokenHash, seat.seq, userId);
     });
     // autoStart：満席になったらその場で開始する（ホストの start と競合しても startGame が status を見て1回だけ開始する）
-    if (this.store.options().autoStart && n + 1 >= maxPlayers) await this.startGame();
+    if (this.store.options().autoStart && n + 1 >= seats) await this.startGame();
     else await this.syncIndex();
     return ok({ playerId, token });
   }
@@ -842,14 +846,14 @@ export class GameRoom extends DurableObject<Env> {
 
     const game = this.game();
     const joined = this.store.playerIds().length;
-    const botCount = practiceBotCount(game, joined, this.store.options().practice ?? false);
+    const botCount = practiceBotCount(game, joined, this.store.options());
     if (joined + botCount < game.minPlayers) {
       return fail(409, "NOT_ENOUGH_PLAYERS", `need at least ${game.minPlayers} players`);
     }
     const seed: Seed = randomHex(16); // 128 ビット。総当たりで特定されないように
     await this.commit(() => {
       const s = this.store;
-      // 練習相手は参加者の後ろの空席（minPlayers まで）に座る
+      // 練習相手は参加者の後ろの空席（seats、省略時は minPlayers まで）に座る
       const botIds = Array.from({ length: botCount }, () => {
         const seat = s.allocateSeat();
         // どのトークンのハッシュとも一致しない値を入れる（練習相手の席には外から行動できない）

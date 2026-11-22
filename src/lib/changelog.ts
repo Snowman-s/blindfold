@@ -20,6 +20,17 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.7.0",
+    date: "2026-11-22",
+    added: [
+      "`options.seats` in `POST /rooms` and `POST /quickmatch`: the number of seats in the room, between the game's " +
+        "`minPlayers` and `maxPlayers` (default `maxPlayers`; outside the range is 400). The room is full, and " +
+        "`autoStart` starts it, at that many players; `practice` fills the empty seats up to it (without `seats`, " +
+        "still up to `minPlayers`). `maxPlayers` in `GET /rooms` is the room's seats. Quick match only pairs rooms " +
+        "with the same seats. Rematches keep it.",
+    ],
+  },
+  {
     version: "0.6.0",
     date: "2026-11-22",
     breaking: [

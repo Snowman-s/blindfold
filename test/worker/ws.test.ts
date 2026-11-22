@@ -511,6 +511,115 @@ describe("持ち時間（Alarm）", () => {
   });
 });
 
+describe("投了（resign）", () => {
+  it("WS で手番でないプレイヤーが投了すると全員に end（reason=resign）が届き、ログ・リプレイでも同じ結果になる", async () => {
+    const { roomId, host, a, b } = await newRoom("tictactoe");
+    const wa = await connect(roomId, a.token);
+    const wb = await connect(roomId, b.token);
+    const spec = await connect(roomId);
+    await call("POST", `/rooms/${roomId}/start`, { token: host });
+    await call("POST", `/rooms/${roomId}/action`, { token: a.token, body: { turn: 0, action: { cell: 4 } } });
+    await wa.next((m) => m.turn === 1);
+    wa.send(JSON.stringify({ type: "resign" })); // p2 の手番だが p1 が投了
+
+    for (const c of [wa, wb, spec]) {
+      expect(await c.next((m) => m.type === "end")).toMatchObject({ winners: ["p2"], reason: "resign" });
+    }
+    const state = (await call("GET", `/rooms/${roomId}/state`)).json;
+    expect(state).toMatchObject({ status: "finished", turn: 2, deadline: null });
+    expect(state.result).toEqual({ winners: ["p2"], scores: { p1: 0, p2: 1 } });
+    expect(state.view.board[4]).toBe("X"); // 盤面は投了で変わらない
+
+    const log = (await call("GET", `/rooms/${roomId}/log`)).json;
+    expect(log.actions).toHaveLength(2);
+    expect(log.actions[1]).toMatchObject({ turn: 1, player: null, action: null, resign: "p1" });
+    expect(log.actions[1].timeout).toBeUndefined();
+    const r = replay(games["tictactoe"]!, log);
+    expect(r.result).toEqual(state.result);
+    expect(r.turn).toBe(2);
+    const rp = (await call("GET", `/rooms/${roomId}/replay`)).json;
+    expect(rp.result).toEqual(state.result);
+    expect(rp.frames.map((f: { turn: number }) => f.turn)).toEqual([0, 1, 2]);
+    expect(rp.frames[2].action).toMatchObject({ resign: "p1" });
+
+    // 後から接続しても end に reason が付く
+    const late = await connect(roomId);
+    expect(await late.next((m) => m.type === "end")).toMatchObject({ reason: "resign" });
+  });
+
+  it("REST で投了でき、D1 に reason=resign・投了者の負けで記録される", async () => {
+    const { roomId, host, a, b } = await newRoom("highcard");
+    await call("POST", `/rooms/${roomId}/start`, { token: host });
+    const r = await call("POST", `/rooms/${roomId}/resign`, { token: b.token });
+    expect(r.status).toBe(200);
+    expect(r.json).toMatchObject({ status: "finished", result: { winners: ["p1"] } });
+    expect(r.json.legal).toBeUndefined();
+
+    const m = await env.DB.prepare("SELECT reason FROM matches WHERE id = ?").bind(roomId).first<{ reason: string }>();
+    expect(m?.reason).toBe("resign");
+    const rows = await env.DB.prepare("SELECT player_id, outcome FROM results WHERE match_id = ? ORDER BY player_id")
+      .bind(roomId)
+      .all<{ player_id: string; outcome: string }>();
+    expect(rows.results).toEqual([
+      { player_id: "p1", outcome: "win" },
+      { player_id: "p2", outcome: "loss" },
+    ]);
+    const matches = (await call("GET", "/matches?game=highcard&limit=100")).json;
+    expect(matches.find((x: { id: string }) => x.id === roomId)?.reason).toBe("resign");
+
+    // 終了後の投了は NOT_PLAYING。勝者は変わらない
+    const again = await call("POST", `/rooms/${roomId}/resign`, { token: a.token });
+    expect(again.status).toBe(409);
+    expect(again.json.error.code).toBe("NOT_PLAYING");
+    expect((await call("GET", `/rooms/${roomId}/state`)).json.result.winners).toEqual(["p1"]);
+  });
+
+  it("待機中・観戦者・不正なトークンの投了は拒否される", async () => {
+    const { roomId, host, a } = await newRoom("tictactoe");
+    const waiting = await call("POST", `/rooms/${roomId}/resign`, { token: a.token });
+    expect(waiting.status).toBe(409);
+    expect(waiting.json.error.code).toBe("NOT_PLAYING");
+    expect((await call("POST", `/rooms/${roomId}/resign`)).status).toBe(401);
+    expect((await call("POST", `/rooms/${roomId}/resign`, { token: host })).status).toBe(401); // hostToken は席ではない
+    expect((await call("POST", `/rooms/zzz/resign`, { token: a.token })).status).toBe(404);
+
+    await call("POST", `/rooms/${roomId}/start`, { token: host });
+    const spec = await connect(roomId);
+    spec.send(JSON.stringify({ type: "resign" }));
+    expect((await spec.next((m) => m.type === "error")).code).toBe("NOT_YOUR_TURN");
+    expect((await call("GET", `/rooms/${roomId}/state`)).json.status).toBe("playing");
+  });
+
+  it("WS で終了後に投了すると ILLEGAL_ACTION", async () => {
+    const { roomId, host, a, b } = await newRoom("tictactoe");
+    await playOut(roomId, host, a, b);
+    const wb = await connect(roomId, b.token);
+    expect(await wb.next((m) => m.type === "end")).toMatchObject({ winners: ["p1"], reason: "normal" });
+    wb.send(JSON.stringify({ type: "resign" }));
+    expect((await wb.next((m) => m.type === "error")).code).toBe("ILLEGAL_ACTION");
+  });
+
+  it("締め切り後の投了は、先に時間切れが確定して NOT_PLAYING になる", async () => {
+    const { roomId, host, b } = await newRoom("tictactoe");
+    await call("POST", `/rooms/${roomId}/start`, { token: host });
+    await pastDeadline(roomId); // p1 の手番で締め切りを過ぎた
+    const r = await call("POST", `/rooms/${roomId}/resign`, { token: b.token });
+    expect(r.status).toBe(409);
+    const state = (await call("GET", `/rooms/${roomId}/state`)).json;
+    expect(state.result.winners).toEqual(["p2"]); // 時間切れで p1 の負け（p2 の投了は無効）
+    const ws = await connect(roomId);
+    expect(await ws.next((m) => m.type === "end")).toMatchObject({ reason: "timeout" });
+  });
+
+  it("練習相手との試合でも投了できる", async () => {
+    const { json } = await call("POST", "/rooms", { body: { game: "tictactoe", options: { practice: true } } });
+    const me = (await call("POST", `/rooms/${json.roomId}/join`)).json;
+    await call("POST", `/rooms/${json.roomId}/start`, { token: json.hostToken });
+    const r = await call("POST", `/rooms/${json.roomId}/resign`, { token: me.token });
+    expect(r.json).toMatchObject({ status: "finished", result: { winners: ["p2"] } });
+  });
+});
+
 describe("ルームの存在確認・入力の制限", () => {
   it("存在しないルームへのアクセスでは DO にテーブルが作られない", async () => {
     const id = "ghost-room-for-test";

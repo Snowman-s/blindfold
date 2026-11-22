@@ -461,6 +461,28 @@ routes.openapi(
   },
 );
 
+routes.openapi(
+  createRoute({
+    method: "post",
+    path: "/rooms/{id}/resign",
+    tags: ["rooms"],
+    operationId: "resign",
+    summary: "投了（降参）",
+    description:
+      "試合中ならいつでも（自分の手番でなくても）投了できる。投了したプレイヤーの負けで、残りのプレイヤー全員が勝者になり、試合はその場で終わる。" +
+      "WebSocket では `{\"type\":\"resign\"}` を送る。待機中・終了後は `NOT_PLAYING`（409）。取り消しはできない。",
+    security: bearerSecurity,
+    request: { params: RoomIdParam },
+    responses: {
+      200: { description: "投了後の状態（status は finished）", content: { "application/json": { schema: RoomStateSchema } } },
+      401: errors[401],
+      404: errors[404],
+      409: errors[409],
+    },
+  }),
+  async (c) => respond(c, await room(c).resign(extractToken(c.req.raw))),
+);
+
 const LogSchema = z
   .object({
     game: z.string(),
@@ -473,6 +495,7 @@ const LogSchema = z
         action: z.unknown(),
         at: z.number(),
         timeout: z.array(z.string()).optional().describe("持ち時間切れになったプレイヤー（あれば player / action は null）"),
+        resign: z.string().optional().describe("投了したプレイヤー（あれば player / action は null）"),
       }),
     ),
   })
@@ -539,7 +562,7 @@ routes.openAPIRegistry.registerPath({
     `サーバーは \`${WS_PROTOCOL}\` を選んで応答する。ヘッダーを付けられるクライアントは \`Authorization: Bearer\` でもよい。` +
     "トークンが無ければ観戦。`?token=` は 400。\n\n" +
     "サーバー → クライアントは `state` / `error` / `end` / `pong`、" +
-    'クライアント → サーバーは `{"type":"action","turn":N,"action":{...}}` と `{"type":"ping"}`。',
+    'クライアント → サーバーは `{"type":"action","turn":N,"action":{...}}`、`{"type":"resign"}`（投了）と `{"type":"ping"}`。',
   request: { params: RoomIdParam },
   responses: {
     101: { description: "Switching Protocols" },

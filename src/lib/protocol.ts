@@ -10,7 +10,12 @@ export const actionBody = z.object({ turn: z.number().int().min(0), action: z.un
 export const clientMessage = z.discriminatedUnion("type", [
   actionBody.extend({ type: z.literal("action") }),
   z.object({ type: z.literal("ping") }),
+  z.object({ type: z.literal("resign") }),
 ]);
+
+/** 試合が終わった理由。normal = ゲームのルールによる決着。 */
+export const END_REASONS = ["normal", "timeout", "resign"] as const;
+export type EndReason = (typeof END_REASONS)[number];
 
 /** REST / DO 共通のエラーレスポンスの本体。 */
 export const errBody = (code: string, message: string) => ({ error: { code, message } });
@@ -32,7 +37,7 @@ export type ServerMessage =
       players: string[];
     }
   | { type: "error"; code: WsErrorCode; message: string }
-  | { type: "end"; winners: string[]; scores?: Record<string, number> }
+  | { type: "end"; winners: string[]; scores?: Record<string, number>; reason: EndReason }
   | { type: "pong" };
 
 /** REST 側のエラーコードを WS の閉じたコード集合に写す（対応はガイドの 1.6 にも書いてある）。 */

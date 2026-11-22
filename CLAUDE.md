@@ -87,6 +87,7 @@ export interface GameDefinition<S, A> {
   view(s: S, pid: string | null): unknown;     // 隠し情報を除去。null は観戦者
   result(s: S): null | { winners: string[]; scores?: Record<string, number> };
   onTimeout?(s: S, pids: string[], rng: Rng): S; // 任意。未定義なら時間切れのプレイヤーの負け
+  onResign?(s: S, pid: string, rng: Rng): S;   // 任意。未定義なら投了者の負け（残り全員の勝ち）。3人以上で投了者だけ抜けて続けるときなどに定義
   practiceAction?(s: S, pid: string, rng: Rng): A; // 任意。練習相手の打ち方。未定義なら合法手からランダム
 }
 ```
@@ -111,6 +112,7 @@ export interface GameDefinition<S, A> {
 | POST | `/rooms/:id/join` | → `{ playerId, token }` |
 | POST | `/rooms/:id/start` | 試合開始（作成者のみ。`hostToken` を Bearer で渡す） |
 | GET | `/rooms/:id/state` | `Authorization: Bearer <token>` があればそのプレイヤー視点、なければ観戦視点 |
+| POST | `/rooms/:id/resign` | 投了。試合中ならいつでも（手番でなくても）。既定は投了者の負けで残り全員が勝ち、その場で終了（`onResign` があればそれに従う）。WS では `{ "type": "resign" }` |
 | POST | `/rooms/:id/action` | WS を使わない簡易 Bot 向け。`{ turn, action }`。相手の手を待つ手段はないので、単発の行動・デバッグ用（対戦は WS） |
 | GET | `/rooms/:id/log` | 行動ログ（リプレイ用。終了後のみ） |
 | GET | `/rooms/:id/replay` | ログから再現した各ターンの観戦視点（終了後のみ） |
@@ -129,6 +131,7 @@ export interface GameDefinition<S, A> {
 クライアント → サーバー：
 ```json
 { "type": "action", "turn": 12, "action": { ... } }
+{ "type": "resign" }
 { "type": "ping" }
 ```
 
@@ -136,12 +139,13 @@ export interface GameDefinition<S, A> {
 ```json
 { "type": "state", "turn": 13, "view": { ... }, "legal": [ ... ], "currentPlayers": ["p1"], "deadline": 1732190000000 }
 { "type": "error", "code": "ILLEGAL_ACTION" | "NOT_YOUR_TURN" | "STALE_TURN" | "BAD_REQUEST", "message": "..." }
-{ "type": "end", "winners": ["p1"], "scores": { ... } }
+{ "type": "end", "winners": ["p1"], "scores": { ... }, "reason": "normal" | "timeout" | "resign" }
 ```
 
 - `turn` が現在のターンと一致しない行動は `STALE_TURN` で拒否する（二重送信・古い手の防止）。
 - 締め切りを過ぎてから届いた行動も、Alarm を待たずにその場で時間切れを確定させてから `STALE_TURN` で拒否する。
 - `legal` は、受け取るプレイヤーが今行動できる場合にだけ付ける。
+- 投了・時間切れはサーバーが書くログの行（`player = ""`、`action = {"$resign":"p1"}` / `{"$timeout":[...]}`）として1ターン進める。既定（`onTimeout` / `onResign` 未定義）は状態を変えず、決着は meta の `forfeit`。それで試合が終わったときだけ理由を `endReason`（D1 の `matches.reason`）に残す。
 
 ## 無料枠の制約（設計時に必ず守る）
 

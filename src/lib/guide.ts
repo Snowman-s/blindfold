@@ -134,6 +134,7 @@ console.log(end.winners.length === 0 ? "draw" : end.winners.includes(me.playerId
 const MESSAGE_TYPES = `// Client -> server (WebSocket text frames, JSON)
 type ClientMessage =
   | { type: "action"; turn: number; action: unknown } // turn = \`turn\` of the latest state; action = one element of \`legal\`
+  | { type: "resign" }                               // give up (by default: you lose, everyone else wins, the game ends)
   | { type: "ping" };                                 // answered with { type: "pong" } (free keepalive)
 
 // Server -> client
@@ -149,7 +150,12 @@ type ServerMessage =
       players: string[];            // all player IDs in join order ("p1", "p2", ...)
     }
   | { type: "error"; code: ${WS_ERROR_CODES.map((c) => `"${c}"`).join(" | ")}; message: string }
-  | { type: "end"; winners: string[]; scores?: Record<string, number> } // winners empty = draw (or everyone timed out)
+  | {
+      type: "end";
+      winners: string[];            // empty = draw (or everyone timed out)
+      scores?: Record<string, number>;
+      reason: "normal" | "timeout" | "resign"; // normal = decided by the game's rules
+    }
   | { type: "pong" };`;
 
 function buildGuide(): string {
@@ -177,7 +183,8 @@ function buildGuide(): string {
         'Act           {"type":"action","turn":<turn of latest state>,"action":<one element of legal, unchanged>}',
         "Loop          on every `state`: if `legal` is present, send one action for that `turn` (once)",
         "STALE_TURN    ignore it and wait for the next `state`",
-        "End           `end` message: { winners, scores }",
+        'Resign        {"type":"resign"} over WS, or POST /rooms/{id}/resign (Bearer token): you lose, the game ends',
+        "End           `end` message: { winners, scores, reason }",
       ].join("\n"),
     ),
     "",
@@ -322,10 +329,21 @@ function buildGuide(): string {
     "see the game's rules). An action that arrives after the deadline is rejected with `STALE_TURN`.",
     "Show a countdown in UIs; bots should simply act promptly.",
     "",
-    "### 1.8 End of game",
+    "### 1.8 Resigning",
     "",
-    "Everyone receives `{ \"type\": \"end\", \"winners\": [...], \"scores\": {...} }` after the final `state`",
-    "(`status: \"finished\"`). An empty `winners` means a draw. You may close the socket.",
+    'Send `{"type":"resign"}` over the WebSocket (or `POST /rooms/{id}/resign` with `Authorization: Bearer <token>`).',
+    "You may resign at any time while the game is `playing`, even when it is not your turn. By default you lose, all",
+    "other players win, and the game ends immediately (`end` with `reason: \"resign\"`). Some games define their own",
+    "handling (for example, only your seat drops out and the game goes on); see the game's rules. It cannot be undone.",
+    "Resigning before the game starts or after it ended is rejected (`ILLEGAL_ACTION` on the WebSocket,",
+    "`NOT_PLAYING` 409 over REST). Spectators cannot resign. A resignation is recorded in `/rooms/{id}/log` as",
+    "`{ player: null, action: null, resign: \"p1\" }` and takes up one `turn`, like a timeout.",
+    "",
+    "### 1.9 End of game",
+    "",
+    "Everyone receives `{ \"type\": \"end\", \"winners\": [...], \"scores\": {...}, \"reason\": \"...\" }` after the final",
+    "`state` (`status: \"finished\"`). An empty `winners` means a draw. `reason` is `normal` (decided by the game's rules),",
+    "`timeout` or `resign`. You may close the socket.",
     "",
     "## 2. Message reference (WebSocket)",
     "",
@@ -344,6 +362,7 @@ function buildGuide(): string {
     "| POST | `/rooms/{id}/start` | Bearer hostToken | start the game |",
     "| GET | `/rooms/{id}/state` | optional Bearer token | current state (player view with token, spectator view without) |",
     "| POST | `/rooms/{id}/action` | Bearer token | `{ turn, action }`; REST alternative to the WS action message |",
+    "| POST | `/rooms/{id}/resign` | Bearer token | resign (by default you lose and the game ends) |",
     "| GET | `/rooms/{id}/ws` | subprotocol token (optional) | WebSocket |",
     "| GET | `/rooms/{id}/log` | - | action log (after the game ends) |",
     "| GET | `/rooms/{id}/replay` | - | spectator view for every turn (after the game ends) |",

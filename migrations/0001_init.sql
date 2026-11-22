@@ -14,7 +14,7 @@ CREATE TABLE matches (
   players TEXT NOT NULL, -- JSON 配列
   started_at INTEGER NOT NULL,
   finished_at INTEGER NOT NULL,
-  reason TEXT NOT NULL -- 'normal' | 'timeout'
+  reason TEXT NOT NULL -- 'normal' | 'timeout' | 'resign'
 );
 CREATE INDEX idx_matches_finished ON matches(finished_at DESC);
 

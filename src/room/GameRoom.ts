@@ -1,10 +1,18 @@
 import { DurableObject } from "cloudflare:workers";
+import { z } from "zod";
 import { getGame } from "../games/registry";
 import { GameError, type AnyGame, type GameResult } from "../games/types";
 import { extractWsAuth, newToken, randomHex } from "../lib/auth";
 import { DEFAULT_TURN_TIME_MS, roomOptions } from "../lib/options";
-import { clientMessage, errBody, toWsErrorCode, type RoomStatus, type ServerMessage } from "../lib/protocol";
-import { applyTimeout, replayFrames, type LogEntry, type ReplayLog } from "../lib/replay";
+import {
+  clientMessage,
+  errBody,
+  toWsErrorCode,
+  type EndReason,
+  type RoomStatus,
+  type ServerMessage,
+} from "../lib/protocol";
+import { applyResign, applyTimeout, replayFrames, type LogEntry, type ReplayLog } from "../lib/replay";
 import { practiceAction } from "../lib/practice";
 import { createRng, rngForTurn, type Seed } from "../lib/rng";
 
@@ -50,8 +58,15 @@ export interface ReplayFrames {
 
 type Attachment = { playerId: string | null };
 
-/** 持ち時間切れのログは player = ""、action = {"$timeout":[...]} で表す。 */
-const TIMEOUT_PLAYER = "";
+/**
+ * サーバーが書くログの行は player = "" で表す（プレイヤー ID と衝突しない）。
+ * 持ち時間切れは action = {"$timeout":[...]}、投了は action = {"$resign":"p1"}。
+ */
+const SYSTEM_PLAYER = "";
+const systemEvent = z.union([
+  z.strictObject({ $timeout: z.array(z.string()) }),
+  z.strictObject({ $resign: z.string() }),
+]);
 
 /**
  * D1 への結果書き込みが失敗したときの再試行（alarm で指数バックオフ、最大1時間おき）。
@@ -173,12 +188,19 @@ export class GameRoom extends DurableObject<Env> {
     return getGame(this.getMeta("gameId")!)!;
   }
 
-  /** ゲーム自身の結果。なければ時間切れによる決着（forfeit）。 */
+  /** ゲーム自身の結果。なければ時間切れ・投了による決着（forfeit）。 */
   private resultOf(game: AnyGame, state: unknown): GameResult | null {
     const r = game.result(state);
     if (r) return r;
     const f = this.getMeta("forfeit");
     return f ? (JSON.parse(f) as GameResult) : null;
+  }
+
+  /** 試合が終わった理由。endReason が無いのは通常の決着か、endReason 導入前の時間切れ。 */
+  private endReason(): EndReason {
+    const r = this.getMeta("endReason");
+    if (r === "timeout" || r === "resign") return r;
+    return this.getMeta("forfeit") !== null ? "timeout" : "normal";
   }
 
   private deadline(): number | null {
@@ -256,7 +278,7 @@ export class GameRoom extends DurableObject<Env> {
   }
 
   private endMessage(r: GameResult): ServerMessage {
-    return { type: "end", winners: r.winners, ...(r.scores ? { scores: r.scores } : {}) };
+    return { type: "end", winners: r.winners, ...(r.scores ? { scores: r.scores } : {}), reason: this.endReason() };
   }
 
   /**
@@ -432,10 +454,10 @@ export class GameRoom extends DurableObject<Env> {
       // 練習試合は戦績・試合一覧に載せない（ランダム相手の勝ち数で戦績が水増しされないように）
       if (!id || !this.env.DB || this.options().practice) return true;
       const players = this.sql.exec("SELECT id, user_id FROM players ORDER BY seq").toArray();
-      // 時間切れによる決着（forfeit）に引き分けはない。勝者がいなければ全員の負け。
-      const byTimeout = this.getMeta("forfeit") !== null;
+      // 時間切れ・投了による決着（forfeit）に引き分けはない。勝者がいなければ全員の負け。
+      const byForfeit = this.getMeta("forfeit") !== null;
       const outcome = (pid: string) =>
-        result.winners.includes(pid) ? "win" : result.winners.length === 0 && !byTimeout ? "draw" : "loss";
+        result.winners.includes(pid) ? "win" : result.winners.length === 0 && !byForfeit ? "draw" : "loss";
       const index = this.indexStatement();
       await this.env.DB.batch([
         ...(index ? [index] : []),
@@ -450,7 +472,7 @@ export class GameRoom extends DurableObject<Env> {
             JSON.stringify(players.map((p) => p.id)),
             Number(this.getMeta("startedAt")),
             Number(this.getMeta("finishedAt")),
-            byTimeout ? "timeout" : "normal",
+            this.endReason(),
           ),
         ...players.map((p) =>
           this.env.DB
@@ -646,6 +668,47 @@ export class GameRoom extends DurableObject<Env> {
     return r.ok ? ok(this.buildState(pid)) : r;
   }
 
+  /** REST の投了。 */
+  async resign(token: string | null): Promise<RoomResult<RoomState>> {
+    if (!this.exists()) return NOT_FOUND;
+    const pid = this.playerByToken(token);
+    if (!pid) return fail(401, "UNAUTHORIZED", "valid player token required");
+    const r = await this.resignAs(pid);
+    return r.ok ? ok(this.buildState(pid)) : r;
+  }
+
+  /**
+   * REST / WS 共通の投了。手番に関係なく、試合中ならいつでもできる。
+   * 既定では投了したプレイヤーの負けで残り全員が勝つ。ゲームが onResign を定義していればそれに従う（試合が続くこともある）。
+   * ログには1ターンとして残すので、リプレイでも同じ結果になる。
+   */
+  private async resignAs(pid: string | null): Promise<RoomResult<null>> {
+    if (!pid) return fail(401, "UNAUTHORIZED", "valid player token required");
+    await this.ensureAlarm();
+    if (this.status() !== "playing") return fail(409, "NOT_PLAYING", "game is not in progress");
+    // 締め切りを過ぎていれば先に時間切れを確定させる（それで決着したら投了は不要）
+    if (this.deadlinePassed()) {
+      await this.resolveTimeout();
+      if (this.status() !== "playing") return fail(409, "NOT_PLAYING", "game is not in progress");
+    }
+    // ここから commit まで await を挟まない
+    const game = this.game();
+    const snap = this.loadSnapshot();
+    let r: ReturnType<typeof applyResign>;
+    try {
+      r = applyResign(game, snap.state, pid, this.playerIds(), this.seed(), snap.turn);
+    } catch (e) {
+      if (e instanceof GameError) return fail(e.code === "NOT_YOUR_TURN" ? 403 : 400, e.code, e.message);
+      throw e;
+    }
+    await this.commit(() => {
+      this.appendSystemLog(snap.turn, { $resign: pid });
+      this.saveSnapshot(snap.turn + 1, r.state);
+      this.recordForfeit(game, r, "resign");
+    }, game.currentPlayers(snap.state));
+    return ok(null);
+  }
+
   /** REST / WS 共通の行動処理。存在するルームで、認証済みの playerId（観戦者は null）を受け取る。 */
   private async actAs(pid: string | null, turn: number, rawAction: unknown): Promise<RoomResult<null>> {
     if (!pid) return fail(401, "UNAUTHORIZED", "valid player token required");
@@ -683,13 +746,22 @@ export class GameRoom extends DurableObject<Env> {
     return ok(null);
   }
 
-  /** 行動ログへの追記。timeout を渡すと持ち時間切れの行になる（符号化は readLog と対）。 */
-  private appendLog(turn: number, player: string, action: unknown, timeout?: string[]): void {
+  /** 行動ログへの追記（符号化は readLog と対）。 */
+  private appendLog(turn: number, player: string, action: unknown): void {
+    this.appendRow(turn, player, action);
+  }
+
+  /** サーバーが書く行（持ち時間切れ・投了）。 */
+  private appendSystemLog(turn: number, event: { $timeout: string[] } | { $resign: string }): void {
+    this.appendRow(turn, SYSTEM_PLAYER, event);
+  }
+
+  private appendRow(turn: number, player: string, action: unknown): void {
     this.sql.exec(
       "INSERT INTO actions(turn, player, action, at) VALUES (?, ?, ?, ?)",
       turn,
-      timeout ? TIMEOUT_PLAYER : player,
-      JSON.stringify(timeout ? { $timeout: timeout } : action),
+      player,
+      JSON.stringify(action),
       Date.now(),
     );
   }
@@ -701,9 +773,12 @@ export class GameRoom extends DurableObject<Env> {
       .map((r) => {
         const action = JSON.parse(r.action as string) as unknown;
         const at = r.at as number;
-        if (r.player === TIMEOUT_PLAYER) {
-          const timeout = (action as { $timeout: string[] }).$timeout;
-          return { turn: r.turn as number, player: null, action: null, at, timeout };
+        if (r.player === SYSTEM_PLAYER) {
+          const base = { turn: r.turn as number, player: null, action: null, at };
+          const ev = systemEvent.safeParse(action);
+          // 知らない形の行を時間切れなどと読み替えると、リプレイの結果が実際の試合とずれる
+          if (!ev.success) throw new Error(`corrupt system log row at turn ${base.turn}`);
+          return "$resign" in ev.data ? { ...base, resign: ev.data.$resign } : { ...base, timeout: ev.data.$timeout };
         }
         return { turn: r.turn as number, player: r.player as string, action, at };
       });
@@ -788,7 +863,9 @@ export class GameRoom extends DurableObject<Env> {
       if (msg.data.type === "ping") return this.send(ws, { type: "pong" });
 
       const att = ws.deserializeAttachment() as Attachment | null;
-      const r = await this.actAs(att?.playerId ?? null, msg.data.turn, msg.data.action);
+      const pid = att?.playerId ?? null;
+      const r =
+        msg.data.type === "resign" ? await this.resignAs(pid) : await this.actAs(pid, msg.data.turn, msg.data.action);
       if (!r.ok) this.send(ws, { type: "error", code: toWsErrorCode(r.code), message: r.message });
       // 成功時の state は afterChange の broadcast で全員に届く
     } catch (e) {
@@ -850,9 +927,19 @@ export class GameRoom extends DurableObject<Env> {
     const r = applyTimeout(game, snap.state, pending, this.playerIds(), this.seed(), snap.turn);
 
     await this.commit(() => {
-      this.appendLog(snap.turn, TIMEOUT_PLAYER, null, pending);
+      this.appendSystemLog(snap.turn, { $timeout: pending });
       this.saveSnapshot(snap.turn + 1, r.state);
-      if (r.forfeit) this.setMeta("forfeit", JSON.stringify(r.forfeit));
+      this.recordForfeit(game, r, "timeout");
     });
+  }
+
+  /**
+   * 時間切れ・投了の結果を meta に残す（commit の write の中で呼ぶ）。
+   * forfeit があれば決着として保存し、試合が終わるなら（forfeit か、onTimeout / onResign の結果で決着）endReason を立てる。
+   * 試合が続くときは endReason を書かない（後で通常の手で決着したら normal）。
+   */
+  private recordForfeit(game: AnyGame, r: { state: unknown; forfeit: GameResult | null }, reason: EndReason): void {
+    if (r.forfeit) this.setMeta("forfeit", JSON.stringify(r.forfeit));
+    if (r.forfeit || game.result(r.state)) this.setMeta("endReason", reason);
   }
 }

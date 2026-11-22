@@ -1,5 +1,6 @@
 import { createRoute, OpenAPIHono, z } from "@hono/zod-openapi";
 import { newApiKey, newUserId, sha256Hex } from "../lib/auth";
+import { END_REASONS, type EndReason } from "../lib/protocol";
 import { errBody, errors, validationHook } from "./schemas";
 
 export const userRoutes = new OpenAPIHono<{ Bindings: Env }>({ defaultHook: validationHook });
@@ -86,7 +87,7 @@ const MatchSchema = z.object({
   players: z.array(z.string()),
   startedAt: z.number(),
   finishedAt: z.number(),
-  reason: z.enum(["normal", "timeout"]),
+  reason: z.enum(END_REASONS),
   results: z.array(
     z.object({ playerId: z.string(), userId: z.string().nullable(), outcome: z.string(), score: z.number().nullable() }),
   ),
@@ -122,7 +123,7 @@ userRoutes.openapi(
     )
       .bind(game ?? null, limit)
       .all<{
-        id: string; game: string; players: string; started_at: number; finished_at: number; reason: "normal" | "timeout";
+        id: string; game: string; players: string; started_at: number; finished_at: number; reason: EndReason;
         player_id: string; user_id: string | null; outcome: string; score: number | null;
       }>();
     const byId = new Map<string, z.infer<typeof MatchSchema>>();

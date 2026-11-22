@@ -5,7 +5,9 @@ import { GameError } from "../../src/games/types";
 import { createRng, rngForTurn } from "../../src/lib/rng";
 import { gameRules, rulesMarkdown } from "../../src/lib/rules";
 import { practiceAction } from "../../src/lib/practice";
-import { applyTimeout, replay, type LogEntry } from "../../src/lib/replay";
+import { applyResign, applyTimeout, replay, type LogEntry } from "../../src/lib/replay";
+import type { AnyGame } from "../../src/games/types";
+import { elimination, type ElimState } from "../fixtures/elimination";
 
 const PLAYERS = ["p1", "p2"];
 
@@ -175,5 +177,37 @@ describe("rng", () => {
     const counts = Array<number>(10).fill(0);
     for (let i = 0; i < 100_000; i++) counts[r.int(10)]!++;
     for (const c of counts) expect(Math.abs(c - 10_000)).toBeLessThan(500);
+  });
+});
+
+describe("投了（applyResign / replay）", () => {
+  it("onResign 未定義のゲームは投了者の負けで、状態は変えない", () => {
+    const game = games["tictactoe"]!;
+    const s = game.init(PLAYERS, "x");
+    const r = applyResign(game, s, "p1", PLAYERS, "x", 0);
+    expect(r.state).toEqual(s);
+    expect(r.forfeit).toEqual({ winners: ["p2"], scores: { p1: 0, p2: 1 } });
+  });
+
+  it("onResign があればそれに従い、試合が続くこともある。リプレイでも同じ結果になる", () => {
+    const players = ["p1", "p2", "p3"];
+    const actions: LogEntry[] = [
+      { turn: 0, player: null, action: null, at: 0, resign: "p2" }, // p2 が抜けても続く
+      { turn: 1, player: "p1", action: { pass: true }, at: 0 },
+      { turn: 2, player: null, action: null, at: 0, resign: "p1" }, // p1 が抜けて p3 の勝ち
+    ];
+    const mid = applyResign(elimination as AnyGame, elimination.init(players, "s"), "p2", players, "s", 0);
+    expect(mid.forfeit).toBeNull();
+    expect(elimination.result(mid.state as ElimState)).toBeNull();
+
+    const r = replay(elimination as AnyGame, { game: elimination.id, seed: "s", players, actions });
+    expect(r.turn).toBe(3);
+    expect(r.result).toEqual({ winners: ["p3"] });
+  });
+
+  it("onResign が拒否した投了は GameError", () => {
+    const s = elimination.init(["p1", "p2", "p3"], "s");
+    const once = applyResign(elimination as AnyGame, s, "p2", ["p1", "p2", "p3"], "s", 0).state;
+    expect(() => applyResign(elimination as AnyGame, once, "p2", ["p1", "p2", "p3"], "s", 1)).toThrow(GameError);
   });
 });

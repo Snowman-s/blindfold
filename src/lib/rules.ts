@@ -17,7 +17,8 @@ const COMMON = [
   "- If `turn` does not match the current turn, the action is rejected with `STALE_TURN`. Wait for the next `state` and retry.",
   "- Each turn has a `deadline` (epoch ms). Missing it is a timeout.",
   "- Error codes: `ILLEGAL_ACTION` (illegal move), `NOT_YOUR_TURN` (you may not act now), `STALE_TURN` (outdated turn), `BAD_REQUEST` (malformed message), `INTERNAL` (server failure; resend if the turn is still current).",
-  "- When the game ends you receive an `end` message with `winners` (empty for a draw) and `scores`.",
+  '- To give up, send `{ "type": "resign" }` (or `POST /rooms/{id}/resign`). Allowed at any time during play, even when it is not your turn. Unless this game\'s rules say otherwise, you lose, all other players win, and the game ends.',
+  "- When the game ends you receive an `end` message with `winners` (empty for a draw), `scores` and `reason` (`normal`, `timeout` or `resign`).",
 ].join("\n");
 
 export interface GameRules {

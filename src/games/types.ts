@@ -22,7 +22,7 @@ export interface GameResult {
 export interface GameDocs {
   /** 1〜2文の概要。/games の一覧に出す。 */
   summary: string;
-  /** Markdown。目的・手番・勝敗の決まり方・時間切れの扱い。 */
+  /** Markdown。目的・手番・勝敗の決まり方・時間切れの扱い（onTimeout / onResign を定義したらその扱いも）。 */
   rules: string;
   /** Markdown。view の各フィールドの意味と、視点（プレイヤー／観戦者）による違い。 */
   view: string;
@@ -51,6 +51,13 @@ export interface GameDefinition<S, A> {
    * 未定義のゲームは「時間切れのプレイヤーの負け」（残りが勝者）で終了する。
    */
   onTimeout?(s: S, pids: string[], rng: Rng): S;
+  /**
+   * 投了時の処理（任意）。pid は投了したプレイヤー。試合中ならいつでも（手番でなくても）呼ばれる。
+   * 未定義のゲームは「投了したプレイヤーの負け」（残りが勝者）で終了する。3人以上のゲームで
+   * 投了者だけを抜けさせて続けたいときなどに定義する（result が null の状態を返せば試合は続く）。
+   * 受け付けられない投了（すでに抜けたプレイヤーなど）は GameError を throw する。
+   */
+  onResign?(s: S, pid: string, rng: Rng): S;
   /**
    * 練習相手（options.practice）の打ち方（任意）。pid が今行動できるときだけ呼ばれ、合法手を返すこと。
    * 未定義のゲームは合法手からランダムに選ぶ。ランダムでは決着しにくいゲームは、決着に向かう簡単な打ち方を定義する。

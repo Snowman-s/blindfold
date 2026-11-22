@@ -29,6 +29,8 @@ export const CHANGELOG: ChangelogEntry[] = [
       "On a simultaneous turn, an action whose `turn` is older than the current one but from the same simultaneous turn " +
         "(other players acted in between) is accepted while the sender may still act, instead of failing with `STALE_TURN`. " +
         "Duplicates and turns from before the simultaneous turn still get `STALE_TURN`.",
+      "A resign that does not change who may act now (for example by a player who already acted on a simultaneous turn) " +
+        "keeps the current deadline and simultaneous turn, so in-flight actions are still accepted and nobody gets extra time.",
     ],
   },
   {

@@ -48,6 +48,27 @@ describe("frontier（部屋で通しで遊ぶ）", () => {
     expect((await send(ps[1], 3)).status).toBe(200);
   });
 
+  it("出し終えた人がラウンドの途中で投了しても、締め切りは延びず、見ていた turn の命令も受け付ける", async () => {
+    const { json } = await call("POST", "/rooms", { body: { game: "frontier", options: { seats: 3 } } });
+    const ps = [];
+    for (let i = 0; i < 3; i++) ps.push((await call("POST", `/rooms/${json.roomId}/join`)).json);
+    await call("POST", `/rooms/${json.roomId}/start`, { token: json.hostToken });
+    const send = (p: { token: string }, turn: number) =>
+      call("POST", `/rooms/${json.roomId}/action`, { token: p.token, body: { turn, action: { orders: [] } } });
+    expect((await send(ps[0], 0)).status).toBe(200);
+    expect((await send(ps[1], 0)).status).toBe(200);
+    const before = (await call("GET", `/rooms/${json.roomId}/state`)).json;
+    expect(before.currentPlayers).toEqual([ps[2].playerId]);
+    expect((await call("POST", `/rooms/${json.roomId}/resign`, { token: ps[0].token })).status).toBe(200);
+    const after = (await call("GET", `/rooms/${json.roomId}/state`)).json;
+    expect(after.turn).toBe(before.turn + 1);
+    expect(after.currentPlayers).toEqual([ps[2].playerId]);
+    expect(after.deadline).toBe(before.deadline);
+    // p3 は turn 0 の state を見て送っていた
+    expect((await send(ps[2], 0)).status).toBe(200);
+    expect((await call("GET", `/rooms/${json.roomId}/state`)).json.view.round).toBe(1);
+  });
+
   it("不正な命令は ILLEGAL_ACTION で、どの命令かを示す", async () => {
     const { json } = await call("POST", "/rooms", { body: { game: "frontier", options: { practice: true } } });
     const me = (await call("POST", `/rooms/${json.roomId}/join`)).json;

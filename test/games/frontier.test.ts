@@ -245,6 +245,30 @@ describe("frontier: 時間切れ・投了", () => {
     checkInvariant(s);
   });
 
+  it("残っている全員が同時に時間切れで抜けたら、誰も残らず引き分け（winners が空）", () => {
+    let s = board();
+    for (let i = 0; i < MAX_MISSED; i++) s = g.onTimeout!(s, ["p1", "p2"], rng);
+    expect(s.alive).toEqual([]);
+    expect(s.out).toEqual({ p1: "timedOut", p2: "timedOut" });
+    expect(g.result(s)).toEqual({ winners: [], scores: { p1: 0, p2: 0 } });
+    checkInvariant(s);
+  });
+
+  it("ラウンドの解決ではプレイヤーの持つノードは減らない（互いの最後のノードを取り合っても誰かが残る）", () => {
+    // 0 - 1 - 2 の一本道で p1 は 0、p2 は 2 だけを持ち、1 は中立
+    const s0 = board({
+      nodes: [
+        { production: 1, owner: "p1", troops: 5 },
+        { production: 1, owner: null, troops: 0 },
+        { production: 1, owner: "p2", troops: 5 },
+        { production: 1, owner: null, troops: 0 },
+      ],
+    });
+    const s = both(s0, [{ from: 0, to: 1, count: 5 }], [{ from: 2, to: 1, count: 5 }]);
+    expect(s.alive).toEqual(["p1", "p2"]);
+    checkInvariant(s);
+  });
+
   it("投了した人が出していた命令は捨てる。抜けた人の投了は ILLEGAL_ACTION", () => {
     const three = board({
       players: ["p1", "p2", "p3"],

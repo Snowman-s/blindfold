@@ -176,12 +176,20 @@ export function decideTimeout(
 /**
  * 同じ同時手番が続いているか：prev（変更前に行動できたプレイヤー）から、行動できるプレイヤーが減っただけ
  * （同時手番で誰かが出した・抜けた）なら true。手番が移ったとき・新しいラウンドに入ったときは false。
+ * unchangedKeeps は「行動できるプレイヤーが変わらなかった」ときも true にするか。投了のときだけ true：
+ * 通常の手で同じ顔ぶれになるのは新しいラウンド（全員が出し終えた）だが、もう出した人や手番でない人の投了では
+ * 顔ぶれが変わらないまま同じ手番が続く（締め切りを延ばしたり、送信中の手を STALE_TURN にしたりしない）。
  */
-export const sameSimultaneousTurn = (prev: string[] | null, prevDeadline: number | null, pending: string[]): boolean =>
+export const sameSimultaneousTurn = (
+  prev: string[] | null,
+  prevDeadline: number | null,
+  pending: string[],
+  unchangedKeeps = false,
+): boolean =>
   prev !== null &&
   prevDeadline !== null &&
   pending.length > 0 &&
-  pending.length < prev.length &&
+  (pending.length < prev.length || (unchangedKeeps && pending.length === prev.length)) &&
   pending.every((p) => prev.includes(p));
 
 /** 次の締め切り。同じ同時手番が続いているなら前の締め切りのまま、そうでなければ持ち時間をリセットする。 */
@@ -191,8 +199,9 @@ export function nextDeadline(
   pending: string[],
   now: number,
   turnTimeMs: number,
+  unchangedKeeps = false,
 ): number {
-  return sameSimultaneousTurn(prev, prevDeadline, pending) ? prevDeadline! : now + turnTimeMs;
+  return sameSimultaneousTurn(prev, prevDeadline, pending, unchangedKeeps) ? prevDeadline! : now + turnTimeMs;
 }
 
 /**
@@ -222,6 +231,8 @@ export function settle(
         turn: number;
         /** write 前の phaseTurn（記録の無いルームは null） */
         prevPhaseTurn: number | null;
+        /** write が投了か（行動できるプレイヤーが変わらなければ同じ手番が続く。sameSimultaneousTurn） */
+        resign?: boolean;
       },
   now: number,
 ): Settlement {
@@ -229,10 +240,11 @@ export function settle(
   const result = resultOf(room.game, room.state, room.forfeit);
   if (result) return { kind: "finished", result, finishedAt: now, cleanupAt: now + FINISHED_ROOM_TTL_MS };
   const pending = room.game.currentPlayers(room.state);
-  const same = sameSimultaneousTurn(room.prev, room.prevDeadline, pending);
+  const keep = room.resign ?? false;
+  const same = sameSimultaneousTurn(room.prev, room.prevDeadline, pending, keep);
   return {
     kind: "playing",
-    deadline: nextDeadline(room.prev, room.prevDeadline, pending, now, room.turnTimeMs),
+    deadline: nextDeadline(room.prev, room.prevDeadline, pending, now, room.turnTimeMs, keep),
     phaseTurn: same && room.prevPhaseTurn !== null ? room.prevPhaseTurn : room.turn,
   };
 }

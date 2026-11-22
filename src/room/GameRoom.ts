@@ -361,8 +361,9 @@ export class GameRoom extends DurableObject<Env> {
    * write と、決着判定・締め切りの更新を1つのトランザクションで確定し、その後で alarm・配信・D1 を行う。
    * 確定後の副作用が失敗しても変更は取り消さず成功として扱う（クライアントには確定済みの状態を配る）。
    * prev は write 前に行動できたプレイヤー（締め切りを延ばすかどうかの判定。nextDeadline）。
+   * resign は write が投了か（行動できるプレイヤーが変わらなければ締め切りと phaseTurn をそのまま残す。settle）。
    */
-  private async commit(write: () => void, prev: string[] | null = null): Promise<void> {
+  private async commit(write: () => void, prev: string[] | null = null, resign = false): Promise<void> {
     const out = this.ctx.storage.transactionSync((): Settlement => {
       const s = this.store;
       const prevDeadline = s.deadline();
@@ -379,6 +380,7 @@ export class GameRoom extends DurableObject<Env> {
           prev,
           prevDeadline,
           prevPhaseTurn,
+          resign,
           turnTimeMs: s.options().turnTimeMs ?? DEFAULT_TURN_TIME_MS,
         };
       };
@@ -921,7 +923,7 @@ export class GameRoom extends DurableObject<Env> {
     await this.commit(() => {
       this.store.appendSystem(snap.turn, { $resign: pid });
       this.writeResolution(snap.turn, r.data);
-    }, game.currentPlayers(snap.state));
+    }, game.currentPlayers(snap.state), true);
     return ok(null);
   }
 

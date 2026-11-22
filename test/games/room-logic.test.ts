@@ -162,6 +162,22 @@ describe("同時手番の phaseTurn と acceptsTurn", () => {
     });
   });
 
+  it("投了で行動できる人が変わらなければ（もう出した人の投了）phaseTurn と締め切りを引き継ぐ。通常の手なら新しいラウンド", () => {
+    // p1 は出し済みで p2 だけが残っている。p1 が投了しても行動できるのは p2 のまま
+    expect(
+      settle({ status: "playing", ...base, state: s1, prev: ["p2"], turn: 6, prevPhaseTurn: 4, resign: true }, 10),
+    ).toEqual({ kind: "playing", deadline: 5000, phaseTurn: 4 });
+    expect(settle({ status: "playing", ...base, state: s1, prev: ["p2"], turn: 6, prevPhaseTurn: 4 }, 10)).toEqual({
+      kind: "playing",
+      deadline: 1010,
+      phaseTurn: 6,
+    });
+    // 投了でも顔ぶれが変われば手番が移ったとみなす
+    expect(
+      settle({ status: "playing", ...base, state: s1, prev: ["p1"], turn: 6, prevPhaseTurn: 4, resign: true }, 10),
+    ).toMatchObject({ deadline: 1010, phaseTurn: 6 });
+  });
+
   it("同じ同時手番の中の古い turn は、送った人がまだ行動できれば受け付ける。二重送信・前の手番の turn は STALE_TURN", () => {
     const snap = { turn: 5, state: s1 };
     const p2card = s0.hands["p2"]![0]!;

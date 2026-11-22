@@ -3,6 +3,8 @@
   "name": "apigames",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-01",
+  // 本番の console.* をダッシュボードで見られるようにする（Free プランでも可）
+  "observability": { "enabled": true },
   "durable_objects": {
     "bindings": [{ "name": "GAME_ROOM", "class_name": "GameRoom" }]
   },

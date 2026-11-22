@@ -1,12 +1,12 @@
 /**
  * WS のサブプロトコル（プロトコルの版）。クライアントは対応する版を1つ以上提示し、サーバーはその中で最も新しいものを選んで応答する。
- * 1.0 以降に WS の破壊的変更をするときは新しい版（apigames.v2）を足し、古い版はしばらく並べて残す。
+ * 1.0 以降に WS の破壊的変更をするときは新しい版（blindfold.v2）を足し、古い版はしばらく並べて残す。
  * 新しい順に並べる。WS_PROTOCOL は今の最新版。
  */
-export const WS_PROTOCOLS = ["apigames.v1"] as const;
+export const WS_PROTOCOLS = ["blindfold.v1"] as const;
 export const WS_PROTOCOL = WS_PROTOCOLS[0];
-/** WS でトークンを渡すサブプロトコルの接頭辞。`apigames.token.<token>` の形で送る（版を含まない）。 */
-export const WS_TOKEN_PROTOCOL_PREFIX = "apigames.token.";
+/** WS でトークンを渡すサブプロトコルの接頭辞。`blindfold.token.<token>` の形で送る（版を含まない）。 */
+export const WS_TOKEN_PROTOCOL_PREFIX = "blindfold.token.";
 
 /**
  * REST 用: `Authorization: Bearer <token>` からトークンを取り出す。
@@ -25,7 +25,7 @@ export type WsAuth =
 
 /**
  * WS 用: ブラウザの WebSocket はヘッダーを付けられないので、サブプロトコルでトークンを受け取る。
- *   new WebSocket(url, ["apigames.v1", "apigames.token.<token>"])
+ *   new WebSocket(url, ["blindfold.v1", "blindfold.token.<token>"])
  * 版のサブプロトコルは必須（未指定を v1 とみなすと、v1 を外したときに黙って壊れるため）。
  * 応答ではトークンを含まない版のサブプロトコルを選ぶ（トークンを応答ヘッダーに載せないため）。
  * トークンのサブプロトコルが無ければ Authorization: Bearer（Node などヘッダーを付けられるクライアント向け）。

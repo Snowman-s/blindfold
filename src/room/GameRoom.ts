@@ -83,7 +83,7 @@ export interface ReplayFrames {
 /**
  * WS に持たせる情報。tokenHash は接続時に使ったトークンのハッシュ（attachment も保存されるので、トークンそのものは持たない）。
  * 再戦ルームでは退出した席に同じ ID で座り直せるので、ID だけでなくトークンも一致する接続だけをその席として扱う。
- * protocol は交渉したサブプロトコル（apigames.v1 など）。版ごとに配信を変えるときに使う。
+ * protocol は交渉したサブプロトコル（blindfold.v1 など）。版ごとに配信を変えるときに使う。
  * at は接続した時刻（同じ席の接続が上限を超えたとき、いちばん古いものを閉じるため。getWebSockets() の順序は保証されない）。
  * strikes / strikeAt はエラーのリーキーバケット（WS_MAX_STRIKES）。strikeAt の時点で strikes 溜まっていた、という意味。
  */

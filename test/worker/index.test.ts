@@ -10,13 +10,13 @@ import { BASE } from "./helpers";
 it("GET / はガイドへの入口を返す", async () => {
   const res = await SELF.fetch(`${BASE}/`);
   expect(res.status).toBe(200);
-  expect(await res.json()).toMatchObject({ name: "apigames", ok: true, guide: `${BASE}/guide.md`, openapi: `${BASE}/openapi.json` });
+  expect(await res.json()).toMatchObject({ name: "blindfold", ok: true, guide: `${BASE}/guide.md`, openapi: `${BASE}/openapi.json` });
 });
 
 it("GET / は Accept: text/markdown ならガイド本文を返す", async () => {
   const res = await SELF.fetch(`${BASE}/`, { headers: { Accept: "text/markdown" } });
   expect(res.headers.get("Content-Type")).toMatch(/^text\/markdown/);
-  expect(await res.text()).toMatch(/^# apigames — Client Developer Guide/);
+  expect(await res.text()).toMatch(/^# blindfold — Client Developer Guide/);
 });
 
 describe("GET /guide.md", () => {

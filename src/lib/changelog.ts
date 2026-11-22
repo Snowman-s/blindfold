@@ -20,6 +20,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.6.0",
+    date: "2026-11-22",
+    breaking: [
+      "The service is renamed from apigames to blindfold, and its base URL changes with it. The WebSocket subprotocols " +
+        "are now `blindfold.v1` and `blindfold.token.<token>`; the `apigames.*` names are no longer accepted. " +
+        "Rooms, users and API keys from the old URL are not carried over.",
+    ],
+  },
+  {
     version: "0.5.0",
     date: "2026-11-22",
     breaking: [
@@ -117,7 +126,7 @@ function renderEntry(e: ChangelogEntry): string {
 
 function buildChangelog(): string {
   return [
-    "# apigames — Changelog",
+    "# blindfold — Changelog",
     "",
     `Current API version: ${API_VERSION}. Newest first. While the API version is 0.x, breaking changes may be released`,
     "without notice and are recorded here afterwards. See section 9 of `/guide.md` for what counts as breaking.",

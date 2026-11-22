@@ -1,266 +1,258 @@
 # CLAUDE.md
 
-## プロジェクト概要
+## Project overview
 
-自作の**ターン制ゲーム**を、画面なし（ヘッドレス）で **API だけで遊べる／観戦できる**ようにする配信基盤。
+A hosting platform that makes my own **turn-based games** **playable and watchable through an API alone**, with no screen (headless).
 
-- ゲームロジックはすべてサーバー側で動かす。クライアントは状態を受け取って描画するか、Bot として行動を送るだけ。
-- 複数のゲームを共通インターフェースで追加できるようにする（プラグイン的に）。
-- **無料枠（Cloudflare Workers Free プラン）の範囲で運用する**ことが前提。
+- All game logic runs on the server. A client only receives state and draws it, or acts as a bot and sends moves.
+- Multiple games can be added through a common interface (plugin-style).
+- **It must run within the free tier (Cloudflare Workers Free plan).**
+- Deployed at https://blindfold.snowesamosc.workers.dev.
 
-## 技術スタック
+## Tech stack
 
-| 役割 | 技術 |
+| Role | Technology |
 |---|---|
-| 言語 | TypeScript（strict） |
-| ランタイム / ホスティング | Cloudflare Workers |
-| HTTP ルーティング | Hono |
-| 試合ルーム（1試合 = 1インスタンス） | Durable Objects（**SQLite バックエンド**。Free プランは KV バックエンド不可） |
-| リアルタイム通信 | WebSocket（**Hibernation API** を必ず使う：`ctx.acceptWebSocket()`） |
-| 持ち時間・タイムアウト | Durable Object Alarms |
-| 永続データ（ユーザー・戦績・試合一覧） | D1 |
-| 観戦ビューア / API ドキュメント | Cloudflare Pages（後回しでよい） |
-| バリデーション / スキーマ | zod（+ `@hono/zod-openapi` で OpenAPI 生成） |
-| テスト | Vitest（`@cloudflare/vitest-pool-workers`） |
-| ツール | wrangler、pnpm |
+| Language | TypeScript (strict) |
+| Runtime / hosting | Cloudflare Workers |
+| HTTP routing | Hono |
+| Match rooms (1 match = 1 instance) | Durable Objects (**SQLite backend**; the Free plan does not allow the KV backend) |
+| Real-time | WebSocket (**always use the Hibernation API**: `ctx.acceptWebSocket()`) |
+| Turn time / timeouts | Durable Object Alarms |
+| Persistent data (users, results, match list) | D1 |
+| API docs | Served by the Worker itself (`/guide.md`, `/games/:id/rules`, `/openapi.json`). No spectator viewer is provided (users build their own clients) |
+| Validation / schemas | zod (+ `@hono/zod-openapi` for OpenAPI generation) |
+| Tests | Vitest (`@cloudflare/vitest-pool-workers`) |
+| Tooling | wrangler, pnpm |
 
-## アーキテクチャ
+## Architecture
 
 ```
-クライアント（Bot / 自作UI / 観戦ビューア）
-   │  REST: ルーム作成・参加・状態取得
-   │  WebSocket: 行動送信・状態配信
+Client (bot / own UI / own spectator viewer)
+   │  REST: create / join rooms, get state
+   │  WebSocket: send moves, receive state
    ▼
-Worker（Hono）… 認証、ルーティング、DO への転送
+Worker (Hono) … auth, routing, forwarding to the DO
    ▼
-Durable Object「GameRoom」… 1試合 = 1インスタンス（idFromName(roomId)）
-   ├ ゲームエンジン（games/ 配下の純粋関数）
-   ├ SQLite … メタ情報・状態スナップショット・行動ログ
-   └ Alarm … 手番の持ち時間切れ処理
+Durable Object "GameRoom" … 1 match = 1 instance (idFromName(roomId))
+   ├ Game engine (pure functions under games/)
+   ├ SQLite … metadata, state snapshot, action log
+   └ Alarm … turn time-outs
    ▼
-D1 … users, matches, results, rooms（一覧用の索引）
+D1 … users, matches, results, rooms (index for listing)
 ```
 
-## ディレクトリ構成（予定）
+## Directory layout
 
 ```
 src/
-  index.ts            # Worker エントリ（Hono app + DO の export）
-  routes/             # REST ルート
-  room/GameRoom.ts    # Durable Object（RPC の入口・トランザクション・alarm・配信・D1 の実行・練習相手）
-  room/logic.ts       # ルームの状態遷移（commit で確定する状態 settle、alarm の判断 planAlarm / wantedAlarm、D1 再試行の間隔）と配る状態の組み立て（純粋関数。Node でテストできる）
-  room/store.ts       # DO 内 SQLite の読み書き（RoomStore。GameRoom からは SQL を書かない）。meta のキーと型は META に1か所で定義する
-  room/d1.ts          # D1 に書く文（matches / results / rooms 索引）の組み立て
-  room/schema.ts      # DO 内 SQLite のスキーマと移行（MIGRATIONS。列やテーブルを足すときはここ）
+  index.ts            # Worker entry (Hono app + DO export)
+  routes/             # REST routes (rooms.ts, users.ts, shared response schemas in schemas.ts)
+  room/GameRoom.ts    # Durable Object (RPC entry points, transactions, alarm, broadcast, running D1 writes, practice opponents)
+  room/logic.ts       # Room state transitions (settle: the state committed; alarm decisions planAlarm / wantedAlarm; D1 retry intervals) and building the state sent to clients (pure functions, testable in Node)
+  room/store.ts       # Reads/writes of the DO's SQLite (RoomStore; GameRoom writes no SQL). meta keys and types are defined once in META
+  room/d1.ts          # Builds the D1 statements (matches / results / rooms index)
+  room/schema.ts      # DO SQLite schema and migrations (MIGRATIONS; add columns or tables here)
   games/
-    types.ts          # GameDefinition インターフェース
-    registry.ts       # gameId -> GameDefinition（今の版だけ）。getGame(id, rulesVersion?) は版が一致するときだけ返す
-    tictactoe/        # 最初のサンプルゲーム（index.ts = GameDefinition、docs.ts = LLM 向けの説明）
-    highcard/         # 隠し情報 + 同時手番のカードゲーム
+    types.ts          # GameDefinition interface
+    registry.ts       # gameId -> GameDefinition (current version only). getGame(id, rulesVersion?) returns only when the version matches
+    tictactoe/        # First sample game (index.ts = GameDefinition, docs.ts = description for clients)
+    highcard/         # Card game with hidden information + simultaneous turns
   lib/
-    rng.ts            # シード付き疑似乱数（文字列シード → cyrb128 → sfc32。状態 128 ビット）
-    auth.ts           # プレイヤートークン発行・検証
-    protocol.ts       # WS メッセージの zod スキーマ
-    replay.ts         # 行動ログからの再現・時間切れ解決（純粋関数）
-    options.ts        # ルームオプション（turnTimeMs、practice）とゲーム固有オプションの検証（parseGameOptions）
-    rules.ts          # ゲームの説明（/games/:id/rules）の組み立て
-    guide.ts          # クライアント開発者向けガイド（/guide.md）の生成
-    changelog.ts      # API の変更履歴（/changelog.md）。API_VERSION を上げたら先頭に足す
-    deprecation.ts    # Deprecation / Sunset ヘッダーのヘルパー（deprecated() ミドルウェア、markDeprecated()）
-    ratelimit.ts      # IP ごとのレート制限（Rate Limiting バインディング。429 RATE_LIMITED + Retry-After）
-    examples.ts       # ガイド・rules に載せる state / end / ログの例（実エンジン + 固定シードから作る）
+    rng.ts            # Seeded PRNG (string seed → cyrb128 → sfc32; 128-bit state)
+    auth.ts           # Issuing and verifying player tokens
+    protocol.ts       # zod schemas for WS messages
+    replay.ts         # Reproduction from the action log, timeout resolution (pure functions)
+    practice.ts       # How the practice opponent picks a move (practiceAction, otherwise a random legal move)
+    version.ts        # API_VERSION and output JSON Schemas (outputJsonSchema)
+    options.ts        # Validation of room options (turnTimeMs, practice) and game-specific options (parseGameOptions)
+    rules.ts          # Builds the game description (/games/:id/rules)
+    guide.ts          # Generates the client developer guide (/guide.md)
+    changelog.ts      # API changelog (/changelog.md). Add an entry at the top when bumping API_VERSION
+    deprecation.ts    # Deprecation / Sunset header helpers (deprecated() middleware, markDeprecated())
+    ratelimit.ts      # Per-IP rate limiting (Rate Limiting bindings; 429 RATE_LIMITED + Retry-After)
+    examples.ts       # state / end / log examples for the guide and rules (built from the real engines + fixed seeds)
 bots/
-  random-bot.ts       # 合法手からランダムに選ぶ Bot（Node で実行）
-  bot-core.ts         # WS ループ（CLI とテストで共有）
-migrations/           # D1 マイグレーション
+  random-bot.ts       # Bot that picks a random legal move (runs in Node)
+  bot-core.ts         # WS loop (shared by the CLI and tests)
+migrations/           # D1 migrations
 test/
+doc/openapi.json      # Snapshot of the OpenAPI spec
 wrangler.jsonc
+README.md             # Repository introduction (English)
 ```
 
-## ゲーム共通インターフェース（最重要）
+## Common game interface (most important)
 
-すべてのゲームはこれを実装する。**副作用なしの純粋関数**にすること（`Math.random()`、`Date.now()`、I/O は禁止）。
+Every game implements this. They must be **pure functions with no side effects** (`Math.random()`, `Date.now()` and I/O are forbidden).
 
 ```ts
-export interface GameDefinition<S, A, O = null> {    // O = ゲーム固有のオプション（optionsSchema の出力）。無ければ null
-  id: string;                                  // "tictactoe" など
-  rulesVersion: number;                        // ルールの版（1 から）。シード + ログの再現が崩れる変更（rng の引き方も含む）で上げる。古い版は残さない（旧版のルームは GAME_REMOVED）
-  viewVersion: number;                         // view の形の版（1 から）。view の破壊的変更（削除・改名・型や意味の変更、enum への値の追加）で上げる。フィールドの追加では上げない
+export interface GameDefinition<S, A, O = null> {    // O = game-specific options (output of optionsSchema); null if none
+  id: string;                                  // e.g. "tictactoe"
+  rulesVersion: number;                        // Rules version (from 1). Bump on any change that breaks reproduction from seed + log (including how rng is drawn). Old versions are not kept (old-version rooms are GAME_REMOVED)
+  viewVersion: number;                         // View shape version (from 1). Bump on breaking view changes (removal, rename, type or meaning change, adding a value to an enum). Adding a field does not bump it
   minPlayers: number;
   maxPlayers: number;
-  actionSchema: z.ZodType<A>;                  // 受信した行動の検証用
-  viewSchema: z.ZodType;                       // view の返り値の形（全視点の和集合。strictObject）。JSON Schema にして /rules で配る
-  docs: GameDocs;                              // { summary, rules, view, examples, options? }。Bot 上の LLM が読む説明
-  optionsSchema?: z.ZodType<O>;                // 任意。ゲーム固有のオプション（POST /rooms の gameOptions）。strictObject で、{} を受け付けること（既定値は .default()）
-  init(players: string[], seed: Seed, options: O): S; // Seed = string（128 ビットの乱数を 16 進 32 文字で発行）。options は既定値を補った値（optionsSchema が無ければ null）
-  currentPlayers(s: S): string[];              // 今行動できるプレイヤー（同時手番も可）
-  legalActions?(s: S, pid: string): A[];       // 任意。state の legal として配る。合法手を列挙できないゲームは定義せず、apply だけで検証する
-  apply(s: S, pid: string, a: A, rng: Rng): S; // 不正な手は GameError を throw
-  view(s: S, pid: string | null): unknown;     // 隠し情報を除去。null は観戦者
+  actionSchema: z.ZodType<A>;                  // Validates incoming actions
+  viewSchema: z.ZodType;                       // Shape of view's return value (union over all viewpoints; strictObject). Served as JSON Schema from /rules
+  docs: GameDocs;                              // { summary, rules, view, examples, options? }. The description read by LLMs running bots
+  optionsSchema?: z.ZodType<O>;                // Optional. Game-specific options (gameOptions of POST /rooms). Must be a strictObject that accepts {} (defaults via .default())
+  init(players: string[], seed: Seed, options: O): S; // Seed = string (128 random bits as 32 hex chars). options has defaults filled in (null without optionsSchema)
+  currentPlayers(s: S): string[];              // Players who may act now (simultaneous turns allowed)
+  legalActions?(s: S, pid: string): A[];       // Optional. Sent as legal in the state. Games whose legal moves can't be enumerated leave it out and validate in apply only
+  apply(s: S, pid: string, a: A, rng: Rng): S; // Throws GameError on an illegal move
+  view(s: S, pid: string | null): unknown;     // Strips hidden information. null is a spectator
   result(s: S): null | { winners: string[]; scores?: Record<string, number> };
-  onTimeout?(s: S, pids: string[], rng: Rng): S; // 任意。未定義なら時間切れのプレイヤーの負け
-  onResign?(s: S, pid: string, rng: Rng): S;   // 任意。未定義なら投了者の負け（残り全員の勝ち）。3人以上で投了者だけ抜けて続けるときなどに定義
-  practiceAction?(s: S, pid: string, rng: Rng): A; // 練習相手の打ち方。未定義なら合法手からランダム。legalActions が無いゲームでは必須。返した手は人間の手と同じく検証し（decideAction）、通らなければ持ち時間切れ
+  onTimeout?(s: S, pids: string[], rng: Rng): S; // Optional. If undefined, the timed-out players lose
+  onResign?(s: S, pid: string, rng: Rng): S;   // Optional. If undefined, the resigning player loses (everyone else wins). Define it e.g. for 3+ players where only the resigner drops out
+  practiceAction?(s: S, pid: string, rng: Rng): A; // How the practice opponent plays. If undefined, a random legal move. Required when legalActions is missing. The returned move is validated like a human's (decideAction); if rejected, it times out
 }
 ```
 
-- 乱数は必ず渡された `seed` / `rng` から作る（`createRng(seed)`）。シードは 128 ビット。32 ビットだと観測した乱数から総当たりでシードを特定され、隠し情報が漏れる。**「初期シード + ゲームオプション + 行動ログ」だけで試合を完全に再現できること**を保証する（リプレイ・デバッグ・不正検証のため）。
-- ゲーム固有のオプションは、ルーム作成時に `optionsSchema` で検証して既定値を補った値を meta（`gameOptions`）に保存し、`init`・`/log`（`ReplayLog.gameOptions`）・D1 の `matches.game_options` に同じ値を使う。オプションの意味や既定値を変えるのはルールの変更（`rulesVersion` を上げる）。
-- 状態 `S` は JSON シリアライズ可能に保つ（Map、Set、クラスインスタンスは使わない）。
-- 隠し情報（手札など）は `view` の中だけで除去する。サーバーが送るのは常に `view` の結果だけ。
+- Randomness always comes from the given `seed` / `rng` (`createRng(seed)`). Seeds are 128-bit; with 32 bits the seed could be brute-forced from observed random values, leaking hidden information. Guarantee that **a match can be fully reproduced from "initial seed + game options + action log" alone** (for replays, debugging and cheat checks).
+- Game-specific options are validated with `optionsSchema` at room creation, defaults are filled in, and the result is stored in meta (`gameOptions`); the same value is used for `init`, `/log` (`ReplayLog.gameOptions`) and D1's `matches.game_options`. Changing the meaning or defaults of an option is a rules change (bump `rulesVersion`).
+- Keep the state `S` JSON-serializable (no Map, Set or class instances).
+- Hidden information (hands etc.) is stripped only inside `view`. The server only ever sends the output of `view`.
 
-## API 仕様
+## API spec
 
 ### REST
 
-| メソッド | パス | 内容 |
+| Method | Path | Description |
 |---|---|---|
-| GET | `/`（`Accept: text/markdown` ならガイド本文）、`/guide.md`、`/llms.txt` | クライアント開発者（コーディングエージェント）向けのガイド。URL を渡すだけでクライアントが書けることが目標。コードから生成し、`version` を ETag にする |
-| GET | `/changelog.md` | API の変更履歴（`src/lib/changelog.ts` から生成。内容のハッシュを ETag にする） |
-| GET | `/games` | 利用できるゲームの一覧（`summary`、`rulesVersion`、`viewVersion`、`listsLegalActions`、`hasOptions`、`rulesUrl` 付き） |
-| GET | `/games/:id/rules` | ゲームの説明（LLM 向け）。ルール・view の読み方・view / action / ゲームオプションの JSON Schema（`optionsSchema`・`defaultGameOptions`）・state の例（実エンジンから生成）・共通の遊び方。`version` を ETag にする |
-| GET | `/games/:id/rules.md` | 同じ内容を Markdown 1枚で。プロンプトにそのまま貼れる |
-| POST | `/rooms` | `{ game: string, options?: {...}, gameOptions?: {...} }` → `{ roomId, hostToken }`。未知のオプションは 400。`gameOptions` はゲーム固有のオプション（ゲームの `optionsSchema` で検証。持たないゲームに渡すと 400）。`options.practice: true` で開始時に空席をサーバー側の練習相手が埋める（打ち方は `practiceAction`、未定義ならランダム。D1 には記録しない）。`options.autoStart: true` で満席になったら自動開始（practice と併用不可）。`options.unlisted: true` で一覧・クイックマッチから外す |
-| GET | `/rooms` | 公開ルームの一覧（`gameOptions` 付き）。`?status=` は `waiting`（既定。空席あり・最終更新から30分以内）か `playing`（索引の最終更新から「持ち時間 + `PLAYING_LIST_GRACE_MS`（2時間）」以内）。`&game=&limit=` で絞り込み。D1 の `rooms` 索引から返す（best-effort。DO が正） |
-| POST | `/quickmatch` | `{ game, options?: { turnTimeMs }, gameOptions? }` → `{ roomId, playerId, token, created }`。同じゲーム・ゲームオプション（既定値を補った値）・持ち時間の autoStart の公開ルームに古い順で入り、無ければ作る |
+| GET | `/` (guide body if `Accept: text/markdown`), `/guide.md`, `/llms.txt` | Guide for client developers (coding agents). Goal: a client can be written from the URL alone. Generated from code; `version` is the ETag |
+| GET | `/changelog.md` | API changelog (generated from `src/lib/changelog.ts`; content hash is the ETag) |
+| GET | `/games` | List of available games (with `summary`, `rulesVersion`, `viewVersion`, `listsLegalActions`, `hasOptions`, `rulesUrl`) |
+| GET | `/games/:id/rules` | Game description: rules, how to read the view, JSON Schemas for view / action / game options (`optionsSchema`, `defaultGameOptions`), state examples (generated from the real engine), common play instructions. `version` is the ETag |
+| GET | `/games/:id/rules.md` | The same content as one Markdown page, ready to paste into a prompt |
+| POST | `/rooms` | `{ game: string, options?: {...}, gameOptions?: {...} }` → `{ roomId, hostToken }`. Unknown options are 400. `gameOptions` are game-specific (validated by the game's `optionsSchema`; 400 for games without one). `options.practice: true` fills empty seats with server-side practice opponents at start (they play by `practiceAction`, random if undefined; not recorded in D1). `options.autoStart: true` starts automatically when full (not combinable with practice). `options.unlisted: true` hides it from the list and quickmatch |
+| GET | `/rooms` | List of public rooms (with `gameOptions`). `?status=` is `waiting` (default; has free seats, updated within 30 minutes) or `playing` (index last updated within "turn time + `PLAYING_LIST_GRACE_MS` (2 hours)"). Filter with `&game=&limit=`. Served from the D1 `rooms` index (best-effort; the DO is authoritative) |
+| POST | `/quickmatch` | `{ game, options?: { turnTimeMs }, gameOptions? }` → `{ roomId, playerId, token, created }`. Joins the oldest public autoStart room with the same game, game options (with defaults filled in) and turn time, or creates one |
 | POST | `/rooms/:id/join` | → `{ playerId, token }` |
-| POST | `/rooms/:id/start` | 試合開始（作成者のみ。`hostToken` を Bearer で渡す） |
-| POST | `/rooms/:id/leave` | 待機中ルームからの退出（join の取り消し。Bearer）。トークンは無効になり、その席の WS は close コード 4000 で閉じる。席番号は再利用しない（`nextSeat` の連番） |
-| POST | `/rooms/:id/rematch` | 終了後の再戦（Bearer）→ `{ roomId, playerId, token }`。最初の呼び出しで同じゲーム・オプション・ゲームオプションの新ルームを作り、人間の席を1つずらして予約する（予約は `init` の引数で meta に持ち、`roomOptions` には入れない）。予約席は `join` 不可（`ROOM_RESERVED`）・一覧に載らない。全員が呼んだら自動開始。同じ人は何度呼んでも同じ席。旧ルームの state に `rematch: { roomId, requestedBy }` が付く |
-| GET | `/rooms/:id/state` | `Authorization: Bearer <token>` があればそのプレイヤー視点、なければ観戦視点 |
-| POST | `/rooms/:id/resign` | 投了。試合中ならいつでも（手番でなくても）。既定は投了者の負けで残り全員が勝ち、その場で終了（`onResign` があればそれに従う）。WS では `{ "type": "resign" }` |
-| POST | `/rooms/:id/action` | WS を使わない簡易 Bot 向け。`{ turn, action }`。相手の手を待つ手段はないので、単発の行動・デバッグ用（対戦は WS） |
-| GET | `/rooms/:id/log` | 行動ログ（リプレイ用。終了後のみ）。作成時に記録した `rulesVersion` と `gameOptions` 付き |
-| GET | `/rooms/:id/replay` | ログから再現した各ターンの観戦視点（終了後のみ）。記録した `rulesVersion` が今の版と違えば 410 `GAME_REMOVED`（`/log` は返す） |
-| POST | `/users` | `{ name }` → `{ userId, name, apiKey }`。join 時に `X-Api-Key` を付けると戦績が紐づく。同じユーザーは1ルームに1席だけ（2席目は 409 `ALREADY_JOINED`） |
-| POST | `/users/:id/key` | API キーの再発行（今のキーを `X-Api-Key` で渡す）→ `{ userId, apiKey }`。古いキーはその場で失効（失効だけの API は無い。キーを失くしたら復旧できない） |
-| GET | `/users/:id` | ユーザーと戦績 |
-| GET | `/matches` | 終了した試合の一覧（`?game=&limit=`） |
-| GET | `/openapi.json` | 生成された OpenAPI 仕様 |
-| GET | `/rooms/:id/ws` | WebSocket へのアップグレード（サブプロトコル `["apigames.v1", "apigames.token.<token>"]`。トークンは Bearer でもよい。トークンが無ければ観戦。`apigames.v1` は観戦でも必須） |
+| POST | `/rooms/:id/start` | Start the match (creator only; `hostToken` as Bearer) |
+| POST | `/rooms/:id/leave` | Leave a waiting room (undo join; Bearer). The token is invalidated and that seat's WS is closed with code 4000. Seat numbers are not reused (`nextSeat` counter) |
+| POST | `/rooms/:id/rematch` | Rematch after the end (Bearer) → `{ roomId, playerId, token }`. The first call creates a new room with the same game, options and game options and reserves the human seats rotated by one (reservations are passed as an `init` argument and kept in meta, not in `roomOptions`). Reserved seats can't be `join`ed (`ROOM_RESERVED`) and the room is not listed. Starts automatically once everyone has called it. The same person always gets the same seat. The old room's state gets `rematch: { roomId, requestedBy }` |
+| GET | `/rooms/:id/state` | That player's view with `Authorization: Bearer <token>`, otherwise the spectator view |
+| POST | `/rooms/:id/resign` | Resign. Any time during the match (even when it's not your turn). By default the resigner loses, everyone else wins and the match ends immediately (`onResign` overrides). Over WS: `{ "type": "resign" }` |
+| POST | `/rooms/:id/action` | For simple bots not using WS. `{ turn, action }`. There's no way to wait for the opponent, so it's for one-off moves and debugging (play over WS) |
+| GET | `/rooms/:id/log` | Action log (for replays; finished rooms only), with the `rulesVersion` and `gameOptions` recorded at creation |
+| GET | `/rooms/:id/replay` | Spectator view of each turn reproduced from the log (finished rooms only). 410 `GAME_REMOVED` if the recorded `rulesVersion` differs from the current one (`/log` still works) |
+| POST | `/users` | `{ name }` → `{ userId, name, apiKey }`. Sending `X-Api-Key` on join links the result to the user. One seat per user per room (a second is 409 `ALREADY_JOINED`) |
+| POST | `/users/:id/key` | Reissue the API key (current key in `X-Api-Key`) → `{ userId, apiKey }`. The old key is revoked immediately (there's no revoke-only API; a lost key can't be recovered) |
+| GET | `/users/:id` | User and their results |
+| GET | `/matches` | List of finished matches (`?game=&limit=`) |
+| GET | `/openapi.json` | Generated OpenAPI spec |
+| GET | `/rooms/:id/ws` | WebSocket upgrade (subprotocols `["blindfold.v1", "blindfold.token.<token>"]`; the token may also be Bearer; no token means spectator; `blindfold.v1` is required even for spectators) |
 
-- トークンは URL に載せない（アクセスログ・ブラウザ履歴に残るため）。`?token=` は 400 で拒否する。
-- ルーム ID は `^[0-9a-f]{12}$`（`isRoomId`）。合わない ID は Worker 側で 404 `ROOM_NOT_FOUND`（`/ws` も含め DO を起こさない）。
-- プレイヤートークン・`hostToken` は DO にハッシュ（sha256）だけを保存する（`players.token`・`meta.hostTokenHash`・WS の attachment の `tokenHash`）。DO の各入口では状態を読む前にハッシュを取る（読んでから commit までに await を挟まないため）。再戦の席のトークンは元のトークンから導出する（`rematchToken`）ので、保存せずに何度でも同じものを返せる。
-- CORS は全オリジン許可（Cookie を使わず Bearer なので安全）。WS のアップグレードは対象外。
-- IP（`CF-Connecting-IP`）ごとにレート制限する（`src/index.ts`）：`POST /users`・`/users/:id/key`（RL_USERS）、`POST /rooms`・`/quickmatch`・`/rooms/:id/join`・`/rooms/:id/rematch`（RL_ROOMS、共有）、`GET /rooms/:id/ws`（RL_WS）、その他の DO・D1 を読むルート（`GET /rooms`・`/rooms/:id/state`・`/log`・`/replay`・`/matches`・`/users/:id`、`POST /rooms/:id/action`・`/resign`・`/start`・`/leave`。RL_READS、共有）。上限は `wrangler.jsonc` の `ratelimits`（拠点ごとの概算。period は 10 か 60）。ヘッダーが無い（Cloudflare の外・テスト）ときは制限しない。
-- 429 で返しても Worker は起動するので、Workers の1日10万リクエストは守れない（守れるのは DO の起動と D1 の読み取り）。Worker より前で止める WAF は独自ドメインのゾーンにしか付けられず（workers.dev では不可）、ドメインは有料なので**使わない**と決めた。無料プランは超過しても課金されず UTC 0時まで止まるだけなので、攻撃されたときの損失は可用性だけ。
-- WS の接続数：1つの席（トークン）につき `MAX_SOCKETS_PER_SEAT`（4）本。超えたらいちばん古い接続（attachment の `at`）を close コード 4004（`CLOSE_REPLACED`）で閉じる。観戦は1ルーム `MAX_SPECTATOR_SOCKETS`（50）本で、超えたら 503 `TOO_MANY_CONNECTIONS`。数えるのは `acceptWebSocket` のタグ（`spectator` / `seat:<pid>`）。
-- WS のエラーの上限：エラーを返すたびに attachment の `strikes` が1つ増え、`WS_STRIKE_DECAY_MS`（10秒）ごとに1つ減る（リーキーバケット。`strikeAt` から遅延評価）。`WS_MAX_STRIKES`（20）を超えたら close コード 4003（`CLOSE_TOO_MANY_ERRORS`）で閉じる。成功した行動・投了と `INTERNAL` は数えない。自動応答の `{"type":"ping"}` と文字列が違う ping は DO を起こすので数える。
-- REST は `Authorization: Bearer`。WS はブラウザがヘッダーを付けられないのでサブプロトコルで渡し、サーバーはトークンを含まない版のサブプロトコル（`apigames.v1`）を選んで応答する。
-- WS のサブプロトコルは WS メッセージの版（`src/lib/auth.ts` の `WS_PROTOCOLS`。新しい順）。提示された中で最も新しいものを選ぶ。未指定を v1 とみなすフォールバックは置かない。1.0 以降の WS の破壊的変更は `apigames.v2` を足して交渉し、古い版はしばらく並べて残す。
-- エンジン（ゲーム、または作成時の `rulesVersion`）がレジストリに無いルームは、待機中も含め `/log`（終了済みのみ）以外が 410 `GAME_REMOVED`。alarm は例外にせず止める（再試行のたびにリクエストを消費しないように）。見つけた時点（入口の `check()` 失敗 → `reject()`、または alarm）で `retire()` が1回だけ畳む：全接続を close コード 4002（`CLOSE_GAME_REMOVED`）で閉じ、D1 の `rooms` の行を消し、進行中だったルームは `FINISHED_ROOM_TTL_MS` 後に掃除する。
+- Tokens never go in URLs (they'd end up in access logs and browser history). `?token=` is rejected with 400.
+- Room IDs match `^[0-9a-f]{12}$` (`isRoomId`). Other IDs get 404 `ROOM_NOT_FOUND` in the Worker (including `/ws`, without waking the DO).
+- Player tokens and `hostToken` are stored in the DO only as hashes (sha256) (`players.token`, `meta.hostTokenHash`, `tokenHash` in the WS attachment). Each DO entry point hashes before reading state (so there's no await between reading and commit). Rematch seat tokens are derived from the original token (`rematchToken`), so the same one can be returned any number of times without storing it.
+- CORS allows all origins (safe because auth is Bearer, not cookies). WS upgrades are excluded.
+- Per-IP (`CF-Connecting-IP`) rate limits (`src/index.ts`): `POST /users`, `/users/:id/key` (RL_USERS); `POST /rooms`, `/quickmatch`, `/rooms/:id/join`, `/rooms/:id/rematch` (RL_ROOMS, shared); `GET /rooms/:id/ws` (RL_WS); other routes that read the DO or D1 (`GET /rooms`, `/rooms/:id/state`, `/log`, `/replay`, `/matches`, `/users/:id`; `POST /rooms/:id/action`, `/resign`, `/start`, `/leave`; RL_READS, shared). Limits are `ratelimits` in `wrangler.jsonc` (approximate, per location; period is 10 or 60). No limit when the header is missing (outside Cloudflare, tests).
+- Returning 429 still invokes the Worker, so the 100k requests/day Workers limit can't be protected (only DO invocations and D1 reads are). A WAF in front of the Worker can only be attached to a custom domain's zone (not workers.dev), and domains cost money, so we decided **not to use one**. The free plan isn't billed on overage, it just stops until 00:00 UTC, so the only loss under attack is availability.
+- WS connection counts: `MAX_SOCKETS_PER_SEAT` (4) per seat (token). Beyond that the oldest connection (attachment `at`) is closed with code 4004 (`CLOSE_REPLACED`). Spectators: `MAX_SPECTATOR_SOCKETS` (50) per room, beyond that 503 `TOO_MANY_CONNECTIONS`. Counted by the `acceptWebSocket` tags (`spectator` / `seat:<pid>`).
+- WS error limit: each error sent increments the attachment's `strikes` by 1, and it decays by 1 every `WS_STRIKE_DECAY_MS` (10 s) (leaky bucket, evaluated lazily from `strikeAt`). Above `WS_MAX_STRIKES` (20) the socket is closed with code 4003 (`CLOSE_TOO_MANY_ERRORS`). Successful actions, resigns and `INTERNAL` don't count. Pings whose string differs from the auto-response `{"type":"ping"}` wake the DO, so they count.
+- REST uses `Authorization: Bearer`. Browsers can't set WS headers, so WS passes the token as a subprotocol, and the server responds by selecting the version subprotocol without the token (`blindfold.v1`).
+- The WS subprotocol is the WS message version (`WS_PROTOCOLS` in `src/lib/auth.ts`, newest first). The newest one offered is chosen. There's no fallback treating "none" as v1. After 1.0, breaking WS changes add `blindfold.v2` to negotiate, keeping the old version alongside for a while.
+- Rooms whose engine (the game, or the `rulesVersion` recorded at creation) isn't in the registry return 410 `GAME_REMOVED` for everything except `/log` (finished rooms only), including while waiting. The alarm stops instead of throwing (so retries don't consume requests). When detected (entry `check()` fails → `reject()`, or in the alarm), `retire()` winds the room down once: closes all connections with code 4002 (`CLOSE_GAME_REMOVED`), deletes the D1 `rooms` row, and schedules cleanup after `FINISHED_ROOM_TTL_MS` for rooms that were in progress.
 
-### WebSocket メッセージ（JSON）
+### WebSocket messages (JSON)
 
-クライアント → サーバー：
+Client → server:
 ```json
 { "type": "action", "turn": 12, "action": { ... } }
 { "type": "resign" }
 { "type": "ping" }
 ```
 
-サーバー → クライアント：
+Server → client:
 ```json
 { "type": "state", "game": "tictactoe", "rulesVersion": 1, "gameOptions": null, "status": "playing", "turn": 13, "players": ["p1", "p2"], "currentPlayers": ["p1"], "view": { ... }, "legal": [ ... ], "deadline": 1732190000000, "now": 1732189710000, "result": null }
 { "type": "error", "code": "ILLEGAL_ACTION" | "NOT_YOUR_TURN" | "STALE_TURN" | "NOT_PLAYING" | "UNAUTHORIZED" | "BAD_REQUEST" | ..., "message": "..." }
 { "type": "end", "winners": ["p1"], "scores": { ... }, "reason": "normal" | "timeout" | "resign" }
 ```
 
-- `turn` が現在のターンと一致しない行動は `STALE_TURN` で拒否する（二重送信・古い手の防止）。
-- 締め切りを過ぎてから届いた行動も、Alarm を待たずにその場で時間切れを確定させてから `STALE_TURN` で拒否する。
-- `state` は REST の `GET /rooms/:id/state` と同じオブジェクトに `type` を付けたもの（`RoomState` が唯一の定義。`src/lib/protocol.ts`）。
-- `error` の `code` は REST と同じコードをそのまま返す（読み替えない）。
-- `legal` は、受け取るプレイヤーが今行動でき、ゲームが `legalActions` を定義している場合にだけ付ける。手番かどうかの判定は `currentPlayers` で行うようクライアントに案内している。
-- `now` はメッセージを作った時点のサーバー時刻（epoch ms）。クライアントは `deadline - now` で残り時間を出す（クライアントの時計ずれ対策）。
-- 投了・時間切れはサーバーが書くログの行（`player = ""`、`action = {"$resign":"p1"}` / `{"$timeout":[...]}`）として1ターン進める。既定（`onTimeout` / `onResign` 未定義）は状態を変えず、決着は meta の `forfeit`。それで試合が終わったときだけ理由を `endReason`（D1 の `matches.reason`）に残す。
+- Actions whose `turn` doesn't match the current turn are rejected with `STALE_TURN` (prevents double sends and stale moves).
+- Actions arriving after the deadline also settle the timeout on the spot, without waiting for the Alarm, and are then rejected with `STALE_TURN`.
+- `state` is the same object as REST `GET /rooms/:id/state` plus `type` (`RoomState` is the single definition, in `src/lib/protocol.ts`).
+- `error` `code`s are the same codes as REST, unchanged (no remapping).
+- `legal` is included only when the receiving player can act now and the game defines `legalActions`. Clients are told to decide whose turn it is from `currentPlayers`.
+- `now` is the server time when the message was built (epoch ms). Clients compute remaining time as `deadline - now` (guards against client clock skew).
+- Resigns and timeouts advance one turn as server-written log rows (`player = ""`, `action = {"$resign":"p1"}` / `{"$timeout":[...]}`). By default (`onTimeout` / `onResign` undefined) the state is unchanged and the outcome is meta's `forfeit`. Only when that ends the match is the reason kept in `endReason` (D1 `matches.reason`).
 
-### 互換性方針
+### Compatibility policy
 
-版を表す値は5種類ある。混同しない。
+There are five kinds of version values. Don't mix them up.
 
-| 名前 | 場所 | 意味 |
+| Name | Where | Meaning |
 |---|---|---|
-| `version` | ガイド・rules の見出し、`/games/:id/rules` の `version`、ETag | 内容のハッシュ。誤字1つ直しても変わる。**キャッシュの鍵でしかなく、互換性の合図ではない** |
-| `apiVersion` | `src/lib/version.ts` の `API_VERSION`。OpenAPI の `info.version`・ガイドの TL;DR・rules の `apiVersion` が同じ値を参照する | API の版（semver） |
-| `rulesVersion` | `GameDefinition.rulesVersion`（整数）。`/games`・rules・state・`/log`・`/replay`・`/matches` で返す | ゲームのルール・action の形の版。「シード + ログで再現できる」保証に関わる。ルームは作成時（`GameRoom.init`。`gameOptions` を検証したのと同じ版）に meta へ記録する。今の版と違うルームは動かさない（`GAME_REMOVED`）。D1 の `matches.rules_version` にも残す |
-| `viewVersion` | `GameDefinition.viewVersion`（整数）。`/games`・rules で返す | ゲームの view の形の版。破壊的変更で上げる。リプレイに関わらないので古い版を残す必要はなく、進行中の試合も新しい形になる |
-| WS サブプロトコル | `apigames.v1`（`WS_PROTOCOLS`） | WS メッセージの版。接続ごとに交渉し、attachment に `protocol` として持つ |
+| `version` | Guide / rules headings, `version` of `/games/:id/rules`, ETag | Content hash. Changes even for a one-character typo fix. **Only a cache key, not a compatibility signal** |
+| `apiVersion` | `API_VERSION` in `src/lib/version.ts`. OpenAPI `info.version`, the guide's TL;DR and rules' `apiVersion` all reference it | API version (semver) |
+| `rulesVersion` | `GameDefinition.rulesVersion` (integer). Returned by `/games`, rules, state, `/log`, `/replay`, `/matches` | Version of a game's rules and action shape. Tied to the "reproducible from seed + log" guarantee. Recorded in meta at room creation (`GameRoom.init`, the same version that validated `gameOptions`). Rooms with a different version from the current one don't run (`GAME_REMOVED`). Also kept in D1 `matches.rules_version` |
+| `viewVersion` | `GameDefinition.viewVersion` (integer). Returned by `/games` and rules | Version of a game's view shape. Bumped on breaking changes. Not involved in replays, so old versions needn't be kept, and matches in progress switch to the new shape too |
+| WS subprotocol | `blindfold.v1` (`WS_PROTOCOLS`) | WS message version. Negotiated per connection and kept in the attachment as `protocol` |
 
-- **0.x の間は実験段階**。破壊的変更は予告なしで出してよい（マイナーを上げる）。changelog は事後に書く。1.0.0 からは破壊的変更でメジャーを上げる。
-- **非破壊（いつでもやる。クライアントは許容する義務がある）**：REST レスポンス・WS メッセージ・`view` へのフィールド追加、新しい WS メッセージ `type`、新しいエラー `code`、新しいゲーム・エンドポイント・省略可能な入力やルームオプション、ガイド・rules・エラーメッセージの文言変更。クライアントの義務（未知のフィールド・`type`・`code` を無視する）はガイドの 9 節・チェックリスト・rules の `COMMON` に書いてある。
-- **破壊的**：フィールドの削除・改名・型や意味の変更、入力を必須にすること、認証方式の変更、ゲームのルール・action の形の変更。
-- **出力の enum（`status`・`reason`・`outcome` など）は値が増えうる**（非破壊）。OpenAPI のレスポンスでは `openEnum()`（`src/routes/schemas.ts`）で string + 説明（今の値）にする。入力の enum は `z.enum` のまま。`view` の中の enum は対象外（`viewVersion` に従う）。クライアントの扱い方（未知の `reason` は `normal` 扱いなど）はガイド 9 節・チェックリスト・`COMMON` に書いてある。
-- **出力の JSON Schema は未知のフィールドを禁止しない**。`viewSchema` は内部では `strictObject`（all-games テストで余計なフィールドが無いことを確かめる用）だが、`/rules` で配るときは `outputJsonSchema()` で `additionalProperties: false` を外す。入力（action・ルームオプション）の Schema は余計なフィールドを拒否するので `z.toJSONSchema` のまま。
-- **告知**：`apiVersion` と `/changelog.md`（`src/lib/changelog.ts`。先頭の版が `API_VERSION` と一致することをテストで確かめる）。廃止を段階的に進めるときに限り、該当するレスポンスに `Deprecation` / `Sunset` ヘッダー（RFC 9745 / 8594）をベストエフォートで付ける（0.x では付かないまま壊すこともある）。ルート全体なら `deprecated(info)` ミドルウェア、フィールドなど使ったときだけなら `markDeprecated(c, info)`（`src/lib/deprecation.ts`）。CORS の `exposeHeaders` に入れてある。
-- **ルールを変えるとき**は `rulesVersion` を上げる。古い版のエンジンは残さない仕様で、前の版で作ったルームは待機中・進行中・終了済みとも `GAME_REMOVED`（410）になり、リプレイできなくなる（終了済みなら `/log` は返す）。古い state や古い `optionsSchema` で検証した `gameOptions` を新しいエンジンで黙って動かすことはない。旧版のルームのデータそのものは掃除（`retire()` → `cleanupAt`）で消える。
-- **view の形を壊すとき**は `viewVersion` を上げる（エンジンは差し替えるだけ）。
+- **0.x is experimental.** Breaking changes may ship without notice (bump the minor). The changelog is written afterwards. From 1.0.0, breaking changes bump the major.
+- **Non-breaking (done any time; clients are obliged to tolerate them):** new fields in REST responses, WS messages and `view`; new WS message `type`s; new error `code`s; new games, endpoints, optional inputs and room options; wording changes in the guide, rules and error messages. The client obligations (ignore unknown fields, `type`s and `code`s) are in section 9 of the guide, the checklist and rules' `COMMON`.
+- **Breaking:** removing, renaming or changing the type or meaning of a field; making an input required; changing auth; changing a game's rules or action shape.
+- **Output enums (`status`, `reason`, `outcome`, etc.) may gain values** (non-breaking). In OpenAPI responses they are string + description (current values) via `openEnum()` (`src/routes/schemas.ts`). Input enums stay `z.enum`. Enums inside `view` are excluded (they follow `viewVersion`). How clients handle them (unknown `reason` treated as `normal`, etc.) is in guide section 9, the checklist and `COMMON`.
+- **Output JSON Schemas don't forbid unknown fields.** `viewSchema` is a `strictObject` internally (so the all-games test can check there are no extra fields), but when served from `/rules`, `outputJsonSchema()` removes `additionalProperties: false`. Input schemas (action, room options) reject extra fields, so they stay as `z.toJSONSchema`.
+- **Announcements:** `apiVersion` and `/changelog.md` (`src/lib/changelog.ts`; a test checks the top entry matches `API_VERSION`). Only when phasing something out gradually, add `Deprecation` / `Sunset` headers (RFC 9745 / 8594) to the relevant responses on a best-effort basis (in 0.x things may break without them). For a whole route use the `deprecated(info)` middleware; for something like a field, only when used, `markDeprecated(c, info)` (`src/lib/deprecation.ts`). They are in CORS `exposeHeaders`.
+- **When changing rules,** bump `rulesVersion`. Old engines aren't kept, so rooms created under the previous version become `GAME_REMOVED` (410) whether waiting, in progress or finished, and can no longer be replayed (`/log` still works for finished ones). Old state, or `gameOptions` validated by an old `optionsSchema`, is never silently run on the new engine. The old rooms' data itself is removed by cleanup (`retire()` → `cleanupAt`).
+- **When breaking the view shape,** bump `viewVersion` (just replace the engine).
 
-## 無料枠の制約（設計時に必ず守る）
+## Free tier constraints (always respect when designing)
 
-- Workers Free：**1日10万リクエスト**（UTC 0時にリセット）。超えるとエラーになる（課金はされない）。
-- DO に**受信した** WebSocket メッセージは **20通で1リクエスト**として数える。**送信は無料**。
-- WebSocket 接続の確立と Alarm の発火は、それぞれ1リクエストとして数える。
-- DO ストレージ（SQLite）：無料枠はアカウントあたり 5GB。
+- Workers Free: **100,000 requests per day** (resets at 00:00 UTC). Beyond that requests error (no billing).
+- WebSocket messages **received** by a DO count as **1 request per 20 messages**. **Sending is free.**
+- Establishing a WebSocket connection and firing an Alarm each count as 1 request.
+- DO storage (SQLite): 5 GB per account on the free tier.
 
-設計方針：
-- 行動の送信は WebSocket を基本にする。REST の `/action` は補助。
-- **必ず Hibernation API を使う**（`state.acceptWebSocket()` + `webSocketMessage()` ハンドラ）。`ws.accept()` は使わない（稼働時間が課金対象になる）。
-- ポーリングを前提にした設計にしない。状態は WS のプッシュで配る。
-- Alarm は「その時点の手番の締め切り」1つだけを設定する（ターンが進むたびに上書きする）。
-- ルーム一覧は D1 の `rooms`（索引）で持つ。書くのは作成・join・退出・開始・終了のときだけで、1手ごとには書かない。例外として、試合中は最後の書き込み（`meta.indexedAt`）から `PLAYING_INDEX_REFRESH_MS`（1時間）経っていれば手の確定時に書き直す（`?status=playing` の鮮度の絞り込みで長い試合が消えないように）。`rev` で古い書き込みの上書きを防ぐ。
-- 状態の配信は当面フルの `view` でよい。サイズが問題になったら差分配信（JSON Patch）を検討する。
+Design principles:
+- Moves are sent over WebSocket by default. REST `/action` is auxiliary.
+- **Always use the Hibernation API** (`state.acceptWebSocket()` + a `webSocketMessage()` handler). Never `ws.accept()` (wall-clock time would be billed).
+- Don't design around polling. State is pushed over WS.
+- Set only one Alarm: the current turn's deadline (overwritten every time the turn advances).
+- The room list lives in D1 `rooms` (an index). It's written only on create, join, leave, start and end, not on every move. Exception: during a match, if `PLAYING_INDEX_REFRESH_MS` (1 hour) has passed since the last write (`meta.indexedAt`), it's rewritten when a move is committed (so long matches don't vanish under `?status=playing`'s freshness filter). `rev` prevents stale writes from overwriting newer ones.
+- Broadcasting the full `view` is fine for now. If size becomes a problem, consider diffs (JSON Patch).
 
-## GameRoom（Durable Object）の責務
+## GameRoom (Durable Object) responsibilities
 
-1. ルームのライフサイクル：`waiting` → `playing` → `finished`
-2. プレイヤーの参加とトークン検証。WS には `serializeAttachment({ playerId })` でプレイヤー情報を持たせる
-3. 行動の受信 → `actionSchema` で検証 → 手番とターンを確認 → `apply` → ログに追記 → 状態を保存 → 全接続に `view` を配信
-   - 何を書くかの判断（行動・投了・時間切れの解決、締め切り・決着の確定、alarm で何をするか、配る状態）は `room/logic.ts` の純粋関数、SQL は `room/store.ts`、D1 の文は `room/d1.ts`。GameRoom は「入口（`enter` / `enterPlayer` / `enterViewer`）→ 判断 → `commit`（1トランザクション）→ 副作用」の順に呼ぶだけにする
-4. 持ち時間切れ（Alarm）時の処理：ゲームごとに定義する（自動パス／負け扱いなど）。デフォルトは負け扱い
-5. 終了時に D1 へ結果を書き込む
-6. 掃除：待機中は最後の変更から `WAITING_ROOM_TTL_MS`（24時間）、終了後は終了から `FINISHED_ROOM_TTL_MS`（7日）で `deleteAll()` し、D1 の `rooms` の行も消す（`matches`・`results` は残す）。時刻は `meta.cleanupAt`。alarm は1つなので、締め切り・D1 の再試行が無いときの行き先にする（`wantedAlarm()`）。試合中は消さない（エンジンが消えたルームは除く）。接続は close コード 4001 で閉じる
+1. Room lifecycle: `waiting` → `playing` → `finished`
+2. Player joining and token verification. WS connections carry player info via `serializeAttachment({ playerId })`
+3. Receive action → validate with `actionSchema` → check turn and player → `apply` → append to log → save state → broadcast `view` to all connections
+   - Decisions about what to write (resolving actions, resigns and timeouts; settling deadlines and outcomes; what the alarm does; the state to send) are pure functions in `room/logic.ts`, SQL is in `room/store.ts`, D1 statements in `room/d1.ts`. GameRoom only calls them in the order "entry (`enter` / `enterPlayer` / `enterViewer`) → decide → `commit` (one transaction) → side effects"
+4. Turn time-out handling (Alarm): defined per game (auto-pass, loss, etc.). Default is a loss
+5. Write results to D1 at the end
+6. Cleanup: `deleteAll()` after `WAITING_ROOM_TTL_MS` (24 hours) since the last change while waiting, or `FINISHED_ROOM_TTL_MS` (7 days) after finishing, and delete the D1 `rooms` row too (`matches` and `results` are kept). The time is `meta.cleanupAt`. There's only one alarm, so it's where the alarm goes when there's no deadline or D1 retry (`wantedAlarm()`). Rooms are never deleted mid-match (except those whose engine is gone). Connections are closed with code 4001
 
-SQLite テーブル（DO 内）：
-- `meta(key TEXT PRIMARY KEY, value TEXT)` … gameId、seed、rulesVersion、gameOptions、status、schemaVersion、hostTokenHash、cleanupAt、result（終了時に確定した結果。D1 の再試行と終了後の state はこれを使う）など
-- `players(id TEXT PRIMARY KEY, token TEXT NOT NULL, seq INTEGER NOT NULL, user_id TEXT)` … `token` はトークンのハッシュ
+SQLite tables (in the DO):
+- `meta(key TEXT PRIMARY KEY, value TEXT)` … gameId, seed, rulesVersion, gameOptions, status, schemaVersion, hostTokenHash, cleanupAt, result (the result settled at the end; used for D1 retries and the post-match state), etc.
+- `players(id TEXT PRIMARY KEY, token TEXT NOT NULL, seq INTEGER NOT NULL, user_id TEXT)` … `token` is the token's hash
 - `actions(turn INTEGER, player TEXT, action TEXT, at INTEGER)`
 - `snapshot(id INTEGER PRIMARY KEY CHECK (id = 1), turn INTEGER, state TEXT)`
-- スキーマは `src/room/schema.ts`。新しいルームは BASE_SCHEMA（版 1）+ `MIGRATIONS` を順に流して作り、既存のルームはコンストラクタの `blockConcurrencyWhile` で `meta.schemaVersion` から1段ずつ移行する。列やテーブルを足すときは `MIGRATIONS` の末尾に足す（BASE_SCHEMA は書き換えない）。
+- The schema is in `src/room/schema.ts`. New rooms are built by running BASE_SCHEMA (version 1) + `MIGRATIONS` in order; existing rooms migrate one step at a time from `meta.schemaVersion` in the constructor's `blockConcurrencyWhile`. To add columns or tables, append to the end of `MIGRATIONS` (never edit BASE_SCHEMA).
 
-## 実装の順番
-
-1. [x] プロジェクトの雛形（wrangler + Hono + TypeScript + Vitest）
-2. [x] `GameDefinition` 型 + 三目並べ + エンジン単体のテスト
-3. [x] GameRoom DO（作成・参加・開始・行動・状態取得）を REST だけで動かす
-4. [x] WebSocket（Hibernation）による配信
-5. [x] `bots/random-bot.ts` で Bot 同士の対戦が最後まで終わることを確認
-6. [x] 行動ログとリプレイ API（シードとログから再現できることをテストする）
-7. [x] Alarm による持ち時間処理
-8. [x] D1（users、matches、results）+ マイグレーション
-9. [x] OpenAPI ドキュメントの生成
-10. [x] 2つ目のゲーム（隠し情報のあるもの。例：簡単なカードゲーム）で `view` の除去を検証する
-
-## コマンド
+## Commands
 
 ```bash
 pnpm install
 pnpm dev                       # wrangler dev
 pnpm test                      # vitest
 pnpm typecheck                 # tsc --noEmit
-pnpm deploy                    # wrangler deploy（先に `pnpm wrangler d1 migrations apply <DB名> --remote`。未適用だと結果の書き込みが失敗し続ける）
-pnpm wrangler d1 migrations apply <DB名> --local
+pnpm deploy                    # wrangler deploy (run `pnpm wrangler d1 migrations apply blindfold --remote` first; otherwise result writes keep failing)
+pnpm wrangler d1 migrations apply blindfold --local
 pnpm tsx bots/random-bot.ts --url http://localhost:8787 --room <roomId> [--host-token <hostToken>]
 pnpm tsx bots/random-bot.ts --url http://localhost:8787 --quickmatch tictactoe
 ```
 
-## コーディング規約
+## Coding conventions
 
-- TypeScript strict。`any` は使わない（外部入力は zod で `unknown` から検証する）。
-- ゲームロジック（`src/games/`）は Cloudflare の API に依存させない。Node 単体でテストできる状態に保つ。
-- エラーは `GameError(code, message)` で投げ、ルーム側で `error` メッセージに変換する。
-- 新しいゲームを追加するときは、次の3つを必ず用意する：(1) `GameDefinition` の実装（`rulesVersion: 1`・`viewVersion: 1`・`docs`・`viewSchema` を含む。view が全局面・全視点で `viewSchema` を満たすことは all-games テストで検証される。`legalActions` を定義しないなら `practiceAction` は必須、`optionsSchema` を定義するなら `docs.options` も書く。これも all-games テストで検証される）、(2) `registry.ts` への登録、(3) ランダム Bot で 100 試合が例外なく終わるテスト（練習相手どうしの 100 試合も all-games テストで自動的に走る。ランダムで決着しにくいゲームは `practiceAction` を定義する）。
-- `docs` はゲームのディレクトリの `docs.ts` に置き、**英語**で書く（LLM が読む前提。翻訳は Bot 側に任せる）。特に `view` の各フィールドの意味と、視点による違いを省略しない。全ゲーム共通の遊び方（turn・legal・エラー）は `src/lib/rules.ts` の `COMMON` にあるので、各ゲームには書かない。
-- 読み手は主に LLM を想定しているが、**サイトに出る文言（ガイド・rules・docs・OpenAPI）には「LLM 向け」と書かない**。決定論的な Bot も使うため、誰が読んでも通じる書き方にする（コードのコメントには書いてよい）。
-- OpenAPI の `summary`・`description`・`.describe()` も**英語**で書く（ガイド・rules と同じく LLM が読む。テストで日本語が混ざっていないことを確かめている）。コードのコメントは日本語でよい。
-- 秘密情報（トークンの署名鍵など）は `wrangler secret` で管理し、コミットしない。ローカルでは `.dev.vars` を使う（gitignore 済みにする）。
+- TypeScript strict. No `any` (validate external input from `unknown` with zod).
+- Game logic (`src/games/`) must not depend on Cloudflare APIs. Keep it testable in plain Node.
+- Throw errors as `GameError(code, message)`; the room converts them into `error` messages.
+- A new game always comes with these three: (1) the `GameDefinition` implementation (including `rulesVersion: 1`, `viewVersion: 1`, `docs` and `viewSchema`; the all-games test checks that view satisfies `viewSchema` in every position and viewpoint. If `legalActions` is not defined, `practiceAction` is required; if `optionsSchema` is defined, write `docs.options` too — also checked by the all-games test), (2) registration in `registry.ts`, (3) a test where the random bot finishes 100 matches without exceptions (100 practice-vs-practice matches also run automatically in the all-games test; define `practiceAction` for games that rarely finish under random play).
+- `docs` lives in `docs.ts` in the game's directory and is written in **English** (assumed to be read by LLMs; translation is left to the bot). In particular, don't omit the meaning of each `view` field or how it differs by viewpoint. Play instructions common to all games (turn, legal, errors) live in `COMMON` in `src/lib/rules.ts`; don't repeat them per game.
+- The main readers are expected to be LLMs, but **site-facing text (guide, rules, docs, OpenAPI) must not say "for LLMs"**. Deterministic bots use it too, so write it so anyone can follow (code comments may say it).
+- OpenAPI `summary`, `description` and `.describe()` are also written in **English** (read by LLMs like the guide and rules; a test checks no Japanese slips in). Code comments may be in Japanese.
+- Secrets (token signing keys, etc.) are managed with `wrangler secret` and never committed. Locally use `.dev.vars` (gitignored).

@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "apigames",
+  "name": "blindfold",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-01",
   // 本番の console.* をダッシュボードで見られるようにする（Free プランでも可）
@@ -25,9 +25,9 @@
   "d1_databases": [
     {
       "binding": "DB",
-      // `pnpm wrangler d1 create apigames` で作成した ID
-      "database_name": "apigames",
-      "database_id": "c726ff90-174f-4c35-844e-b2d58a376b90",
+      // `pnpm wrangler d1 create blindfold` で作成した ID
+      "database_name": "blindfold",
+      "database_id": "c77580a5-7e82-4243-945a-99f6be888dab",
       "migrations_dir": "migrations"
     }
   ]

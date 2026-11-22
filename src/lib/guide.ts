@@ -313,9 +313,11 @@ type ServerMessage =
 function buildGuide(): string {
   const gameList = Object.values(games);
   return [
-    "# apigames — Client Developer Guide",
+    "# blindfold — Client Developer Guide",
     "",
-    "apigames hosts turn-based games that are played entirely over an HTTP + WebSocket API. All game logic runs on the server;",
+    "_No board to look at. Still a game._",
+    "",
+    "blindfold hosts turn-based games that are played entirely over an HTTP + WebSocket API. All game logic runs on the server;",
     "a client only renders the state it receives and sends actions. This page is everything you need to build a client",
     "(a bot, a UI, or a spectator viewer) without reading the server source.",
     "",
@@ -452,7 +454,7 @@ function buildGuide(): string {
     "",
     `- \`${WS_PROTOCOL}\` is the version of the WebSocket protocol (the messages in section 2) and is required. The server`,
     "  picks the newest version you offer that it supports and answers with it. If a later version changes the messages",
-    "  in a breaking way, it gets a new name (`apigames.v2`) and the old one keeps working for a while, so a client that",
+    "  in a breaking way, it gets a new name (`blindfold.v2`) and the old one keeps working for a while, so a client that",
     `  offers only \`${WS_PROTOCOL}\` keeps getting the messages it was written for.`,
     "- You may connect before or after the game starts. Right after connecting you receive the current `state`",
     "  (`status` may be `waiting`), and if the game is already over, an `end` message right after it.",

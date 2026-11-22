@@ -63,7 +63,7 @@ app.get("/", async (c) => {
   // 取得ツールは JSON を要約してから渡すことがあるので、相対パスより辿りやすい絶対 URL にする。
   const origin = new URL(c.req.url).origin;
   return c.json({
-    name: "apigames",
+    name: "blindfold",
     ok: true,
     description: "Turn-based games playable over HTTP + WebSocket. To build a client, read the guide.",
     guide: `${origin}/guide.md`,
@@ -100,7 +100,7 @@ app.openAPIRegistry.registerComponent("securitySchemes", "bearerAuth", {
 app.doc31("/openapi.json", {
   openapi: "3.1.0",
   info: {
-    title: "apigames API",
+    title: "blindfold API",
     version: API_VERSION,
     description:
       "An API for playing and watching turn-based games without a screen. All game logic runs on the server. " +
@@ -124,7 +124,7 @@ const SWAGGER_UI = {
 const DOCS_INIT_SCRIPT = 'SwaggerUIBundle({ url: "/openapi.json", dom_id: "#ui", validatorUrl: null });';
 
 const DOCS_HTML = `<!doctype html>
-<html lang="ja"><head><meta charset="utf-8"><title>apigames API</title>
+<html lang="ja"><head><meta charset="utf-8"><title>blindfold API</title>
 <link rel="stylesheet" href="${SWAGGER_UI.base}/swagger-ui.css" integrity="${SWAGGER_UI.css}" crossorigin="anonymous"></head>
 <body><div id="ui"></div>
 <script src="${SWAGGER_UI.base}/swagger-ui-bundle.js" integrity="${SWAGGER_UI.js}" crossorigin="anonymous"></script>

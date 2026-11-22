@@ -728,25 +728,25 @@ describe("ルームの存在確認・入力の制限", () => {
     expect(((await res.json()) as any).error.code).toBe("BAD_REQUEST");
   });
 
-  it("版のサブプロトコル（apigames.v1）が無い・知らない版だけ・トークンが複数あるなら 400", async () => {
+  it("版のサブプロトコル（blindfold.v1）が無い・知らない版だけ・トークンが複数あるなら 400", async () => {
     const { roomId, a, b } = await newRoom("tictactoe");
     const upgrade = (protocols?: string) =>
       SELF.fetch(`${BASE}/rooms/${roomId}/ws`, {
         headers: { Upgrade: "websocket", ...(protocols !== undefined ? { "Sec-WebSocket-Protocol": protocols } : {}) },
       });
     expect((await upgrade()).status).toBe(400); // 観戦でも版は必須
-    expect((await upgrade(`apigames.token.${a.token}`)).status).toBe(400);
-    const unversioned = await upgrade(`apigames, apigames.token.${a.token}`); // 版の無い旧名
+    expect((await upgrade(`blindfold.token.${a.token}`)).status).toBe(400);
+    const unversioned = await upgrade(`blindfold, blindfold.token.${a.token}`); // 版の無い旧名
     expect(unversioned.status).toBe(400);
     expect(((await unversioned.json()) as any).error.message).toContain(WS_PROTOCOL);
-    expect((await upgrade("apigames.v999")).status).toBe(400);
-    expect((await upgrade(`${WS_PROTOCOL}, apigames.token.${a.token}, apigames.token.${b.token}`)).status).toBe(400);
+    expect((await upgrade("blindfold.v999")).status).toBe(400);
+    expect((await upgrade(`${WS_PROTOCOL}, blindfold.token.${a.token}, blindfold.token.${b.token}`)).status).toBe(400);
   });
 
   it("知っている版と知らない版を並べて提示したら、知っている版を選ぶ", async () => {
     const { roomId } = await newRoom("tictactoe");
     const res = await SELF.fetch(`${BASE}/rooms/${roomId}/ws`, {
-      headers: { Upgrade: "websocket", "Sec-WebSocket-Protocol": `apigames.v999, ${WS_PROTOCOL}` },
+      headers: { Upgrade: "websocket", "Sec-WebSocket-Protocol": `blindfold.v999, ${WS_PROTOCOL}` },
     });
     expect(res.status).toBe(101);
     expect(res.headers.get("Sec-WebSocket-Protocol")).toBe(WS_PROTOCOL);

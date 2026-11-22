@@ -95,7 +95,7 @@ describe("WebSocket connection limits", () => {
     const { roomId, a } = await newRoom("tictactoe");
     for (let i = 0; i < MAX_SPECTATOR_SOCKETS; i++) await conn(roomId);
     const res = await SELF.fetch(`https://example.com/rooms/${roomId}/ws`, {
-      headers: { Upgrade: "websocket", "Sec-WebSocket-Protocol": "apigames.v1" },
+      headers: { Upgrade: "websocket", "Sec-WebSocket-Protocol": "blindfold.v1" },
     });
     expect(res.status).toBe(503);
     expect(((await res.json()) as any).error.code).toBe("TOO_MANY_CONNECTIONS");

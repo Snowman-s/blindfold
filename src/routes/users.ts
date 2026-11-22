@@ -3,6 +3,16 @@ import { newApiKey, newUserId, sha256Hex } from "../lib/auth";
 import { END_REASONS, type EndReason } from "../lib/protocol";
 import { errBody, errors, validationHook } from "./schemas";
 
+export const UserSchema = z
+  .object({
+    id: z.string(),
+    name: z.string(),
+    stats: z
+      .object({ played: z.number(), wins: z.number(), losses: z.number(), draws: z.number() })
+      .describe("Counts over recorded (non-practice) games joined with this user's X-Api-Key"),
+  })
+  .openapi("User");
+
 export const userRoutes = new OpenAPIHono<{ Bindings: Env }>({ defaultHook: validationHook });
 
 userRoutes.openapi(
@@ -11,10 +21,10 @@ userRoutes.openapi(
     path: "/users",
     tags: ["users"],
     operationId: "createUser",
-    summary: "ユーザー登録",
+    summary: "Register a user",
     description:
-      "`apiKey` はこのレスポンスでしか返らない（サーバーにはハッシュだけ保存）。" +
-      "`POST /rooms/{id}/join` に `X-Api-Key` として渡すと戦績が紐づく。",
+      "`apiKey` is returned only in this response (the server stores only its hash). " +
+      "Send it as `X-Api-Key` to `POST /rooms/{id}/join` or `POST /quickmatch` to record results on this user.",
     request: {
       body: {
         required: true,
@@ -23,7 +33,7 @@ userRoutes.openapi(
     },
     responses: {
       201: {
-        description: "登録済み",
+        description: "Registered",
         content: { "application/json": { schema: z.object({ userId: z.string(), name: z.string(), apiKey: z.string() }) } },
       },
       400: errors[400],
@@ -46,18 +56,14 @@ userRoutes.openapi(
     path: "/users/{id}",
     tags: ["users"],
     operationId: "getUser",
-    summary: "ユーザーと戦績",
+    summary: "A user and their results",
     request: { params: z.object({ id: z.string().openapi({ param: { name: "id", in: "path" } }) }) },
     responses: {
       200: {
-        description: "ユーザー",
+        description: "User",
         content: {
           "application/json": {
-            schema: z.object({
-              id: z.string(),
-              name: z.string(),
-              stats: z.object({ played: z.number(), wins: z.number(), losses: z.number(), draws: z.number() }),
-            }),
+            schema: UserSchema,
           },
         },
       },
@@ -81,17 +87,28 @@ userRoutes.openapi(
   },
 );
 
-const MatchSchema = z.object({
-  id: z.string(),
-  game: z.string(),
-  players: z.array(z.string()),
-  startedAt: z.number(),
-  finishedAt: z.number(),
-  reason: z.enum(END_REASONS),
-  results: z.array(
-    z.object({ playerId: z.string(), userId: z.string().nullable(), outcome: z.string(), score: z.number().nullable() }),
-  ),
-});
+export const OUTCOMES = ["win", "loss", "draw"] as const;
+
+export const MatchSchema = z
+  .object({
+    id: z.string().describe("Same as the roomId of the game (so /rooms/{id}/log and /replay work with it)"),
+    game: z.string(),
+    players: z.array(z.string()),
+    startedAt: z.number().describe("epoch ms"),
+    finishedAt: z.number().describe("epoch ms"),
+    reason: z.enum(END_REASONS).describe("normal = decided by the game's rules"),
+    results: z.array(
+      z.object({
+        playerId: z.string(),
+        userId: z.string().nullable().describe("The user who joined with X-Api-Key, or null"),
+        outcome: z
+          .enum(OUTCOMES)
+          .describe("draw only for a game decided as a draw by its rules. If everyone timed out, everyone gets loss"),
+        score: z.number().nullable().describe("scores[playerId] of the result, or null if the game has no scores"),
+      }),
+    ),
+  })
+  .openapi("Match");
 
 userRoutes.openapi(
   createRoute({
@@ -99,7 +116,7 @@ userRoutes.openapi(
     path: "/matches",
     tags: ["matches"],
     operationId: "listMatches",
-    summary: "終了した試合の一覧（新しい順）",
+    summary: "Finished matches, newest first",
     request: {
       query: z.object({
         game: z.string().optional().openapi({ param: { name: "game", in: "query" } }),
@@ -107,7 +124,7 @@ userRoutes.openapi(
       }),
     },
     responses: {
-      200: { description: "試合一覧", content: { "application/json": { schema: z.array(MatchSchema) } } },
+      200: { description: "Matches", content: { "application/json": { schema: z.array(MatchSchema) } } },
       400: errors[400],
     },
   }),
@@ -124,7 +141,7 @@ userRoutes.openapi(
       .bind(game ?? null, limit)
       .all<{
         id: string; game: string; players: string; started_at: number; finished_at: number; reason: EndReason;
-        player_id: string; user_id: string | null; outcome: string; score: number | null;
+        player_id: string; user_id: string | null; outcome: (typeof OUTCOMES)[number]; score: number | null;
       }>();
     const byId = new Map<string, z.infer<typeof MatchSchema>>();
     for (const r of rows.results) {

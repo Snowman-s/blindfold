@@ -60,7 +60,8 @@ src/
     replay.ts         # 行動ログからの再現・時間切れ解決（純粋関数）
     options.ts        # ルームオプション（turnTimeMs、practice）
     rules.ts          # ゲームの説明（/games/:id/rules）の組み立て
-    guide.ts          # クライアント開発者向けガイド（/guide.md）の生成。state の例は実エンジンから作る
+    guide.ts          # クライアント開発者向けガイド（/guide.md）の生成
+    examples.ts       # ガイド・rules に載せる state / end / ログの例（実エンジン + 固定シードから作る）
 bots/
   random-bot.ts       # 合法手からランダムに選ぶ Bot（Node で実行）
   bot-core.ts         # WS ループ（CLI とテストで共有）
@@ -79,6 +80,7 @@ export interface GameDefinition<S, A> {
   minPlayers: number;
   maxPlayers: number;
   actionSchema: z.ZodType<A>;                  // 受信した行動の検証用
+  viewSchema: z.ZodType;                       // view の返り値の形（全視点の和集合。strictObject）。JSON Schema にして /rules で配る
   docs: GameDocs;                              // { summary, rules, view, examples }。Bot 上の LLM が読む説明
   init(players: string[], seed: Seed): S;     // Seed = string（サーバーは 128 ビットの乱数を 16 進 32 文字で発行）
   currentPlayers(s: S): string[];              // 今行動できるプレイヤー（同時手番も可）
@@ -104,19 +106,21 @@ export interface GameDefinition<S, A> {
 |---|---|---|
 | GET | `/`（`Accept: text/markdown` ならガイド本文）、`/guide.md`、`/llms.txt` | クライアント開発者（コーディングエージェント）向けのガイド。URL を渡すだけでクライアントが書けることが目標。コードから生成し、`version` を ETag にする |
 | GET | `/games` | 利用できるゲームの一覧（`summary`、`rulesUrl` 付き） |
-| GET | `/games/:id/rules` | ゲームの説明（LLM 向け）。ルール・view の読み方・action の JSON Schema・共通の遊び方。`version` を ETag にする |
+| GET | `/games/:id/rules` | ゲームの説明（LLM 向け）。ルール・view の読み方・view / action の JSON Schema・state の例（実エンジンから生成）・共通の遊び方。`version` を ETag にする |
 | GET | `/games/:id/rules.md` | 同じ内容を Markdown 1枚で。プロンプトにそのまま貼れる |
 | POST | `/rooms` | `{ game: string, options?: {...} }` → `{ roomId, hostToken }`。未知のオプションは 400。`options.practice: true` で開始時に空席をサーバー側の練習相手が埋める（打ち方は `practiceAction`、未定義ならランダム。D1 には記録しない）。`options.autoStart: true` で満席になったら自動開始（practice と併用不可）。`options.unlisted: true` で一覧・クイックマッチから外す |
 | GET | `/rooms` | 公開ルームの一覧。`?status=` は `waiting`（既定。空席あり・最終更新から30分以内）か `playing`。`&game=&limit=` で絞り込み。D1 の `rooms` 索引から返す（best-effort。DO が正） |
 | POST | `/quickmatch` | `{ game, options?: { turnTimeMs } }` → `{ roomId, playerId, token, created }`。同じゲーム・持ち時間の autoStart の公開ルームに古い順で入り、無ければ作る |
 | POST | `/rooms/:id/join` | → `{ playerId, token }` |
 | POST | `/rooms/:id/start` | 試合開始（作成者のみ。`hostToken` を Bearer で渡す） |
+| POST | `/rooms/:id/leave` | 待機中ルームからの退出（join の取り消し。Bearer）。トークンは無効になり、その席の WS は close コード 4000 で閉じる。席番号は再利用しない（`nextSeat` の連番） |
+| POST | `/rooms/:id/rematch` | 終了後の再戦（Bearer）→ `{ roomId, playerId, token }`。最初の呼び出しで同じゲーム・オプションの新ルームを作り、人間の席を1つずらして予約する（予約は `init` の引数で meta に持ち、`roomOptions` には入れない）。予約席は `join` 不可（`ROOM_RESERVED`）・一覧に載らない。全員が呼んだら自動開始。同じ人は何度呼んでも同じ席。旧ルームの state に `rematch: { roomId, requestedBy }` が付く |
 | GET | `/rooms/:id/state` | `Authorization: Bearer <token>` があればそのプレイヤー視点、なければ観戦視点 |
 | POST | `/rooms/:id/resign` | 投了。試合中ならいつでも（手番でなくても）。既定は投了者の負けで残り全員が勝ち、その場で終了（`onResign` があればそれに従う）。WS では `{ "type": "resign" }` |
 | POST | `/rooms/:id/action` | WS を使わない簡易 Bot 向け。`{ turn, action }`。相手の手を待つ手段はないので、単発の行動・デバッグ用（対戦は WS） |
 | GET | `/rooms/:id/log` | 行動ログ（リプレイ用。終了後のみ） |
 | GET | `/rooms/:id/replay` | ログから再現した各ターンの観戦視点（終了後のみ） |
-| POST | `/users` | `{ name }` → `{ userId, apiKey }`。join 時に `X-Api-Key` を付けると戦績が紐づく |
+| POST | `/users` | `{ name }` → `{ userId, name, apiKey }`。join 時に `X-Api-Key` を付けると戦績が紐づく |
 | GET | `/users/:id` | ユーザーと戦績 |
 | GET | `/matches` | 終了した試合の一覧（`?game=&limit=`） |
 | GET | `/openapi.json` | 生成された OpenAPI 仕様 |
@@ -137,7 +141,7 @@ export interface GameDefinition<S, A> {
 
 サーバー → クライアント：
 ```json
-{ "type": "state", "turn": 13, "view": { ... }, "legal": [ ... ], "currentPlayers": ["p1"], "deadline": 1732190000000 }
+{ "type": "state", "turn": 13, "view": { ... }, "legal": [ ... ], "currentPlayers": ["p1"], "deadline": 1732190000000, "now": 1732189710000 }
 { "type": "error", "code": "ILLEGAL_ACTION" | "NOT_YOUR_TURN" | "STALE_TURN" | "BAD_REQUEST", "message": "..." }
 { "type": "end", "winners": ["p1"], "scores": { ... }, "reason": "normal" | "timeout" | "resign" }
 ```
@@ -145,6 +149,7 @@ export interface GameDefinition<S, A> {
 - `turn` が現在のターンと一致しない行動は `STALE_TURN` で拒否する（二重送信・古い手の防止）。
 - 締め切りを過ぎてから届いた行動も、Alarm を待たずにその場で時間切れを確定させてから `STALE_TURN` で拒否する。
 - `legal` は、受け取るプレイヤーが今行動できる場合にだけ付ける。
+- `now` はメッセージを作った時点のサーバー時刻（epoch ms）。クライアントは `deadline - now` で残り時間を出す（クライアントの時計ずれ対策）。
 - 投了・時間切れはサーバーが書くログの行（`player = ""`、`action = {"$resign":"p1"}` / `{"$timeout":[...]}`）として1ターン進める。既定（`onTimeout` / `onResign` 未定義）は状態を変えず、決着は meta の `forfeit`。それで試合が終わったときだけ理由を `endReason`（D1 の `matches.reason`）に残す。
 
 ## 無料枠の制約（設計時に必ず守る）
@@ -159,7 +164,7 @@ export interface GameDefinition<S, A> {
 - **必ず Hibernation API を使う**（`state.acceptWebSocket()` + `webSocketMessage()` ハンドラ）。`ws.accept()` は使わない（稼働時間が課金対象になる）。
 - ポーリングを前提にした設計にしない。状態は WS のプッシュで配る。
 - Alarm は「その時点の手番の締め切り」1つだけを設定する（ターンが進むたびに上書きする）。
-- ルーム一覧は D1 の `rooms`（索引）で持つ。書くのは作成・join・開始・終了のときだけで、1手ごとには書かない。`rev` で古い書き込みの上書きを防ぐ。
+- ルーム一覧は D1 の `rooms`（索引）で持つ。書くのは作成・join・退出・開始・終了のときだけで、1手ごとには書かない。`rev` で古い書き込みの上書きを防ぐ。
 - 状態の配信は当面フルの `view` でよい。サイズが問題になったら差分配信（JSON Patch）を検討する。
 
 ## GameRoom（Durable Object）の責務
@@ -206,6 +211,8 @@ pnpm tsx bots/random-bot.ts --url http://localhost:8787 --quickmatch tictactoe
 - TypeScript strict。`any` は使わない（外部入力は zod で `unknown` から検証する）。
 - ゲームロジック（`src/games/`）は Cloudflare の API に依存させない。Node 単体でテストできる状態に保つ。
 - エラーは `GameError(code, message)` で投げ、ルーム側で `error` メッセージに変換する。
-- 新しいゲームを追加するときは、次の3つを必ず用意する：(1) `GameDefinition` の実装（`docs` を含む）、(2) `registry.ts` への登録、(3) ランダム Bot で 100 試合が例外なく終わるテスト（練習相手どうしの 100 試合も all-games テストで自動的に走る。ランダムで決着しにくいゲームは `practiceAction` を定義する）。
+- 新しいゲームを追加するときは、次の3つを必ず用意する：(1) `GameDefinition` の実装（`docs`・`viewSchema` を含む。view が全局面・全視点で `viewSchema` を満たすことは all-games テストで検証される）、(2) `registry.ts` への登録、(3) ランダム Bot で 100 試合が例外なく終わるテスト（練習相手どうしの 100 試合も all-games テストで自動的に走る。ランダムで決着しにくいゲームは `practiceAction` を定義する）。
 - `docs` はゲームのディレクトリの `docs.ts` に置き、**英語**で書く（LLM が読む前提。翻訳は Bot 側に任せる）。特に `view` の各フィールドの意味と、視点による違いを省略しない。全ゲーム共通の遊び方（turn・legal・エラー）は `src/lib/rules.ts` の `COMMON` にあるので、各ゲームには書かない。
+- 読み手は主に LLM を想定しているが、**サイトに出る文言（ガイド・rules・docs・OpenAPI）には「LLM 向け」と書かない**。決定論的な Bot も使うため、誰が読んでも通じる書き方にする（コードのコメントには書いてよい）。
+- OpenAPI の `summary`・`description`・`.describe()` も**英語**で書く（ガイド・rules と同じく LLM が読む。テストで日本語が混ざっていないことを確かめている）。コードのコメントは日本語でよい。
 - 秘密情報（トークンの署名鍵など）は `wrangler secret` で管理し、コミットしない。ローカルでは `.dev.vars` を使う（gitignore 済みにする）。

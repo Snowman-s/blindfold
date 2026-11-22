@@ -26,11 +26,36 @@ export type HighCardAction = { card: number };
 
 const actionSchema = z.object({ card: z.number().int().min(1).max(DECK_SIZE) });
 
+const card = z.number().int().min(1).max(DECK_SIZE);
+const perPlayer = <T extends z.ZodType>(v: T) => z.record(z.string(), v);
+
+const viewSchema = z.strictObject({
+  players: z.array(z.string()).length(2).describe("The two player IDs"),
+  round: z.number().int().min(0).max(ROUNDS).describe(`Number of finished rounds. ${ROUNDS} = game over`),
+  wins: perPlayer(z.number().int().min(0)).describe("Player ID -> rounds won"),
+  history: z
+    .array(
+      z.strictObject({
+        cards: perPlayer(card).describe("Player ID -> card played in that round"),
+        winner: z.string().nullable().describe("Player ID who won the round"),
+      }),
+    )
+    .describe("Finished rounds, oldest first"),
+  handSizes: perPlayer(z.number().int().min(0)).describe("Player ID -> number of cards left in hand"),
+  hasPlayed: perPlayer(z.boolean()).describe("Player ID -> whether that player has played a card this round"),
+  hand: z.array(card).optional().describe("Players only (absent for spectators): your remaining cards, ascending"),
+  myPlayed: card
+    .nullable()
+    .optional()
+    .describe("Players only (absent for spectators): the card you played this round, or null if you have not played yet"),
+});
+
 export const highcard: GameDefinition<HighCardState, HighCardAction> = {
   id: "highcard",
   minPlayers: 2,
   maxPlayers: 2,
   actionSchema,
+  viewSchema,
   docs,
 
   init(players, seed) {

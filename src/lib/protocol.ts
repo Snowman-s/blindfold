@@ -17,6 +17,9 @@ export const clientMessage = z.discriminatedUnion("type", [
 export const END_REASONS = ["normal", "timeout", "resign"] as const;
 export type EndReason = (typeof END_REASONS)[number];
 
+/** WS の close コード：退出したプレイヤーの接続をサーバーが閉じるとき（再接続しても無駄なことを伝える）。 */
+export const CLOSE_LEFT_ROOM = 4000;
+
 /** REST / DO 共通のエラーレスポンスの本体。 */
 export const errBody = (code: string, message: string) => ({ error: { code, message } });
 
@@ -33,8 +36,12 @@ export type ServerMessage =
       legal?: unknown[];
       currentPlayers: string[];
       deadline: number | null;
+      /** サーバーの現在時刻（epoch ms）。残り時間は deadline - now で出す */
+      now: number;
       status: RoomStatus;
       players: string[];
+      /** 終了後、誰かが再戦を申し込んだときだけ付く */
+      rematch?: { roomId: string; requestedBy: string[] };
     }
   | { type: "error"; code: WsErrorCode; message: string }
   | { type: "end"; winners: string[]; scores?: Record<string, number>; reason: EndReason }

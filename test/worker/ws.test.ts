@@ -5,6 +5,7 @@ import { randomPick, runBot, type SocketLike } from "../../bots/bot-core";
 import { games } from "../../src/games/registry";
 import { WS_PROTOCOL, WS_TOKEN_PROTOCOL_PREFIX } from "../../src/lib/auth";
 import { replay } from "../../src/lib/replay";
+import { LogSchema, ReplaySchema } from "../../src/routes/rooms";
 import { BASE, call, newRoom, playOut } from "./helpers";
 const open: WebSocket[] = [];
 afterEach(() => {
@@ -105,6 +106,48 @@ describe("WebSocket", () => {
     expect((await wa.next((m) => m.turn === 1)).legal).toBeUndefined();
   });
 
+  it("state にサーバー時刻 now が入る（WS・REST とも）", async () => {
+    const { roomId, host, a } = await newRoom("tictactoe");
+    const t0 = Date.now();
+    const wa = await connect(roomId, a.token);
+    const s0 = await wa.next((m) => m.type === "state");
+    expect(s0.now).toBeGreaterThanOrEqual(t0);
+    const r = (await call("POST", `/rooms/${roomId}/start`, { token: host })).json;
+    expect(r.now).toBeGreaterThanOrEqual(t0);
+    expect(r.deadline - r.now).toBeGreaterThan(0);
+    const s1 = await wa.next((m) => m.status === "playing");
+    expect(s1.deadline - s1.now).toBeGreaterThan(0);
+  });
+
+  it("同じトークンで複数接続でき、両方に配信される。2本目の同ターンの手は STALE_TURN", async () => {
+    const { roomId, host, a } = await newRoom("tictactoe");
+    const w1 = await connect(roomId, a.token);
+    const w2 = await connect(roomId, a.token);
+    await call("POST", `/rooms/${roomId}/start`, { token: host });
+    await w1.next((m) => m.status === "playing");
+    await w2.next((m) => m.status === "playing");
+    w1.send(JSON.stringify({ type: "action", turn: 0, action: { cell: 0 } }));
+    await w2.next((m) => m.turn === 1);
+    w2.send(JSON.stringify({ type: "action", turn: 0, action: { cell: 1 } }));
+    expect((await w2.next((m) => m.type === "error")).code).toBe("STALE_TURN");
+    expect((await w1.next((m) => m.turn === 1)).view).toEqual((await w2.next((m) => m.turn === 1)).view);
+  });
+
+  it("切断しても負けにならず、再接続すると現在の state（legal 付き）が届いて続きを打てる", async () => {
+    const { roomId, host, a, b } = await newRoom("tictactoe");
+    const wa = await connect(roomId, a.token);
+    await call("POST", `/rooms/${roomId}/start`, { token: host });
+    await wa.next((m) => m.status === "playing");
+    wa.close();
+    const wb = await connect(roomId, b.token);
+    const wa2 = await connect(roomId, a.token);
+    const s = await wa2.next((m) => m.type === "state");
+    expect(s).toMatchObject({ status: "playing", turn: 0 });
+    expect(s.legal).toHaveLength(9);
+    wa2.send(JSON.stringify({ type: "action", turn: 0, action: { cell: 4 } }));
+    expect((await wb.next((m) => m.turn === 1)).legal).toHaveLength(8);
+  });
+
   it("REST の行動も WS 接続に配信される", async () => {
     const { roomId, host, a, b } = await newRoom("tictactoe");
     const wb = await connect(roomId, b.token);
@@ -183,7 +226,14 @@ describe("Bot 同士の対戦", () => {
       expect(games[game]!.view(r.state, null)).toEqual(state.view);
 
       // リプレイ API
+      expect(LogSchema.parse(log)).toEqual(log);
       const rp = (await call("GET", `/rooms/${roomId}/replay`)).json;
+      expect(ReplaySchema.parse(rp)).toEqual(rp);
+      // frames[i].action は frames[i] を作ったログの行（actions[i - 1]）
+      expect(rp.frames[0].action).toBeNull();
+      expect(rp.frames.slice(1).map((f: { action: unknown }) => f.action)).toEqual(log.actions);
+      for (const f of rp.frames) games[game]!.viewSchema.parse(f.view);
+      games[game]!.viewSchema.parse(state.view);
       expect(rp.frames).toHaveLength(state.turn + 1);
       expect(rp.frames.at(-1).view).toEqual(state.view);
       expect(rp.result).toEqual(state.result);
@@ -326,6 +376,8 @@ describe("持ち時間（Alarm）", () => {
     expect(r.turn).toBe(2);
     const rp = (await call("GET", `/rooms/${roomId}/replay`)).json;
     expect(rp.result).toEqual(state.result);
+    expect(ReplaySchema.parse(rp)).toEqual(rp);
+    expect(rp.frames[2].action).toEqual({ turn: 1, player: null, action: null, at: expect.any(Number), timeout: ["p2"] });
   });
 
   it("同時手番では、まだ出していないプレイヤーだけが負ける", async () => {

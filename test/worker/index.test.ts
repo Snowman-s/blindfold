@@ -2,6 +2,9 @@ import { SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { games } from "../../src/games/registry";
 import { WS_PROTOCOL, WS_TOKEN_PROTOCOL_PREFIX } from "../../src/lib/auth";
+import { responseExamples } from "../../src/lib/guide";
+import { LogEntrySchema, LogSchema, ReplaySchema } from "../../src/routes/rooms";
+import { MatchSchema, UserSchema } from "../../src/routes/users";
 import { BASE } from "./helpers";
 
 it("GET / はガイドへの入口を返す", async () => {
@@ -45,7 +48,7 @@ describe("GET /guide.md", () => {
     const states = blocks.filter((b) => b && b.type === "state");
     expect(states.length).toBe(Object.keys(games).length * 2);
     for (const s of states) {
-      expect(Object.keys(s)).toEqual(expect.arrayContaining(["turn", "view", "currentPlayers", "deadline", "status", "players"]));
+      expect(Object.keys(s)).toEqual(expect.arrayContaining(["turn", "view", "currentPlayers", "deadline", "now", "status", "players"]));
     }
   });
 
@@ -81,6 +84,45 @@ describe("GET /guide.md", () => {
     expect(etag).toMatch(/^"[0-9a-f]{12}"$/);
     const c = await SELF.fetch(`${BASE}/guide.md`, { headers: { "If-None-Match": etag } });
     expect(c.status).toBe(304);
+  });
+});
+
+describe("ガイドの応答例", () => {
+  it("/log・/replay・/users/:id・/matches の例は OpenAPI のスキーマを満たす", () => {
+    const r = responseExamples();
+    expect(LogSchema.parse(r.log)).toEqual(r.log);
+    expect(ReplaySchema.parse(r.replay)).toEqual(r.replay);
+    LogEntrySchema.parse(r.timeoutEntry);
+    LogEntrySchema.parse(r.resignEntry);
+    expect(UserSchema.parse(r.user)).toEqual(r.user);
+    expect(MatchSchema.parse(r.match)).toEqual(r.match);
+    expect(r.replay.result).not.toBeNull();
+  });
+
+  it("ガイドに載っている JSON の例はすべてパースできる", async () => {
+    const md = await (await SELF.fetch(`${BASE}/guide.md`)).text();
+    for (const m of md.matchAll(/```json\n([\s\S]*?)\n```/g)) expect(() => JSON.parse(m[1]!)).not.toThrow();
+    expect(md).toContain("### 8.1 `GET /rooms/{id}/log`");
+  });
+});
+
+describe("OpenAPI", () => {
+  it("説明はすべて英語（日本語が混ざっていない）", async () => {
+    const text = await (await SELF.fetch(`${BASE}/openapi.json`)).text();
+    expect(text).not.toMatch(/[぀-ヿ一-鿿＀-￯]/);
+  });
+
+  it("rules に viewSchema と state の例が載る", async () => {
+    for (const id of Object.keys(games)) {
+      const r = await (await SELF.fetch(`${BASE}/games/${id}/rules`)).json<{
+        viewSchema: { type: string };
+        stateExamples: { message: { status: string } }[];
+        endExample: { type: string };
+      }>();
+      expect(r.viewSchema.type).toBe("object");
+      expect(r.stateExamples.map((e) => e.message.status)).toContain("finished");
+      expect(r.endExample.type).toBe("end");
+    }
   });
 });
 

@@ -2,10 +2,11 @@ import { DurableObject } from "cloudflare:workers";
 import { z } from "zod";
 import { getGame } from "../games/registry";
 import { GameError, type AnyGame, type GameResult } from "../games/types";
-import { extractWsAuth, newToken, randomHex } from "../lib/auth";
+import { extractWsAuth, newRoomId, newToken, randomHex } from "../lib/auth";
 import { DEFAULT_TURN_TIME_MS, roomOptions } from "../lib/options";
 import {
   clientMessage,
+  CLOSE_LEFT_ROOM,
   errBody,
   toWsErrorCode,
   type EndReason,
@@ -44,7 +45,17 @@ export interface RoomState {
   legal?: unknown[];
   /** 現在の手番の締め切り（epoch ms）。playing 以外は null */
   deadline: number | null;
+  /** サーバーの現在時刻（epoch ms）。クライアントは deadline - now で残り時間を出す（時計ずれ対策） */
+  now: number;
   result: GameResult | null;
+  /** 終了後に誰かが再戦を申し込んだときだけ付く */
+  rematch?: RematchInfo;
+}
+
+/** 再戦の案内。roomId は新しいルーム、requestedBy は申し込んだ（このルームでの）プレイヤー ID。 */
+export interface RematchInfo {
+  roomId: string;
+  requestedBy: string[];
 }
 
 export interface ReplayFrames {
@@ -56,7 +67,12 @@ export interface ReplayFrames {
   result: GameResult | null;
 }
 
-type Attachment = { playerId: string | null };
+/**
+ * WS に持たせる情報。token は接続時に使ったトークン（サーバー内にだけ保存され、クライアントには送らない）。
+ * 再戦ルームでは退出した席に同じ ID で座り直せるので、ID だけでなくトークンも一致する接続だけをその席として扱う。
+ * token が無いのはこの仕組みの導入前に繋いだ接続で、ID だけで判定する。
+ */
+type Attachment = { playerId: string | null; token?: string };
 
 /**
  * サーバーが書くログの行は player = "" で表す（プレイヤー ID と衝突しない）。
@@ -100,6 +116,7 @@ type RoomCore = {
   currentPlayers: string[];
   deadline: number | null;
   result: GameResult | null;
+  rematch: RematchInfo | null;
 };
 
 export class GameRoom extends DurableObject<Env> {
@@ -158,6 +175,36 @@ export class GameRoom extends DurableObject<Env> {
     return rows.length ? (rows[0]!.id as string) : null;
   }
 
+  /**
+   * 新しい席の ID を払い出す（p1, p2, ... の連番。退出しても番号は再利用しない）。
+   * 再利用すると、閉じ損ねた退出者の WS（attachment に playerId を持つ）が新しい参加者の view を受け取れてしまう。
+   * seq は番号と揃える（手番の順 = ORDER BY seq）。nextSeat が無いのはこの仕組みの導入前に作ったルームで、
+   * 既存の席は p(seq+1) なので、最大の seq の次から払い出す（退出で行数が減っていても衝突しない）。
+   * write の中（トランザクション内）で呼ぶこと。
+   */
+  private allocateSeat(): { id: string; seq: number } {
+    const fallback = () => {
+      const r = this.sql.exec("SELECT MAX(seq) AS m FROM players").toArray()[0];
+      return r?.m === null || r?.m === undefined ? 1 : Number(r.m) + 2;
+    };
+    const stored = this.getMeta("nextSeat");
+    const n = stored !== null ? Number(stored) : fallback();
+    this.setMeta("nextSeat", String(n + 1));
+    return { id: `p${n}`, seq: n - 1 };
+  }
+
+  /** 再戦用に席を予約したルームなら、元のルームのプレイヤー ID → このルームの席 ID。 */
+  private reservedSeats(): Record<string, string> | null {
+    const r = this.getMeta("reserved");
+    return r ? (JSON.parse(r) as Record<string, string>) : null;
+  }
+
+  private rematchInfo(): RematchInfo | null {
+    const roomId = this.getMeta("rematchRoomId");
+    const by = this.getMeta("rematchRequested");
+    return roomId && by ? { roomId, requestedBy: JSON.parse(by) as string[] } : null;
+  }
+
   private loadSnapshot(): { turn: number; state: unknown } {
     const r = this.sql.exec("SELECT turn, state FROM snapshot WHERE id = 1").toArray()[0]!;
     return { turn: r.turn as number, state: JSON.parse(r.state as string) };
@@ -214,7 +261,7 @@ export class GameRoom extends DurableObject<Env> {
     const status = this.status();
     const players = this.playerIds();
     if (status === "waiting") {
-      return { game, status, players, snap: null, currentPlayers: [], deadline: null, result: null };
+      return { game, status, players, snap: null, currentPlayers: [], deadline: null, result: null, rematch: null };
     }
     const snap = this.loadSnapshot();
     return {
@@ -225,11 +272,12 @@ export class GameRoom extends DurableObject<Env> {
       currentPlayers: status === "playing" ? game.currentPlayers(snap.state) : [],
       deadline: this.deadline(),
       result: this.resultOf(game, snap.state),
+      rematch: status === "finished" ? this.rematchInfo() : null,
     };
   }
 
   private stateFor(core: RoomCore, pid: string | null): RoomState {
-    const { game, status, players, snap, currentPlayers, deadline, result } = core;
+    const { game, status, players, snap, currentPlayers, deadline, result, rematch } = core;
     const out: RoomState = {
       game: game.id,
       status,
@@ -238,11 +286,13 @@ export class GameRoom extends DurableObject<Env> {
       currentPlayers,
       view: snap ? game.view(snap.state, pid) : null,
       deadline,
+      now: Date.now(),
       result,
     };
     if (snap && pid && status === "playing" && currentPlayers.includes(pid)) {
       out.legal = game.legalActions(snap.state, pid);
     }
+    if (rematch) out.rematch = rematch;
     return out;
   }
 
@@ -272,8 +322,10 @@ export class GameRoom extends DurableObject<Env> {
       ...(s.legal ? { legal: s.legal } : {}),
       currentPlayers: s.currentPlayers,
       deadline: s.deadline,
+      now: s.now,
       status: s.status,
       players: s.players,
+      ...(s.rematch ? { rematch: s.rematch } : {}),
     };
   }
 
@@ -282,15 +334,37 @@ export class GameRoom extends DurableObject<Env> {
   }
 
   /**
+   * 接続のプレイヤー ID。もう席にいない（退出した）プレイヤーの接続や、座り直す前のトークンの接続は観戦者として扱う
+   * （退出時に閉じるが、閉じ損ねても他人の視点が漏れず、行動もできないように）。
+   */
+  private socketPlayer(ws: WebSocket, seats: Map<string, string>): string | null {
+    const att = ws.deserializeAttachment() as Attachment | null;
+    const pid = att?.playerId ?? null;
+    if (pid === null || !seats.has(pid)) return null;
+    return att?.token === undefined || att.token === seats.get(pid) ? pid : null;
+  }
+
+  /** 席 ID → 今のトークン。 */
+  private seatTokens(): Map<string, string> {
+    return new Map(
+      this.sql
+        .exec("SELECT id, token FROM players")
+        .toArray()
+        .map((r) => [r.id as string, r.token as string]),
+    );
+  }
+
+  /**
    * 全接続に、その接続の視点の view を配る（end があれば続けて end も）。
    * 共通部分は1回だけ読み、同じ視点の接続（観戦者どうしなど）はメッセージを使い回す。
    */
   private broadcast(end?: GameResult): void {
     const core = this.loadCore();
+    const seats = this.seatTokens();
     const byViewer = new Map<string | null, string>();
     const endMsg = end ? JSON.stringify(this.endMessage(end)) : null;
     for (const ws of this.ctx.getWebSockets()) {
-      const pid = (ws.deserializeAttachment() as Attachment | null)?.playerId ?? null;
+      const pid = this.socketPlayer(ws, seats);
       let msg = byViewer.get(pid);
       if (msg === undefined) {
         msg = JSON.stringify(this.stateMessage(this.stateFor(core, pid)));
@@ -520,7 +594,8 @@ export class GameRoom extends DurableObject<Env> {
   private indexStatement(): D1PreparedStatement | null {
     const opts = this.options();
     const id = this.getMeta("roomId");
-    if (!id || !this.env.DB || opts.unlisted || opts.practice) return null;
+    // 再戦ルームは決まったメンバーしか入れないので載せない
+    if (!id || !this.env.DB || opts.unlisted || opts.practice || this.reservedSeats()) return null;
     const rev = Number(this.getMeta("indexRev") ?? "0") + 1;
     this.setMeta("indexRev", String(rev));
     const game = this.game();
@@ -562,11 +637,16 @@ export class GameRoom extends DurableObject<Env> {
 
   // ---- RPC ----
 
-  /** ルーム作成。同じ ID で2回呼ぶと 409。開始権限を持つ hostToken を返す。 */
+  /**
+   * ルーム作成。同じ ID で2回呼ぶと 409。開始権限を持つ hostToken を返す。
+   * reserved（再戦用。元のルームのプレイヤー ID → 席 ID）を渡すと、その席は joinReserved でしか埋まらず、
+   * 全席が埋まった時点で開始する。roomOptions には入れない（POST /rooms から誰でも指定できてしまうため）。
+   */
   async init(
     roomId: string,
     gameId: string,
     options: unknown,
+    reserved: Record<string, string> | null = null,
   ): Promise<RoomResult<{ game: string; hostToken: string }>> {
     if (this.getMeta("gameId") !== null) return fail(409, "ROOM_EXISTS", "room already exists");
     if (!getGame(gameId)) return fail(400, "UNKNOWN_GAME", `unknown game: ${gameId}`);
@@ -581,27 +661,124 @@ export class GameRoom extends DurableObject<Env> {
       this.setMeta("hostToken", hostToken);
       this.setMeta("status", "waiting");
       this.setMeta("createdAt", String(Date.now()));
+      // 再戦ルームでは、練習相手などの追加の席は予約席の後ろから
+      this.setMeta("nextSeat", String(reserved ? Object.keys(reserved).length + 1 : 1));
+      if (reserved) this.setMeta("reserved", JSON.stringify(reserved));
     });
     await this.syncIndex();
     return ok({ game: gameId, hostToken });
   }
 
-  /** 参加。プレイヤー ID は参加順に p1, p2, ... */
+  /** 参加。プレイヤー ID は参加順に p1, p2, ...（退出した席の番号は再利用しない） */
   async join(userId: string | null = null): Promise<RoomResult<{ playerId: string; token: string }>> {
     if (!this.exists()) return NOT_FOUND;
+    if (this.reservedSeats()) return fail(403, "ROOM_RESERVED", "this room is reserved for a rematch");
     if (this.status() !== "waiting") return fail(409, "ALREADY_STARTED", "game already started");
     const n = this.playerIds().length;
     const { maxPlayers } = this.game();
     if (n >= maxPlayers) return fail(409, "ROOM_FULL", "room is full");
-    const playerId = `p${n + 1}`;
     const token = newToken();
+    let playerId = "";
     await this.commit(() => {
-      this.sql.exec("INSERT INTO players(id, token, seq, user_id) VALUES (?, ?, ?, ?)", playerId, token, n, userId);
+      const seat = this.allocateSeat();
+      playerId = seat.id;
+      this.sql.exec("INSERT INTO players(id, token, seq, user_id) VALUES (?, ?, ?, ?)", seat.id, token, seat.seq, userId);
     });
     // autoStart：満席になったらその場で開始する（ホストの start と競合しても startGame が status を見て1回だけ開始する）
     if (this.options().autoStart && n + 1 >= maxPlayers) await this.startGame();
     else await this.syncIndex();
     return ok({ playerId, token });
+  }
+
+  /**
+   * 再戦ルームの予約席に座る（元のルームの rematch から呼ぶ。origin は元のルームでのプレイヤー ID）。
+   * 同じ origin で何度呼んでも同じ席・同じトークンを返す。予約席が全部埋まったら開始する。
+   */
+  async joinReserved(
+    origin: string,
+    userId: string | null,
+  ): Promise<RoomResult<{ playerId: string; token: string }>> {
+    if (!this.exists()) return NOT_FOUND;
+    const reserved = this.reservedSeats();
+    const seat = reserved?.[origin];
+    if (!reserved || !seat) return fail(403, "ROOM_RESERVED", "no seat is reserved for this player");
+    const row = this.sql.exec("SELECT token FROM players WHERE id = ?", seat).toArray()[0];
+    if (row) return ok({ playerId: seat, token: row.token as string });
+    if (this.status() !== "waiting") return fail(409, "ALREADY_STARTED", "game already started");
+    const token = newToken();
+    await this.commit(() => {
+      const seq = Number(seat.slice(1)) - 1;
+      this.sql.exec("INSERT INTO players(id, token, seq, user_id) VALUES (?, ?, ?, ?)", seat, token, seq, userId);
+    });
+    if (this.playerIds().length >= Object.keys(reserved).length) await this.startGame();
+    return ok({ playerId: seat, token });
+  }
+
+  /**
+   * 待機中のルームから退出する（join の取り消し）。席は空き、トークンは無効になり、その席の WS は閉じる。
+   * 再戦ルームでは席は予約されたまま（元のルームの rematch をもう一度呼べば座り直せる）。返すのは観戦視点。
+   */
+  async leave(token: string | null): Promise<RoomResult<RoomState>> {
+    if (!this.exists()) return NOT_FOUND;
+    const pid = this.playerByToken(token);
+    if (!pid) return fail(401, "UNAUTHORIZED", "valid player token required");
+    if (this.status() !== "waiting") return fail(409, "ALREADY_STARTED", "game already started (resign instead)");
+    // ここから commit まで await を挟まない（start と入れ替わらない）
+    await this.commit(() => {
+      this.sql.exec("DELETE FROM players WHERE id = ?", pid);
+    });
+    for (const ws of this.ctx.getWebSockets()) {
+      if ((ws.deserializeAttachment() as Attachment | null)?.playerId !== pid) continue;
+      try {
+        ws.close(CLOSE_LEFT_ROOM, "left the room");
+      } catch {
+        // すでに閉じている
+      }
+    }
+    await this.syncIndex();
+    return ok(this.buildState(null));
+  }
+
+  /**
+   * 再戦：同じメンバーで新しいルームを作る（終了後のみ。プレイヤーのトークンで呼ぶ）。
+   * 最初の呼び出しでルームを作り、席順をそこで決める（人間の席を1つずつずらす。2人なら先手と後手が入れ替わる）。
+   * 呼んだプレイヤーはその場で自分の席に座る。全員が呼んだら開始する（練習相手の席は開始時に埋まる）。
+   * 同じプレイヤーが何度呼んでも同じ { roomId, playerId, token } が返る。
+   */
+  async rematch(token: string | null): Promise<RoomResult<{ roomId: string; playerId: string; token: string }>> {
+    if (!this.exists()) return NOT_FOUND;
+    const pid = this.playerByToken(token);
+    if (!pid) return fail(401, "UNAUTHORIZED", "valid player token required");
+    if (this.status() !== "finished") return fail(403, "NOT_FINISHED", "rematch is available after the game has finished");
+
+    // 新しいルームの ID は await の前に確定させる（同時に呼ばれても1つしか作らない）
+    let roomId = this.getMeta("rematchRoomId");
+    if (!roomId) {
+      roomId = newRoomId();
+      this.setMeta("rematchRoomId", roomId);
+    }
+    const stub = this.env.GAME_ROOM.getByName(roomId);
+    if (this.getMeta("rematchReady") !== "1") {
+      const bots = this.bots();
+      const humans = this.playerIds().filter((p) => !bots.includes(p));
+      const n = humans.length;
+      const reserved = Object.fromEntries(humans.map((p, i) => [p, `p${((i + n - 1) % n) + 1}`]));
+      const init = await stub.init(roomId, this.getMeta("gameId")!, this.options(), reserved);
+      // ROOM_EXISTS は、同時に呼ばれたもう一方が作り終えたということ
+      if (!init.ok && init.code !== "ROOM_EXISTS") return init;
+      this.setMeta("rematchReady", "1");
+    }
+    const userRow = this.sql.exec("SELECT user_id FROM players WHERE id = ?", pid).toArray()[0];
+    const seat = await stub.joinReserved(pid, (userRow?.user_id as string | null | undefined) ?? null);
+    if (!seat.ok) return seat;
+
+    const requested = this.rematchInfo()?.requestedBy ?? [];
+    if (!requested.includes(pid)) {
+      this.setMeta("rematchRequested", JSON.stringify([...requested, pid]));
+      // 終了済みのルームの接続に再戦の申し込みを知らせる（end は送り直さない）
+      await this.attempt("broadcast", () => this.broadcast());
+    }
+    return ok({ roomId, ...seat.data });
   }
 
   /** 試合開始（作成者 = POST /rooms で受け取った hostToken を持つ者のみ）。返すのは観戦視点。 */
@@ -621,26 +798,24 @@ export class GameRoom extends DurableObject<Env> {
     if (this.status() !== "waiting") return fail(409, "ALREADY_STARTED", "game already started");
 
     const game = this.game();
-    const joined = this.playerIds();
-    // 練習相手は参加者の後ろの空席（minPlayers まで）に座る
-    const botIds = this.options().practice
-      ? Array.from({ length: Math.max(0, game.minPlayers - joined.length) }, (_, i) => `p${joined.length + i + 1}`)
-      : [];
-    const players = [...joined, ...botIds];
-    if (players.length < game.minPlayers) {
+    const joined = this.playerIds().length;
+    const botCount = this.options().practice ? Math.max(0, game.minPlayers - joined) : 0;
+    if (joined + botCount < game.minPlayers) {
       return fail(409, "NOT_ENOUGH_PLAYERS", `need at least ${game.minPlayers} players`);
     }
     const seed: Seed = randomHex(16); // 128 ビット。総当たりで特定されないように
-    const state = game.init(players, seed);
     await this.commit(() => {
-      botIds.forEach((id, i) => {
+      // 練習相手は参加者の後ろの空席（minPlayers まで）に座る
+      const botIds = Array.from({ length: botCount }, () => {
+        const seat = this.allocateSeat();
         // トークンは誰にも渡さない（練習相手の席には外から行動できない）
-        this.sql.exec("INSERT INTO players(id, token, seq, user_id) VALUES (?, ?, ?, NULL)", id, newToken(), joined.length + i);
+        this.sql.exec("INSERT INTO players(id, token, seq, user_id) VALUES (?, ?, ?, NULL)", seat.id, newToken(), seat.seq);
+        return seat.id;
       });
       if (botIds.length) this.setMeta("bots", JSON.stringify(botIds));
       this.setMeta("seed", String(seed));
       this.setMeta("startedAt", String(Date.now()));
-      this.saveSnapshot(0, state);
+      this.saveSnapshot(0, game.init(this.playerIds(), seed));
       this.setMeta("status", "playing");
     });
     await this.syncIndex();
@@ -835,7 +1010,7 @@ export class GameRoom extends DurableObject<Env> {
     const pair = new WebSocketPair();
     const [client, server] = [pair[0], pair[1]];
     this.ctx.acceptWebSocket(server); // Hibernation API。server.accept() は使わない
-    server.serializeAttachment({ playerId: pid } satisfies Attachment);
+    server.serializeAttachment((pid ? { playerId: pid, token: auth.token! } : { playerId: null }) satisfies Attachment);
 
     const s = this.buildState(pid);
     this.send(server, this.stateMessage(s));
@@ -862,8 +1037,7 @@ export class GameRoom extends DurableObject<Env> {
       }
       if (msg.data.type === "ping") return this.send(ws, { type: "pong" });
 
-      const att = ws.deserializeAttachment() as Attachment | null;
-      const pid = att?.playerId ?? null;
+      const pid = this.socketPlayer(ws, this.seatTokens());
       const r =
         msg.data.type === "resign" ? await this.resignAs(pid) : await this.actAs(pid, msg.data.turn, msg.data.action);
       if (!r.ok) this.send(ws, { type: "error", code: toWsErrorCode(r.code), message: r.message });

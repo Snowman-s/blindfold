@@ -3,8 +3,9 @@ import { games } from "../games/registry";
 import type { AnyGame } from "../games/types";
 import { sha256Hex, WS_PROTOCOL, WS_TOKEN_PROTOCOL_PREFIX } from "./auth";
 import { DEFAULT_TURN_TIME_MS, roomOptions, WAITING_LIST_TTL_MS } from "./options";
-import { WS_ERROR_CODES, type ServerMessage } from "./protocol";
-import { rngForTurn } from "./rng";
+import { compactJson, gameExamples } from "./examples";
+import { CLOSE_LEFT_ROOM, WS_ERROR_CODES } from "./protocol";
+import { replayFrames } from "./replay";
 
 /**
  * クライアント開発者（主にコーディングエージェント）向けのガイド（GET /guide.md, /llms.txt）。
@@ -16,50 +17,21 @@ import { rngForTurn } from "./rng";
  */
 
 const BASE = "{{BASE}}";
-/** 例の state に入れる締め切り（固定値。実際は epoch ms の現在時刻 + 持ち時間）。 */
-const EXAMPLE_DEADLINE = 1767225600000;
-const EXAMPLE_PLAYERS = ["p1", "p2"];
 
-const json = (v: unknown) => JSON.stringify(v, null, 2);
+const json = (v: unknown) => compactJson(v);
 const code = (lang: string, body: string) => "```" + lang + "\n" + body + "\n```";
-
-/**
- * 固定シードで1手進めた局面の state メッセージ（行動できるプレイヤーの視点と観戦視点）。
- * 実際のエンジンから作るので、view の形が変わっても例が古くならない。
- */
-function exampleStates(game: AnyGame): { actor: string; player: ServerMessage; spectator: ServerMessage } {
-  const seed = "guide-example";
-  let state = game.init(EXAMPLE_PLAYERS, seed);
-  const first = game.currentPlayers(state)[0]!;
-  state = game.apply(state, first, game.legalActions(state, first)[0], rngForTurn(seed, 0));
-  const turn = 1;
-  const current = game.currentPlayers(state);
-  const actor = current[0] ?? first;
-  const msg = (pid: string | null): ServerMessage => {
-    const legal = pid && current.includes(pid) ? game.legalActions(state, pid) : undefined;
-    return {
-      type: "state",
-      turn,
-      view: game.view(state, pid),
-      ...(legal ? { legal } : {}),
-      currentPlayers: current,
-      deadline: EXAMPLE_DEADLINE,
-      status: "playing",
-      players: EXAMPLE_PLAYERS,
-    };
-  };
-  return { actor, player: msg(actor), spectator: msg(null) };
-}
 
 function gameSection(game: AnyGame): string {
   const players = game.minPlayers === game.maxPlayers ? `${game.minPlayers}` : `${game.minPlayers}-${game.maxPlayers}`;
-  const ex = exampleStates(game);
+  const ex = gameExamples(game);
   return [
     `### \`${game.id}\` (${players} players)`,
     "",
     game.docs.summary,
     "",
-    `Full rules, view fields and action schema: [${BASE}/games/${game.id}/rules.md](${BASE}/games/${game.id}/rules.md) (JSON: \`/games/${game.id}/rules\`).`,
+    `Full rules, view fields, the JSON Schema of \`view\`, and more example messages (start of the game, every viewer,` +
+      ` finished game and \`end\`): [${BASE}/games/${game.id}/rules.md](${BASE}/games/${game.id}/rules.md)` +
+      ` (JSON: \`/games/${game.id}/rules\`, fields \`viewSchema\` and \`stateExamples\`).`,
     "",
     "Action JSON Schema:",
     code("json", json(z.toJSONSchema(game.actionSchema))),
@@ -69,6 +41,104 @@ function gameSection(game: AnyGame): string {
     "",
     "The same moment as a **spectator** (no token). Hidden information (if the game has any) is removed and `legal` is absent:",
     code("json", json(ex.spectator)),
+  ].join("\n");
+}
+
+const EXAMPLE_ROOM_ID = "3f9c0a1b2d4e";
+
+/**
+ * /log・/replay・/users/:id・/matches の応答例。最初のゲームを固定シードで最後まで進めた試合から作る
+ * （テストで OpenAPI のスキーマに通して、形がずれていないことを確かめる）。
+ */
+export function responseExamples() {
+  const game = Object.values(games)[0]!;
+  const ex = gameExamples(game);
+  const log = ex.log;
+  const { frames, result } = replayFrames(game, log);
+  const allFrames = frames.map((f, i) => ({
+    turn: f.turn,
+    view: game.view(f.state, null),
+    action: i === 0 ? null : log.actions[i - 1]!,
+  }));
+  const last = log.actions[log.actions.length - 1]!;
+  const user = { id: "u_8b1e2f3a4c5d", name: "alice", stats: { played: 3, wins: 2, losses: 1, draws: 0 } };
+  const outcome = (p: string) => (result!.winners.includes(p) ? "win" : result!.winners.length === 0 ? "draw" : "loss");
+  return {
+    game,
+    log,
+    /** 長いので最初の2フレームと最後のフレームだけ。 */
+    replay: {
+      game: log.game,
+      seed: log.seed,
+      players: log.players,
+      frames: [...allFrames.slice(0, 2), allFrames[allFrames.length - 1]!],
+      result,
+    },
+    timeoutEntry: { turn: 3, player: null, action: null, at: last.at, timeout: ["p2"] },
+    resignEntry: { turn: 3, player: null, action: null, at: last.at, resign: "p1" },
+    user,
+    match: {
+      id: EXAMPLE_ROOM_ID,
+      game: log.game,
+      players: log.players,
+      startedAt: log.actions[0]!.at,
+      finishedAt: last.at,
+      reason: "normal" as const,
+      results: log.players.map((p, i) => ({
+        playerId: p,
+        userId: i === 0 ? user.id : null,
+        outcome: outcome(p),
+        score: result!.scores?.[p] ?? null,
+      })),
+    },
+  };
+}
+
+function responseShapes(): string {
+  const r = responseExamples();
+  return [
+    "### 8.1 `GET /rooms/{id}/log`",
+    "",
+    "Available once the game is `finished`. Before that it fails with `NOT_FINISHED` (403), because the seed would reveal",
+    "hidden information.",
+    `\`seed\` + \`actions\` reproduce the game exactly. Example (a finished \`${r.game.id}\` game):`,
+    code("json", json(r.log)),
+    code(
+      "ts",
+      [
+        "type Log = { game: string; seed: string; players: string[]; actions: LogEntry[] }; // actions[i].turn === i",
+        "type LogEntry = {",
+        "  turn: number;           // the turn it was applied at; applying it produced turn + 1",
+        "  player: string | null;  // who acted; null on a timeout / resignation entry",
+        "  action: unknown | null; // the action as sent (an element of legal); null on a timeout / resignation entry",
+        "  at: number;             // epoch ms (server clock)",
+        "  timeout?: string[];     // only on a timeout entry: the players who ran out of time",
+        "  resign?: string;        // only on a resignation entry: the player who resigned",
+        "};",
+      ].join("\n"),
+    ),
+    "Timeouts and resignations are entries written by the server. They take up one `turn` each, like an action.",
+    "A timeout entry and a resignation entry (each would be one element of `actions`):",
+    code("json", json([r.timeoutEntry, r.resignEntry])),
+    "",
+    "### 8.2 `GET /rooms/{id}/replay`",
+    "",
+    "The same game as a list of spectator views, one per turn: `frames[i].turn === i`, `frames[0]` is the initial",
+    "position and the last frame is the final one. **`frames[i].action` is the log entry that produced frame `i`**",
+    "(`actions[i - 1]` of `/log`, same shape including timeout / resignation entries); it is `null` for `frames[0]`.",
+    "`result` is `{ winners, scores }` as in `end`. Example, showing only the first two and the last frame:",
+    code("json", json(r.replay)),
+    "",
+    "### 8.3 `GET /users/{id}` and `GET /matches`",
+    "",
+    "`POST /users` with `{\"name\":\"alice\"}` returns `{ userId, name, apiKey }` (201). The `apiKey` is shown only once.",
+    "`GET /users/{id}` counts the recorded games joined with that user's `X-Api-Key` (practice games are not recorded):",
+    code("json", json(r.user)),
+    "`GET /matches?game=&limit=` lists finished games, newest first. `id` is the room ID, so `/rooms/{id}/log` and",
+    "`/replay` work with it. `userId` is null for a seat joined without `X-Api-Key`. `outcome` is `win`, `loss` or",
+    "`draw`; `draw` only for a game its rules decided as a draw (if everyone timed out, everyone gets `loss` and",
+    "`winners` is empty). `score` is the game's score for that seat, or null if the game has none.",
+    code("json", json([r.match])),
   ].join("\n");
 }
 
@@ -125,7 +195,38 @@ await post(\`/rooms/\${roomId}/start\`, undefined, hostToken);
 const end = await play(roomId, me.token);
 console.log(end.winners.length === 0 ? "draw" : end.winners.includes(me.playerId) ? "you won" : "you lost", end.scores);`;
 
-const QUICKMATCH_CLIENT = `// Play one game against whoever else is looking for a tictactoe game.
+const RECONNECT_CLIENT = `// Keeps one seat connected until the game ends: pings, and reconnects with backoff.
+// BASE as in section 6, wsBase as in 1.4. onMessage(msg, ws) runs your game loop; reset its "answered turn" per socket.
+function connect(roomId, token, onMessage, delay = 1000, failures = 0) {
+  const ws = new WebSocket(\`\${wsBase}/rooms/\${roomId}/ws\`, ["${WS_PROTOCOL}", "${WS_TOKEN_PROTOCOL_PREFIX}" + token]);
+  let ended = false;
+  let opened = false;
+  let pinger;
+  ws.addEventListener("open", () => {
+    opened = true;
+    delay = 1000;
+    failures = 0;
+    pinger = setInterval(() => ws.send('{"type":"ping"}'), 30_000);
+  });
+  ws.addEventListener("message", (ev) => {
+    const msg = JSON.parse(ev.data);
+    if (msg.type === "end") ended = true;
+    onMessage(msg, ws);
+  });
+  ws.addEventListener("close", async (ev) => {
+    clearInterval(pinger);
+    if (ended || ev.code === ${CLOSE_LEFT_ROOM}) return; // ${CLOSE_LEFT_ROOM} = you left the room (1.2)
+    if (!opened && ++failures % 3 === 0) {
+      // A refused upgrade looks like any other drop (code 1006). Ask REST why, and stop for good on 401 / 404.
+      const res = await fetch(\`\${BASE}/rooms/\${roomId}/state\`, { headers: { Authorization: \`Bearer \${token}\` } }).catch(() => null);
+      if (res && (res.status === 401 || res.status === 404)) return console.error("seat is gone:", res.status);
+    }
+    const wait = delay * (0.5 + Math.random());
+    setTimeout(() => connect(roomId, token, onMessage, Math.min(delay * 2, 30_000), failures), wait);
+  });
+}`;
+
+const QUICKMATCH_CLIENT =`// Play one game against whoever else is looking for a tictactoe game.
 const me = await post("/quickmatch", { game: "tictactoe" }); // { roomId, playerId, token, created }
 console.log(me.created ? "waiting for an opponent..." : "joined an open room");
 const end = await play(me.roomId, me.token);
@@ -145,9 +246,11 @@ type ServerMessage =
       view: unknown;                // game-specific board as seen by the receiver (hidden info removed)
       legal?: unknown[];            // present only if the receiver may act now
       currentPlayers: string[];     // player IDs who may act now (several = simultaneous turn)
-      deadline: number | null;      // epoch ms by which currentPlayers must act; null when not playing
+      deadline: number | null;      // epoch ms (server clock) by which currentPlayers must act; null when not playing
+      now: number;                  // server clock (epoch ms) when this message was built; time left = deadline - now
       status: "waiting" | "playing" | "finished";
-      players: string[];            // all player IDs in join order ("p1", "p2", ...)
+      players: string[];            // all player IDs in seat order ("p1", "p2", ...)
+      rematch?: { roomId: string; requestedBy: string[] }; // only after the end, once someone asked for a rematch (1.9)
     }
   | { type: "error"; code: ${WS_ERROR_CODES.map((c) => `"${c}"`).join(" | ")}; message: string }
   | {
@@ -185,6 +288,8 @@ function buildGuide(): string {
         "STALE_TURN    ignore it and wait for the next `state`",
         'Resign        {"type":"resign"} over WS, or POST /rooms/{id}/resign (Bearer token): you lose, the game ends',
         "End           `end` message: { winners, scores, reason }",
+        "Leave         POST /rooms/{id}/leave (Bearer token): undo a join before the game starts",
+        "Rematch       POST /rooms/{id}/rematch (Bearer token) after the end -> { roomId, playerId, token } in a new room",
       ].join("\n"),
     ),
     "",
@@ -204,13 +309,13 @@ function buildGuide(): string {
     "   auto-start room of that game with the same `turnTimeMs`, or creates one if there is none. The game starts by itself",
     "   as soon as the room is full, so nobody calls `start`.",
     code("sh", `curl -X POST ${BASE}/quickmatch -H 'Content-Type: application/json' -d '{"game":"tictactoe"}'`),
-    code("json", json({ roomId: "3f9c0a1b2d4e5f60", playerId: "p1", token: "<token>", created: true })),
+    code("json", json({ roomId: EXAMPLE_ROOM_ID, playerId: "p1", token: "<token>", created: true })),
     "   `created: true` means you made a new room and are waiting for someone else. Connect the WebSocket **right away**",
     "   with your `token`: you receive `state` messages with `status: \"waiting\"` (and a growing `players`) until the room",
     "   fills, then a `status: \"playing\"` state, with `legal` if you move first. Optional body `options.turnTimeMs`",
     "   (matched exactly) and header `X-Api-Key` work as for `/rooms` and `/join`. Nobody gets a `hostToken`.",
     `   A room you created stops being offered to others ${WAITING_LIST_TTL_MS / 60000} minutes after its last join. If nobody`,
-    "   has joined by then, close the socket and call `/quickmatch` again (the old seat is simply abandoned).",
+    "   has joined by then, call `POST /rooms/{roomId}/leave` with your token (1.2) and `/quickmatch` again.",
     "2. **Browse open rooms.** `GET /rooms` lists public waiting rooms that still have a free seat",
     "   (`?game=&limit=`; each item has `roomId`, `game`, `players`, `maxPlayers`, `autoStart`, `turnTimeMs`). Join one",
     "   with `POST /rooms/{roomId}/join`. The list is an index and can lag a little: if the join fails with `ROOM_FULL`,",
@@ -223,7 +328,7 @@ function buildGuide(): string {
     "",
     "### 1.1 Create a room",
     code("sh", `curl -X POST ${BASE}/rooms -H 'Content-Type: application/json' -d '{"game":"tictactoe"}'`),
-    code("json", json({ roomId: "3f9c0a1b2d4e5f60", hostToken: "<hostToken>" })),
+    code("json", json({ roomId: EXAMPLE_ROOM_ID, hostToken: "<hostToken>" })),
     "",
     "`options` is optional. Unknown keys are rejected with 400. Its JSON Schema:",
     code("json", json(z.toJSONSchema(roomOptions))),
@@ -248,7 +353,13 @@ function buildGuide(): string {
     code("json", json({ playerId: "p1", token: "<token>" })),
     "",
     "- Player IDs are assigned in join order: `p1`, `p2`, ... Keep `token` secret; it identifies the seat.",
-    "- Joining fails with `ROOM_FULL` or `ALREADY_STARTED` (409).",
+    "- Joining fails with `ROOM_FULL` or `ALREADY_STARTED` (409), or `ROOM_RESERVED` (403) for a rematch room (1.9).",
+    `- **Leaving:** before the game starts, \`POST /rooms/{roomId}/leave\` with \`Authorization: Bearer <token>\` frees your`,
+    `  seat. Your token stops working and the server closes your WebSockets to that room with close code ${CLOSE_LEFT_ROOM}`,
+    "  (do not reconnect). Seat numbers are not reused, so the next player to join gets a new ID and `players` can have",
+    "  gaps (for example `[\"p2\", \"p3\"]`). Turn order is the order of `players` (seat order), which is join order",
+    "  except in a rematch room, where the seats are fixed in advance (1.9). Once the game has started, leaving gets",
+    "  `ALREADY_STARTED` (409): resign instead (1.8).",
     "- Optional: send `X-Api-Key: <apiKey>` (from `POST /users` with `{\"name\":\"...\"}`) to record the result on that user.",
     "- To test alone, create the room with `options.practice` (see 1.1) and join once, or join twice and run two connections.",
     "",
@@ -275,7 +386,7 @@ function buildGuide(): string {
     "",
     "- You may connect before or after the game starts. Right after connecting you receive the current `state`",
     "  (`status` may be `waiting`), and if the game is already over, an `end` message right after it.",
-    "- Reconnecting is always safe: the first `state` tells you everything. You do not need to keep local state.",
+    "- Reconnecting is always safe: the first `state` tells you everything. You do not need to keep local state (see 1.10).",
     "- If the upgrade is refused (404 unknown room, 401 invalid token, 400 token in the URL or a malformed subprotocol),",
     "  a browser `WebSocket` cannot read the status or the body: it only fires `error` and `close` (usually code 1006).",
     "  To find out why, call `GET /rooms/{id}/state` with the same token in `Authorization: Bearer`: an unknown room (404)",
@@ -311,7 +422,7 @@ function buildGuide(): string {
     "",
     "REST errors use HTTP status codes with the body `{ \"error\": { \"code\": \"...\", \"message\": \"...\" } }`.",
     "Codes: `BAD_REQUEST` (400), `UNKNOWN_GAME` (400), `ILLEGAL_ACTION` (400), `UNAUTHORIZED` (401), `NOT_HOST` (403),",
-    "`NOT_YOUR_TURN` (403), `NOT_FINISHED` (403), `ROOM_NOT_FOUND` (404, unknown room), `NOT_FOUND` (404: unknown",
+    "`NOT_YOUR_TURN` (403), `NOT_FINISHED` (403), `ROOM_RESERVED` (403), `ROOM_NOT_FOUND` (404, unknown room), `NOT_FOUND` (404: unknown",
     "route, unknown game in `/games/{id}/rules`, unknown user in `/users/{id}`), `ALREADY_STARTED` / `ROOM_FULL` /",
     "`NOT_ENOUGH_PLAYERS` / `NOT_PLAYING` / `STALE_TURN` (409), `UPGRADE_REQUIRED` (426), `INTERNAL` (500).",
     "",
@@ -324,10 +435,22 @@ function buildGuide(): string {
     "",
     "### 1.7 Deadlines",
     "",
-    "`deadline` is an epoch-millisecond timestamp. If a player in `currentPlayers` has not acted by then, the server",
-    "resolves the timeout itself (by default the player who timed out loses; some games define their own handling,",
-    "see the game's rules). An action that arrives after the deadline is rejected with `STALE_TURN`.",
-    "Show a countdown in UIs; bots should simply act promptly.",
+    "`deadline` is an epoch-millisecond timestamp on the **server's** clock. If a player in `currentPlayers` has not",
+    "acted by then, the server resolves the timeout itself (by default the player who timed out loses; some games define",
+    "their own handling, see the game's rules). An action that arrives after the deadline is rejected with `STALE_TURN`.",
+    "",
+    "Every `state` also carries `now`, the server clock when the message was built. Do not compare `deadline` with your",
+    "own `Date.now()`: the client's clock may be off by seconds or more. Take the time left from the server's values and",
+    "count down locally from the moment the message arrived:",
+    code(
+      "js",
+      [
+        "const remainingMs = state.deadline - state.now; // time left when the server sent this state",
+        "const localDeadline = Date.now() + remainingMs;  // the same moment on your own clock (minus network delay)",
+      ].join("\n"),
+    ),
+    "Network delay makes this slightly optimistic, so keep a safety margin. Show a countdown in UIs; bots should",
+    "simply act promptly.",
     "",
     "### 1.8 Resigning",
     "",
@@ -343,7 +466,69 @@ function buildGuide(): string {
     "",
     "Everyone receives `{ \"type\": \"end\", \"winners\": [...], \"scores\": {...}, \"reason\": \"...\" }` after the final",
     "`state` (`status: \"finished\"`). An empty `winners` means a draw. `reason` is `normal` (decided by the game's rules),",
-    "`timeout` or `resign`. You may close the socket.",
+    "`timeout` or `resign`. You may close the socket (the server does not close it for you).",
+    "",
+    "**Rematch.** To play again with the same players, every player calls `POST /rooms/{roomId}/rematch` on the",
+    "finished room with their own token. The first call creates a new room (same game and options); each call seats the",
+    "caller there and returns `{ roomId, playerId, token }` for the **new** room. Connect to it right away (1.4): it",
+    "starts by itself once every player has called rematch, and you receive `waiting` states until then. Seats are",
+    "rotated by one, so your `playerId` changes (in a two-player game, first and second player swap). The seat order is",
+    "fixed when the room is created; it does not depend on who calls rematch first. Calling again",
+    "returns the same seat and token. Only players of the old room can sit there (others get `ROOM_RESERVED`), and",
+    "the room is not listed. Practice bots are added again when it starts, so a practice rematch starts at once.",
+    "Before the end you get `NOT_FINISHED` (403).",
+    "",
+    "When someone asks, everyone still connected to the finished room receives one more `state` (after `end`) with",
+    "`rematch: { roomId, requestedBy }`; `GET /rooms/{id}/state` shows it too. A bot that wants rematches can simply",
+    "call rematch after every `end`. To decline after accepting, leave the new room (`POST /rooms/{newRoomId}/leave`).",
+    "`requestedBy` means \"has asked at least once\"; who is seated right now is the new room's `players`. The other",
+    "players may never answer, so if the new room has not started within a time you choose, leave it and move on.",
+    "",
+    "### 1.10 Disconnects, reconnects and long-running clients",
+    "",
+    "**A disconnect is not a loss.** The server does not care whether your socket is open; only the deadline matters.",
+    "Reconnect and act before `deadline` and nothing is lost. If you stay disconnected past the deadline, the turn times",
+    "out exactly as if you had been connected and idle (by default you lose). Other players are not told that you left.",
+    "",
+    "**Several connections per token are allowed.** You may open more than one WebSocket with the same token (for",
+    "example a bot and a UI, or an old socket that has not noticed it is dead). Every connection receives every",
+    "broadcast. Only the first action for a `turn` is applied; the same-turn action from another connection gets",
+    "`STALE_TURN`. Any number of spectators may connect as well.",
+    "",
+    "**Keepalive.** While a socket is open, send `{\"type\":\"ping\"}` about every 30 seconds. The server answers",
+    "`{\"type\":\"pong\"}` without waking the room, so pings do not use the request budget. A silent socket may be dropped",
+    "by proxies, and the pong tells you the socket is still alive: if nothing arrives within about 10 seconds of a ping,",
+    "close the socket and reconnect.",
+    "",
+    "**When the server closes a socket.** In normal operation the server never closes a socket by itself, not even after",
+    "`end`; that is up to you. It closes one only when it echoes a close you started, when you left the room",
+    `(close code ${CLOSE_LEFT_ROOM}; do not reconnect), or when the platform reports an error on the socket (close code 1011).`,
+    "A socket can also drop without a close frame (code 1006 in browsers) when",
+    "the network fails or the service is redeployed. Treat every unexpected `close` the same way: reconnect.",
+    "",
+    "**Reconnecting.** Open a new WebSocket with the same URL and token. The first message is the current `state`",
+    "(followed by `end` if the game is over), so you need no local state.",
+    "",
+    "- Back off between attempts: about 1 s, 2 s, 4 s, ... up to 30 s, with random jitter. Reset the delay once a",
+    "  connection opens. Turns last minutes by default, so a short outage does not cost the game.",
+    "- Forget which `turn` you already answered. If the first `state` still offers `legal` for that turn, your action was",
+    "  lost: send it again. Had it been applied, the turn would have moved on.",
+    "- Stop after an `end` message. A browser cannot see why an upgrade failed (see 1.4), so after a few failed attempts",
+    "  call `GET /rooms/{id}/state` with the token: 404 (unknown room) or 401 (invalid token) means stop; anything else",
+    "  means keep retrying with backoff.",
+    "",
+    code("js", RECONNECT_CLIENT),
+    "",
+    "**Persist your seat.** Tokens cannot be reissued, and there is no way to look your seat up again. Save `roomId`,",
+    "`playerId` and `token` (to a file, `localStorage`, ...) as soon as `join` or `quickmatch` returns, so a restarted",
+    "process can reconnect and continue. Keep them private: anyone with the token plays your seat. `hostToken` is needed",
+    "only until `start`.",
+    "",
+    "**How long rooms live.** Rooms are currently never deleted: a waiting room stays joinable, and a finished room keeps",
+    "its `state`, `/log` and `/replay`, for as long as the service runs. This is not a promise; download",
+    "`/rooms/{id}/log` (or `/replay`) after the game if you need a permanent record. A waiting room drops out of",
+    `\`GET /rooms\` and quick match ${WAITING_LIST_TTL_MS / 60000} minutes after its last update, but can still be joined by \`roomId\`.`,
+    "An abandoned game in progress ends by itself as its deadlines run out.",
     "",
     "## 2. Message reference (WebSocket)",
     "",
@@ -360,6 +545,8 @@ function buildGuide(): string {
     "| POST | `/rooms` | - | `{ game, options? }` -> `{ roomId, hostToken }` |",
     "| POST | `/rooms/{id}/join` | optional `X-Api-Key` | -> `{ playerId, token }` |",
     "| POST | `/rooms/{id}/start` | Bearer hostToken | start the game |",
+    "| POST | `/rooms/{id}/leave` | Bearer token | leave before the game starts (undo join) |",
+    "| POST | `/rooms/{id}/rematch` | Bearer token | after the end: `{ roomId, playerId, token }` in a new room with the same players |",
     "| GET | `/rooms/{id}/state` | optional Bearer token | current state (player view with token, spectator view without) |",
     "| POST | `/rooms/{id}/action` | Bearer token | `{ turn, action }`; REST alternative to the WS action message |",
     "| POST | `/rooms/{id}/resign` | Bearer token | resign (by default you lose and the game ends) |",
@@ -374,16 +561,18 @@ function buildGuide(): string {
     "`game` and `result` (`{ winners, scores } | null`), without the `type` field.",
     `Full OpenAPI spec: [${BASE}/openapi.json](${BASE}/openapi.json).`,
     "",
-    "## 4. Spectating and replays",
+    "## 4. Spectating, replays and results",
     "",
     "- Find games in progress with `GET /rooms?status=playing` (public rooms only).",
     "- Connect to `/rooms/{id}/ws` with only the `" + WS_PROTOCOL + "` subprotocol (no token) to receive spectator `state` messages.",
-    "- After the game ends, `GET /rooms/{id}/replay` returns `{ game, seed, players, frames: [{ turn, view, action }], result }`,",
-    "  where `view` is the spectator view at each turn. Use it to build a replay viewer.",
+    "- After the game ends, `GET /rooms/{id}/replay` gives the spectator view at every turn. Use it to build a",
+    "  replay viewer. Finished games are listed in `GET /matches`. Response shapes and examples: section 8.",
     "",
     "## 5. Games",
     "",
-    "Each game defines its own `view` and `action`. Examples below are generated from the real game engine.",
+    "Each game defines its own `view` and `action`. Examples below are generated from the real game engine. For typed",
+    "clients (TypeScript types, Python dataclasses, ...), generate the types from `viewSchema` and `actionSchema` in",
+    "`GET /games/{id}/rules` (JSON Schema) instead of guessing from the examples.",
     "",
     gameList.map(gameSection).join("\n\n"),
     "",
@@ -408,6 +597,15 @@ function buildGuide(): string {
     "- [ ] REST responses that are not JSON (or are 5xx) are retried later instead of crashing the JSON parser.",
     "- [ ] The UI handles `status: \"waiting\"` (before start) and `view` fields that only some viewers receive.",
     "- [ ] On `end`, the result is shown and the socket is closed.",
+    "- [ ] Countdowns use `deadline - now` from the `state`, not the local clock.",
+    "- [ ] `roomId`, `playerId` and `token` are saved; an unexpected `close` leads to a reconnect with backoff.",
+    "- [ ] While the socket is open, `{\"type\":\"ping\"}` is sent about every 30 seconds.",
+    "",
+    "## 8. Response reference (logs, replays, users, matches)",
+    "",
+    "Needed for replay viewers and result pages, not for playing. Full schemas are in the OpenAPI spec.",
+    "",
+    responseShapes(),
     "",
   ].join("\n");
 }

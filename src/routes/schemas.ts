@@ -26,12 +26,12 @@ const errorResponse = (description: string) => ({
 });
 
 export const errors = {
-  400: errorResponse("不正なリクエスト"),
-  401: errorResponse("トークンが無効"),
-  403: errorResponse("権限がない／まだ公開できない"),
-  404: errorResponse("ルームが存在しない"),
-  409: errorResponse("現在の状態では実行できない（STALE_TURN など）"),
-  426: errorResponse("WebSocket へのアップグレードが必要（UPGRADE_REQUIRED）"),
+  400: errorResponse("Bad request (BAD_REQUEST, UNKNOWN_GAME, ILLEGAL_ACTION)"),
+  401: errorResponse("Invalid token or API key (UNAUTHORIZED)"),
+  403: errorResponse("Not allowed, or not available yet (NOT_HOST, NOT_YOUR_TURN, NOT_FINISHED, ROOM_RESERVED)"),
+  404: errorResponse("Not found (ROOM_NOT_FOUND, NOT_FOUND)"),
+  409: errorResponse("Not possible in the current state (ALREADY_STARTED, ROOM_FULL, NOT_ENOUGH_PLAYERS, NOT_PLAYING, STALE_TURN)"),
+  426: errorResponse("A WebSocket upgrade is required (UPGRADE_REQUIRED)"),
 } as const;
 
 export const ResultSchema = z
@@ -45,13 +45,21 @@ export const RoomStateSchema = z
   .object({
     game: z.string(),
     status: z.enum(ROOM_STATUSES),
-    turn: z.number().int().describe("適用済みの行動数。行動にはこの値を付けて送る"),
+    turn: z.number().int().describe("Number of actions applied so far. Send this value with your action"),
     players: z.array(z.string()),
     currentPlayers: z.array(z.string()),
-    view: z.unknown().describe("ゲームごとの視点付き盤面（隠し情報は除去済み）"),
-    legal: z.array(z.unknown()).optional().describe("呼び出したプレイヤーが今行動できるときだけ付く"),
-    deadline: z.number().nullable().describe("現在の手番の締め切り（epoch ms）"),
+    view: z.unknown().describe("Game-specific board as seen by the caller (hidden information removed). Its JSON Schema is viewSchema in /games/{id}/rules. null while waiting"),
+    legal: z.array(z.unknown()).optional().describe("Present only if the caller may act now"),
+    deadline: z.number().nullable().describe("Deadline of the current turn (epoch ms, server clock). null unless playing"),
+    now: z.number().describe("Server clock (epoch ms) when this response was built. Time left = deadline - now (do not use the client's clock)"),
     result: ResultSchema.nullable(),
+    rematch: z
+      .object({
+        roomId: z.string().describe("The new room. Call POST /rooms/{id}/rematch on this (finished) room to take your seat there"),
+        requestedBy: z.array(z.string()).describe("Players of this room who have asked for the rematch"),
+      })
+      .optional()
+      .describe("Present only after the game has finished and someone asked for a rematch"),
   })
   .openapi("RoomState");
 

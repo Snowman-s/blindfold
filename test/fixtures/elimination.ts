@@ -23,6 +23,7 @@ export const elimination: GameDefinition<ElimState, { pass: true }> = {
   minPlayers: 2,
   maxPlayers: 3,
   actionSchema: z.object({ pass: z.literal(true) }),
+  viewSchema: z.strictObject({ alive: z.array(z.string()), turn: z.number().int() }),
   docs: { summary: "test", rules: "test", view: "test", examples: [{ action: { pass: true }, meaning: "pass" }] },
   init: (players) => ({ alive: [...players], turn: 0 }),
   currentPlayers: (s) => (s.alive.length > 1 ? [s.alive[s.turn]!] : []),

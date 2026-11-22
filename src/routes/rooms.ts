@@ -4,7 +4,7 @@ import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { games, getGame } from "../games/registry";
 import { extractToken, newRoomId, sha256Hex, WS_PROTOCOL, WS_TOKEN_PROTOCOL_PREFIX } from "../lib/auth";
 import { DEFAULT_TURN_TIME_MS, roomOptions, turnTimeMs, WAITING_LIST_TTL_MS } from "../lib/options";
-import { actionBody } from "../lib/protocol";
+import { actionBody, CLOSE_LEFT_ROOM } from "../lib/protocol";
 import { gameRules, rulesMarkdown, type GameRules } from "../lib/rules";
 import type { RoomResult } from "../room/GameRoom";
 import {
@@ -61,7 +61,7 @@ const GameInfo = z
     minPlayers: z.number().int(),
     maxPlayers: z.number().int(),
     summary: z.string(),
-    rulesUrl: z.string().describe("ルールの詳細（JSON）。Markdown は末尾に .md を付ける"),
+    rulesUrl: z.string().describe("Rules in JSON. Append .md for the Markdown version"),
   })
   .openapi("GameInfo");
 
@@ -71,8 +71,8 @@ routes.openapi(
     path: "/games",
     tags: ["games"],
     operationId: "listGames",
-    summary: "利用できるゲームの一覧",
-    responses: { 200: { description: "ゲーム一覧", content: { "application/json": { schema: z.array(GameInfo) } } } },
+    summary: "List available games",
+    responses: { 200: { description: "Games", content: { "application/json": { schema: z.array(GameInfo) } } } },
   }),
   (c) =>
     c.json(
@@ -94,15 +94,20 @@ const GameIdParam = z.object({
 const GameRulesSchema = z
   .object({
     id: z.string(),
-    version: z.string().describe("説明の内容のハッシュ。キャッシュした説明が古いか判定できる"),
+    version: z.string().describe("Hash of the content (also sent as ETag). Tells whether a cached copy is outdated"),
     minPlayers: z.number().int(),
     maxPlayers: z.number().int(),
     summary: z.string(),
-    rules: z.string().describe("Markdown。目的・手番・勝敗・時間切れ"),
-    view: z.string().describe("Markdown。view の各フィールドの意味"),
-    actionSchema: z.unknown().describe("action の JSON Schema"),
+    rules: z.string().describe("Markdown: goal, turns, how the game is decided, timeouts"),
+    view: z.string().describe("Markdown: meaning of each field of view, and how it differs by viewer"),
+    viewSchema: z.unknown().describe("JSON Schema of view (fields that only some viewers receive are optional)"),
+    actionSchema: z.unknown().describe("JSON Schema of action"),
     examples: z.array(z.object({ action: z.unknown(), meaning: z.string() })),
-    common: z.string().describe("Markdown。全ゲーム共通の遊び方（turn・legal・エラー）"),
+    stateExamples: z
+      .array(z.object({ title: z.string(), message: z.unknown() }))
+      .describe("Example state messages generated from the engine: start, after one action (each viewer), finished"),
+    endExample: z.unknown().describe("The end message that follows the finished example"),
+    common: z.string().describe("Markdown: how to play, common to all games (turn, legal, errors)"),
   })
   .openapi("GameRules");
 
@@ -127,14 +132,14 @@ routes.openapi(
     path: "/games/{id}/rules",
     tags: ["games"],
     operationId: "getGameRules",
-    summary: "ゲームの説明（LLM 向け）",
+    summary: "Game rules",
     description:
-      "ルール・view の読み方・行動の JSON Schema・全ゲーム共通の遊び方を返す。Bot 上の LLM のプロンプトに入れることを想定。" +
-      "プロンプトにそのまま貼れる Markdown 版は `/games/{id}/rules.md`。",
+      "Rules, how to read `view`, the JSON Schemas of `view` and `action`, example states, and how to play (common to all games). " +
+      "The same content as one Markdown page: `/games/{id}/rules.md`.",
     request: { params: GameIdParam },
     responses: {
-      200: { description: "ゲームの説明", content: { "application/json": { schema: GameRulesSchema } } },
-      304: { description: "If-None-Match の version から変わっていない" },
+      200: { description: "Game rules", content: { "application/json": { schema: GameRulesSchema } } },
+      304: { description: "Not modified since the version in If-None-Match" },
       404: errors[404],
     },
   }),
@@ -147,11 +152,11 @@ routes.openapi(
     path: "/games/{id}/rules.md",
     tags: ["games"],
     operationId: "getGameRulesMarkdown",
-    summary: "ゲームの説明（Markdown 1枚）",
+    summary: "Game rules (one Markdown page)",
     request: { params: GameIdParam },
     responses: {
       200: { description: "Markdown", content: { "text/markdown": { schema: z.string() } } },
-      304: { description: "If-None-Match の version から変わっていない" },
+      304: { description: "Not modified since the version in If-None-Match" },
       404: errors[404],
     },
   }),
@@ -167,13 +172,13 @@ routes.openapi(
     path: "/rooms",
     tags: ["rooms"],
     operationId: "createRoom",
-    summary: "ルーム作成",
+    summary: "Create a room",
     description:
-      "`options.turnTimeMs`（1000〜86400000）で1手の持ち時間を指定できる。省略時は5分。時間切れは負け扱い。" +
-      "`options.practice: true` を付けると、開始時に空席（minPlayers まで）をサーバー側の練習相手が埋める（打ち方はゲームごと。戦績には残らない）。" +
-      "`options.autoStart: true` なら満席（maxPlayers）になった時点で自動で開始する（practice とは併用不可）。" +
-      "ルームは既定で一覧（`GET /rooms`）に載る。載せたくなければ `options.unlisted: true`（練習ルームは常に載らない）。" +
-      "未知のオプションは 400。返ってくる `hostToken` は試合開始（`/rooms/{id}/start`）に必要で、作成者だけが持つ。",
+      "`options.turnTimeMs` (1000-86400000) sets the time limit per turn; the default is 5 minutes. By default a player who times out loses. " +
+      "With `options.practice: true`, server-side practice bots fill the empty seats (up to minPlayers) when the game starts (how they play depends on the game; practice games are not recorded). " +
+      "With `options.autoStart: true`, the game starts as soon as maxPlayers have joined (cannot be combined with practice). " +
+      "Rooms are listed in `GET /rooms` by default; pass `options.unlisted: true` to hide a room (practice rooms are never listed). " +
+      "Unknown options are rejected with 400. The returned `hostToken` is needed to start the game (`/rooms/{id}/start`); only the creator has it.",
     request: {
       body: {
         required: true,
@@ -186,12 +191,12 @@ routes.openapi(
     },
     responses: {
       201: {
-        description: "作成済み",
+        description: "Created",
         content: {
           "application/json": {
             schema: z.object({
               roomId: z.string(),
-              hostToken: z.string().describe("試合開始に使う作成者用トークン。プレイヤートークンとは別"),
+              hostToken: z.string().describe("The creator's token for starting the game. Not a player token"),
             }),
           },
         },
@@ -213,9 +218,9 @@ const RoomSummary = z
     roomId: z.string(),
     game: z.string(),
     status: z.enum(["waiting", "playing"]),
-    players: z.number().int().describe("参加人数"),
+    players: z.number().int().describe("Number of players who have joined"),
     maxPlayers: z.number().int(),
-    autoStart: z.boolean().describe("true なら満席になった時点で自動で始まる"),
+    autoStart: z.boolean().describe("If true, the game starts by itself once the room is full"),
     turnTimeMs: z.number().int(),
     createdAt: z.number(),
     updatedAt: z.number(),
@@ -228,11 +233,11 @@ routes.openapi(
     path: "/rooms",
     tags: ["rooms"],
     operationId: "listRooms",
-    summary: "公開ルームの一覧（待機中・進行中）",
+    summary: "List public rooms (waiting or playing)",
     description:
-      "`status=waiting`（既定）は空席がある待機中のルーム。最後の更新から30分を過ぎたものは出さない。" +
-      "`status=playing` は進行中のルーム（観戦用）。終了した試合は `/matches`。" +
-      "`options.unlisted` と練習ルームは載らない。一覧は索引なので古いことがある（join が `ROOM_FULL` などで失敗したら次を試す）。",
+      "`status=waiting` (default): waiting rooms with a free seat, updated within the last 30 minutes. " +
+      "`status=playing`: games in progress (for spectating). Finished games are in `/matches`. " +
+      "Unlisted and practice rooms are never listed. The list is an index and may lag: if a join fails with `ROOM_FULL` or similar, try the next room.",
     request: {
       query: z.object({
         status: z.enum(["waiting", "playing"]).default("waiting").openapi({ param: { name: "status", in: "query" } }),
@@ -241,7 +246,7 @@ routes.openapi(
       }),
     },
     responses: {
-      200: { description: "ルーム一覧（新しく更新された順）", content: { "application/json": { schema: z.array(RoomSummary) } } },
+      200: { description: "Rooms, most recently updated first", content: { "application/json": { schema: z.array(RoomSummary) } } },
       400: errors[400],
     },
   }),
@@ -285,11 +290,11 @@ routes.openapi(
     path: "/quickmatch",
     tags: ["rooms"],
     operationId: "quickMatch",
-    summary: "クイックマッチ（空いている部屋に入る。無ければ作る）",
+    summary: "Quick match (join an open room, or create one)",
     description:
-      "同じゲーム・同じ持ち時間の、自動開始（`autoStart`）の公開ルームに空席があれば参加し、無ければ `autoStart: true` のルームを作って参加する。" +
-      "満席になった時点で自動で始まるので、返ってきた `token` ですぐ WebSocket に接続して待てばよい（`status: \"waiting\"` の state が届き、揃うと `playing` になる）。" +
-      "`created` は新しくルームを作ったかどうか。`hostToken` は返さない（誰も早めに開始できない）。`X-Api-Key` を付けると戦績が紐づく。",
+      "Joins the oldest public auto-start room of the same game and turn time that has a free seat, or creates such a room (`autoStart: true`) and joins it. " +
+      "The game starts by itself once the room is full, so connect the WebSocket with the returned `token` right away and wait (you receive `status: \"waiting\"` states, then `playing`). " +
+      "`created` tells whether a new room was created. No `hostToken` is returned (nobody can start early). Send `X-Api-Key` to record the result on your user.",
     request: {
       headers: ApiKeyHeader,
       body: {
@@ -306,14 +311,14 @@ routes.openapi(
     },
     responses: {
       201: {
-        description: "参加済み",
+        description: "Joined",
         content: {
           "application/json": {
             schema: z.object({
               roomId: z.string(),
               playerId: z.string(),
               token: z.string(),
-              created: z.boolean().describe("true なら新しく作ったルーム（相手が来るまで待つ）"),
+              created: z.boolean().describe("True if a new room was created (wait for opponents)"),
             }),
           },
         },
@@ -360,15 +365,17 @@ routes.openapi(
     path: "/rooms/{id}/join",
     tags: ["rooms"],
     operationId: "joinRoom",
-    summary: "ルームに参加",
-    description: "プレイヤー ID は参加順に p1, p2, ...。`X-Api-Key` を付けると戦績がそのユーザーに紐づく。",
+    summary: "Join a room",
+    description:
+      "Player IDs are assigned in join order: p1, p2, ... (numbers of seats that were left are not reused). Seat order (= `players`) is the turn order. " +
+      "Rematch rooms cannot be joined here (`ROOM_RESERVED` 403; use `POST /rooms/{id}/rematch` on the finished room). Send `X-Api-Key` to record the result on that user.",
     request: {
       params: RoomIdParam,
       headers: ApiKeyHeader,
     },
     responses: {
       201: {
-        description: "参加済み",
+        description: "Joined",
         content: { "application/json": { schema: z.object({ playerId: z.string(), token: z.string() }) } },
       },
       401: errors[401],
@@ -389,13 +396,13 @@ routes.openapi(
     path: "/rooms/{id}/start",
     tags: ["rooms"],
     operationId: "startRoom",
-    summary: "試合開始（作成者のみ）",
+    summary: "Start the game (room creator only)",
     description:
-      "`POST /rooms` で受け取った `hostToken` を `Authorization: Bearer` で渡す。プレイヤートークンでは 403。返すのは観戦視点。",
+      "Send the `hostToken` from `POST /rooms` as `Authorization: Bearer`. A player token gets 403. Returns the spectator view.",
     security: bearerSecurity,
     request: { params: RoomIdParam },
     responses: {
-      200: { description: "開始済み", content: { "application/json": { schema: RoomStateSchema } } },
+      200: { description: "Started", content: { "application/json": { schema: RoomStateSchema } } },
       401: errors[401],
       403: errors[403],
       404: errors[404],
@@ -411,12 +418,12 @@ routes.openapi(
     path: "/rooms/{id}/state",
     tags: ["rooms"],
     operationId: "getState",
-    summary: "状態取得",
-    description: "`Authorization: Bearer <token>` があればそのプレイヤー視点、なければ観戦視点。",
+    summary: "Get the current state",
+    description: "With `Authorization: Bearer <token>`, the view of that player; without it, the spectator view. An invalid token is rejected with 401 (no fallback to the spectator view).",
     security: [...bearerSecurity, {}],
     request: { params: RoomIdParam },
     responses: {
-      200: { description: "現在の状態", content: { "application/json": { schema: RoomStateSchema } } },
+      200: { description: "Current state", content: { "application/json": { schema: RoomStateSchema } } },
       401: errors[401],
       404: errors[404],
     },
@@ -430,12 +437,12 @@ routes.openapi(
     path: "/rooms/{id}/action",
     tags: ["rooms"],
     operationId: "postAction",
-    summary: "行動を送る（WS を使わない簡易 Bot 向け）",
+    summary: "Send an action (for simple bots without WebSocket)",
     description:
-      "補助的な手段。REST には相手の手番が終わるのを待つ仕組みがないので、1試合を通して遊ぶなら WebSocket（`/rooms/{id}/ws`）を使う。" +
-      "`/state` のポーリングは前提にしない（無料枠のリクエスト数を消費する）。" +
-      "`turn` が現在のターンと一致しなければ `STALE_TURN`（409）。" +
-      "持ち時間を過ぎてから届いた行動も、その場で時間切れを確定させたうえで `STALE_TURN` になる。",
+      "A secondary option. REST has no way to wait for the other players, so use the WebSocket (`/rooms/{id}/ws`) to play a full game. " +
+      "Do not poll `/state` (it uses up the free-tier request budget). " +
+      "If `turn` is not the current turn, the action is rejected with `STALE_TURN` (409). " +
+      "An action that arrives after the deadline also gets `STALE_TURN`, after the timeout is resolved on the spot.",
     security: bearerSecurity,
     request: {
       params: RoomIdParam,
@@ -447,7 +454,7 @@ routes.openapi(
       },
     },
     responses: {
-      200: { description: "行動後の状態", content: { "application/json": { schema: RoomStateSchema } } },
+      200: { description: "State after the action", content: { "application/json": { schema: RoomStateSchema } } },
       400: errors[400],
       401: errors[401],
       403: errors[403],
@@ -467,14 +474,14 @@ routes.openapi(
     path: "/rooms/{id}/resign",
     tags: ["rooms"],
     operationId: "resign",
-    summary: "投了（降参）",
+    summary: "Resign",
     description:
-      "試合中ならいつでも（自分の手番でなくても）投了できる。投了したプレイヤーの負けで、残りのプレイヤー全員が勝者になり、試合はその場で終わる。" +
-      "WebSocket では `{\"type\":\"resign\"}` を送る。待機中・終了後は `NOT_PLAYING`（409）。取り消しはできない。",
+      "Allowed at any time while the game is playing, even when it is not your turn. By default the resigning player loses, all other players win, and the game ends immediately (some games define their own handling). " +
+      "Over the WebSocket, send `{\"type\":\"resign\"}`. Before the start or after the end: `NOT_PLAYING` (409). It cannot be undone.",
     security: bearerSecurity,
     request: { params: RoomIdParam },
     responses: {
-      200: { description: "投了後の状態（status は finished）", content: { "application/json": { schema: RoomStateSchema } } },
+      200: { description: "State after resigning (status is finished, unless the game goes on without you)", content: { "application/json": { schema: RoomStateSchema } } },
       401: errors[401],
       404: errors[404],
       409: errors[409],
@@ -483,23 +490,101 @@ routes.openapi(
   async (c) => respond(c, await room(c).resign(extractToken(c.req.raw))),
 );
 
-const LogSchema = z
+routes.openapi(
+  createRoute({
+    method: "post",
+    path: "/rooms/{id}/leave",
+    tags: ["rooms"],
+    operationId: "leaveRoom",
+    summary: "Leave a waiting room (undo join)",
+    description:
+      "Only before the game starts (after that: `ALREADY_STARTED` 409; resign instead). Your seat is freed, your token stops working, " +
+      `and the server closes your WebSockets to this room with close code ${CLOSE_LEFT_ROOM}. Seat numbers are not reused: the next player to join gets a new ID. ` +
+      "Returns the spectator view.",
+    security: bearerSecurity,
+    request: { params: RoomIdParam },
+    responses: {
+      200: { description: "Left", content: { "application/json": { schema: RoomStateSchema } } },
+      401: errors[401],
+      404: errors[404],
+      409: errors[409],
+    },
+  }),
+  async (c) => respond(c, await room(c).leave(extractToken(c.req.raw))),
+);
+
+routes.openapi(
+  createRoute({
+    method: "post",
+    path: "/rooms/{id}/rematch",
+    tags: ["rooms"],
+    operationId: "rematch",
+    summary: "Rematch (same players, new room)",
+    description:
+      "Call it on the finished room with your player token. The first call creates a new room with the same game and options; " +
+      "every call seats the caller there and returns the new `roomId`, `playerId` and `token`. Seats are rotated by one " +
+      "(in a two-player game, first and second player swap). Only the players of this room can take those seats (others get `ROOM_RESERVED` 403). " +
+      "The new game starts by itself once every player has called rematch (practice bots are added again at start). " +
+      "Calling again returns the same seat and token. The finished room's `state` gets `rematch: { roomId, requestedBy }`, pushed over the WebSocket, " +
+      "so the other players can see the offer (`requestedBy` lists everyone who has asked at least once). " +
+      "The others may never answer: if the new room does not start within a time you choose, leave it. To decline after accepting, leave the new room (`POST /rooms/{newId}/leave`). Before the end: `NOT_FINISHED` 403.",
+    security: bearerSecurity,
+    request: { params: RoomIdParam },
+    responses: {
+      200: {
+        description: "Your seat in the new room",
+        content: {
+          "application/json": { schema: z.object({ roomId: z.string(), playerId: z.string(), token: z.string() }) },
+        },
+      },
+      401: errors[401],
+      403: errors[403],
+      404: errors[404],
+      409: errors[409],
+    },
+  }),
+  async (c) => respond(c, await room(c).rematch(extractToken(c.req.raw))),
+);
+
+export const LogEntrySchema = z
+  .object({
+    turn: z.number().int().describe("The turn this entry was applied at (0, 1, 2, ...). Applying it produced turn + 1"),
+    player: z.string().nullable().describe("Who acted. null for a timeout or resignation entry (written by the server)"),
+    action: z.unknown().describe("The action as sent (an element of legal). null for a timeout or resignation entry"),
+    at: z.number().describe("When it was applied (epoch ms, server clock)"),
+    timeout: z.array(z.string()).optional().describe("Present only on a timeout entry: the players who ran out of time"),
+    resign: z.string().optional().describe("Present only on a resignation entry: the player who resigned"),
+  })
+  .openapi("LogEntry");
+
+export const LogSchema = z
   .object({
     game: z.string(),
-    seed: z.string().describe("初期シード（128 ビット、16 進 32 文字）"),
+    seed: z.string().describe("Initial seed (128 bits, 32 hex characters)"),
     players: z.array(z.string()),
-    actions: z.array(
-      z.object({
-        turn: z.number().int(),
-        player: z.string().nullable(),
-        action: z.unknown(),
-        at: z.number(),
-        timeout: z.array(z.string()).optional().describe("持ち時間切れになったプレイヤー（あれば player / action は null）"),
-        resign: z.string().optional().describe("投了したプレイヤー（あれば player / action は null）"),
-      }),
-    ),
+    actions: z.array(LogEntrySchema).describe("Every entry in turn order; actions[i].turn === i"),
   })
   .openapi("ReplayLog");
+
+export const ReplaySchema = z
+  .object({
+    game: z.string(),
+    seed: z.string(),
+    players: z.array(z.string()),
+    frames: z
+      .array(
+        z.object({
+          turn: z.number().int(),
+          view: z.unknown().describe("Spectator view at this turn"),
+          action: LogEntrySchema.nullable().describe(
+            "The log entry that produced this frame (= actions[turn - 1] of /log). null for the first frame (turn 0)",
+          ),
+        }),
+      )
+      .describe("frames[i].turn === i. The first frame is the initial position, the last one the final position"),
+    result: ResultSchema.nullable(),
+  })
+  .openapi("Replay");
 
 routes.openapi(
   createRoute({
@@ -507,11 +592,11 @@ routes.openapi(
     path: "/rooms/{id}/log",
     tags: ["rooms"],
     operationId: "getLog",
-    summary: "行動ログ（リプレイ用）",
-    description: "シードから隠し情報が分からないよう、試合終了後のみ取得できる。`seed` + `actions` から試合を完全に再現できる。",
+    summary: "Action log (for replays)",
+    description: "Available only after the game has ended, so that the seed cannot reveal hidden information. `seed` + `actions` reproduce the game exactly.",
     request: { params: RoomIdParam },
     responses: {
-      200: { description: "行動ログ", content: { "application/json": { schema: LogSchema } } },
+      200: { description: "Action log", content: { "application/json": { schema: LogSchema } } },
       403: errors[403],
       404: errors[404],
     },
@@ -525,21 +610,13 @@ routes.openapi(
     path: "/rooms/{id}/replay",
     tags: ["rooms"],
     operationId: "getReplay",
-    summary: "ログから再現した各ターンの観戦視点",
+    summary: "Spectator view for every turn, reproduced from the log",
     request: { params: RoomIdParam },
     responses: {
       200: {
-        description: "リプレイ",
+        description: "Replay",
         content: {
-          "application/json": {
-            schema: z.object({
-              game: z.string(),
-              seed: z.string(),
-              players: z.array(z.string()),
-              frames: z.array(z.object({ turn: z.number().int(), view: z.unknown(), action: z.unknown() })),
-              result: ResultSchema.nullable(),
-            }),
-          },
+          "application/json": { schema: ReplaySchema },
         },
       },
       403: errors[403],
@@ -555,14 +632,14 @@ routes.openAPIRegistry.registerPath({
   path: "/rooms/{id}/ws",
   tags: ["rooms"],
   operationId: "connectWebSocket",
-  summary: "WebSocket へアップグレード",
+  summary: "Upgrade to WebSocket",
   description:
-    `プレイヤーとして接続するときは、サブプロトコルで \`["${WS_PROTOCOL}", "${WS_TOKEN_PROTOCOL_PREFIX}<token>"]\` を渡す` +
-    `（例: \`new WebSocket(url, ["${WS_PROTOCOL}", "${WS_TOKEN_PROTOCOL_PREFIX}" + token])\`）。` +
-    `サーバーは \`${WS_PROTOCOL}\` を選んで応答する。ヘッダーを付けられるクライアントは \`Authorization: Bearer\` でもよい。` +
-    "トークンが無ければ観戦。`?token=` は 400。\n\n" +
-    "サーバー → クライアントは `state` / `error` / `end` / `pong`、" +
-    'クライアント → サーバーは `{"type":"action","turn":N,"action":{...}}`、`{"type":"resign"}`（投了）と `{"type":"ping"}`。',
+    `To connect as a player, pass the subprotocols \`["${WS_PROTOCOL}", "${WS_TOKEN_PROTOCOL_PREFIX}<token>"]\`` +
+    ` (e.g. \`new WebSocket(url, ["${WS_PROTOCOL}", "${WS_TOKEN_PROTOCOL_PREFIX}" + token])\`). ` +
+    `The server answers with the \`${WS_PROTOCOL}\` subprotocol. Clients that can set headers may send \`Authorization: Bearer\` instead. ` +
+    "Without a token you are a spectator. `?token=` is rejected with 400.\n\n" +
+    "Server -> client: `state` / `error` / `end` / `pong`. " +
+    'Client -> server: `{"type":"action","turn":N,"action":{...}}`, `{"type":"resign"}` and `{"type":"ping"}`.',
   request: { params: RoomIdParam },
   responses: {
     101: { description: "Switching Protocols" },

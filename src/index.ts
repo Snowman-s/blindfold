@@ -61,7 +61,7 @@ app.route("/", userRoutes);
 app.openAPIRegistry.registerComponent("securitySchemes", "bearerAuth", {
   type: "http",
   scheme: "bearer",
-  description: "`POST /rooms/{id}/join` が返す token（開始時は hostToken）。URL の `?token=` は受け付けない。",
+  description: "The player `token` from `POST /rooms/{id}/join` or `POST /quickmatch` (`hostToken` for `start`). `?token=` in the URL is rejected.",
 });
 
 app.doc31("/openapi.json", {
@@ -70,9 +70,10 @@ app.doc31("/openapi.json", {
     title: "apigames API",
     version: "0.2.0",
     description:
-      "ターン制ゲームを画面なしで遊べる／観戦できる API。ゲームロジックはすべてサーバー側で動く。\n\n" +
-      "`turn` は適用済みの行動数。行動は現在の `turn` を付けて送り、一致しなければ `STALE_TURN` で拒否される。\n" +
-      "ルームは `waiting` → `playing` → `finished` と進む。",
+      "An API for playing and watching turn-based games without a screen. All game logic runs on the server. " +
+      "Client developer guide: `/guide.md`.\n\n" +
+      "`turn` is the number of actions applied so far. Send the current `turn` with each action; otherwise it is rejected with `STALE_TURN`.\n" +
+      "A room goes `waiting` -> `playing` -> `finished`.",
   },
 });
 

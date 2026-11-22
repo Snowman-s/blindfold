@@ -36,6 +36,12 @@ export interface GameDefinition<S, A> {
   minPlayers: number;
   maxPlayers: number;
   actionSchema: z.ZodType<A>;
+  /**
+   * view の返り値の形（全視点の和集合。視点によって無いフィールドは optional にし、describe に誰に付くかを書く）。
+   * JSON Schema にして /games/:id/rules で配り、型付きクライアントが推測なしで書けるようにする。
+   * 実際の view がこれを満たすことは all-games テストで検証する（strictObject にして余計なフィールドも検出する）。
+   */
+  viewSchema: z.ZodType;
   docs: GameDocs;
   /** seed は文字列（サーバーは 128 ビットの乱数を発行する）。乱数は createRng(seed) で作る。 */
   init(players: string[], seed: Seed): S;

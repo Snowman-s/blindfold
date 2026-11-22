@@ -31,11 +31,21 @@ function findWinnerMark(board: Cell[]): Mark | null {
 
 const actionSchema = z.object({ cell: z.number().int().min(0).max(8) });
 
+const viewSchema = z.strictObject({
+  players: z.array(z.string()).length(2).describe("[X player, O player]"),
+  board: z
+    .array(z.enum(["X", "O"]).nullable())
+    .length(9)
+    .describe("Cells 0-8 in row-major order. null = empty"),
+  next: z.string().nullable().describe("Player ID to move next, or null once the game is over"),
+});
+
 export const tictactoe: GameDefinition<TicTacToeState, TicTacToeAction> = {
   id: "tictactoe",
   minPlayers: 2,
   maxPlayers: 2,
   actionSchema,
+  viewSchema,
   docs,
 
   init(players) {

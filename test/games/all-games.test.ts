@@ -5,6 +5,7 @@ import { GameError } from "../../src/games/types";
 import { createRng, rngForTurn } from "../../src/lib/rng";
 import { gameRules, rulesMarkdown } from "../../src/lib/rules";
 import { practiceAction } from "../../src/lib/practice";
+import { gameExamples } from "../../src/lib/examples";
 import { applyResign, applyTimeout, replay, type LogEntry } from "../../src/lib/replay";
 import type { AnyGame } from "../../src/games/types";
 import { elimination, type ElimState } from "../fixtures/elimination";
@@ -80,6 +81,47 @@ describe.each(Object.keys(games))("%s", (gameId) => {
     const r = await gameRules(game);
     expect(r.actionSchema).toHaveProperty("type", "object");
     expect(rulesMarkdown(r)).toContain(game.docs.rules);
+  });
+
+  it("view は全局面・全視点で viewSchema を満たす（余計なフィールドも無い）", () => {
+    for (let seed = 0; seed < 100; seed++) {
+      const { actions } = playRandom(gameId, String(seed));
+      let state = game.init(PLAYERS, String(seed));
+      const check = () => {
+        for (const pid of [...PLAYERS, null]) {
+          const v = game.view(state, pid);
+          const r = game.viewSchema.safeParse(v);
+          if (!r.success) throw new Error(`seed ${seed}, viewer ${pid}: ${r.error.message}`);
+          expect(JSON.parse(JSON.stringify(r.data))).toEqual(v);
+        }
+      };
+      check();
+      for (const a of actions) {
+        state = game.apply(state, a.player!, a.action, rngForTurn(String(seed), a.turn));
+        check();
+      }
+    }
+  });
+
+  it("例（開始直後・1手後・決着後）は実際の view と同じ形で、決着後は end が続く", () => {
+    const ex = gameExamples(game);
+    const statuses = ex.states.map((e) => e.message.status);
+    expect(statuses[0]).toBe("playing");
+    expect(statuses.at(-1)).toBe("finished");
+    for (const e of ex.states) {
+      game.viewSchema.parse(e.message.view);
+      if (e.message.status === "finished") {
+        expect(e.message.currentPlayers).toEqual([]);
+        expect(e.message.deadline).toBeNull();
+        expect(e.message).not.toHaveProperty("legal");
+      }
+    }
+    expect(ex.player.legal).toBeDefined();
+    expect(ex.spectator).not.toHaveProperty("legal");
+    // ログの例は再現でき、end と同じ結果になる
+    const r = replay(game, ex.log);
+    expect(r.result).toEqual({ winners: ex.end.winners, ...(ex.end.scores ? { scores: ex.end.scores } : {}) });
+    expect(ex.log.actions.map((a) => a.turn)).toEqual(ex.log.actions.map((_, i) => i));
   });
 
   it("状態は JSON 往復で変わらず、apply は入力を変更しない", () => {

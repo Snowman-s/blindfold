@@ -24,6 +24,36 @@ export const CLOSE_LEFT_ROOM = 4000;
 /** WS の close コード：ルームが削除されたとき（放置・終了から一定期間後の掃除。再接続しても ROOM_NOT_FOUND）。 */
 export const CLOSE_ROOM_DELETED = 4001;
 
+// 4002 は「エンジンが無くなったルーム（GAME_REMOVED）」用に取ってある（TODO.md）。
+
+/**
+ * WS の close コード：エラーになるメッセージを送りすぎた接続を閉じるとき（不正なメッセージ 20 通で1リクエストを消費するため）。
+ * クライアントのバグなので、すぐに再接続しても同じことになる。
+ */
+export const CLOSE_TOO_MANY_ERRORS = 4003;
+
+/** WS の close コード：同じ席の接続が上限を超えたので、いちばん古い接続を閉じるとき（新しい接続が残る。再接続しない）。 */
+export const CLOSE_REPLACED = 4004;
+
+/** 1つの席（トークン）で同時に開ける WS の数。超えたらいちばん古い接続を CLOSE_REPLACED で閉じる。 */
+export const MAX_SOCKETS_PER_SEAT = 4;
+
+/** 1ルームの観戦者の WS の数の上限。超えた接続は 503 TOO_MANY_CONNECTIONS で拒否する。 */
+export const MAX_SPECTATOR_SOCKETS = 50;
+
+/**
+ * WS のエラーの上限（リーキーバケット）。エラーを返すたびに1つ溜まり、WS_STRIKE_DECAY_MS ごとに1つ減る。
+ * WS_MAX_STRIKES を超えたら CLOSE_TOO_MANY_ERRORS で閉じる。成功した行動・投了、自動応答の ping は数えない。
+ */
+export const WS_MAX_STRIKES = 20;
+export const WS_STRIKE_DECAY_MS = 10_000;
+
+/**
+ * WS の close コード：ルームのゲーム（または作成時のルールの版）がサーバーから無くなったとき（GAME_REMOVED。
+ * 再接続しても 410）。
+ */
+export const CLOSE_GAME_REMOVED = 4002;
+
 /** REST / DO 共通のエラーレスポンスの本体。 */
 export const errBody = (code: string, message: string) => ({ error: { code, message } });
 
@@ -33,8 +63,8 @@ export const errBody = (code: string, message: string) => ({ error: { code, mess
  */
 export interface RoomState {
   game: string;
-  /** 試合の開始時に記録したルールの版。waiting の間は null */
-  rulesVersion: number | null;
+  /** ルームの作成時に記録したルールの版 */
+  rulesVersion: number;
   /** ゲーム固有のオプション（既定値を補った後の値）。オプションを持たないゲームは null */
   gameOptions: unknown;
   status: RoomStatus;

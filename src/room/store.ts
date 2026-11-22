@@ -82,9 +82,9 @@ export class RoomStore {
     return this.getMeta("seed")!;
   }
 
-  /** 試合の開始時に記録したルールの版（waiting の間は null）。 */
-  rulesVersion(): number | null {
-    return this.getNumber("rulesVersion");
+  /** ルームの作成時（init）に記録したルールの版。 */
+  rulesVersion(): number {
+    return Number(this.getMeta("rulesVersion")!);
   }
 
   /** ゲーム固有のオプション（init で既定値を補って保存した値。オプションの無いゲームは null）。 */
@@ -108,6 +108,11 @@ export class RoomStore {
     return this.getNumber("cleanupAt");
   }
 
+  /** 一覧の索引（D1 の rooms）を最後に書いた（書こうとした）時刻。索引に載せないルームは null。 */
+  indexedAt(): number | null {
+    return this.getNumber("indexedAt");
+  }
+
   /** 練習相手（サーバー側の Bot）のプレイヤー ID。 */
   bots(): string[] {
     return this.getJson<string[]>("bots", []);
@@ -116,6 +121,14 @@ export class RoomStore {
   /** 時間切れ・投了による決着（ゲーム自身の結果より優先度は低い）。 */
   forfeit(): GameResult | null {
     return this.getJson<GameResult | null>("forfeit", null);
+  }
+
+  /**
+   * 終了時に確定した結果（finished のときだけある）。D1 への書き込みの再試行と、終了後に配る state はこれを使う
+   * （エンジンが無くなっても D1 に書けるように、また後から計算し直した結果とずれないように）。
+   */
+  result(): GameResult | null {
+    return this.getJson<GameResult | null>("result", null);
   }
 
   /** 試合が終わった理由。時間切れ・投了で終わったときだけ書く。無ければ通常の決着。 */

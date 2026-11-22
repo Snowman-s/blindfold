@@ -25,7 +25,7 @@ const COMMON = [
   "- When the game ends you receive an `end` message with `winners` (empty for a draw), `scores` and `reason` (`normal`, `timeout` or `resign`).",
   "- New fields, message `type`s and error codes may be added at any time. Ignore fields you do not know (the `view` schema does not forbid extra fields), skip unknown message types, and treat an unknown error code like `BAD_REQUEST`.",
   "- Enum-like fields outside `view` may get new values: treat an unknown `reason` like `normal`, and an unknown `status` as neither `waiting` nor `finished` (wait for the next `state`).",
-  "- When the rules below change, `rulesVersion` goes up and rooms started with an older version can no longer be played or replayed (`GAME_REMOVED`; their `/log` stays available). Breaking changes to `view` bump `viewVersion`.",
+  "- When the rules below change, `rulesVersion` goes up and rooms created with an older version (even ones still waiting) can no longer be played or replayed (`GAME_REMOVED`; the `/log` of a finished one stays available). Breaking changes to `view` bump `viewVersion`.",
 ].join("\n");
 
 export interface GameRules {

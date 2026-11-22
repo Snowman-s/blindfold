@@ -30,6 +30,20 @@ export type RoomOptions = z.infer<typeof roomOptions>;
 /** 待機中のルームを一覧・クイックマッチに出す期間（最後の更新から）。放置された部屋に人を集めないため。 */
 export const WAITING_LIST_TTL_MS = 30 * 60 * 1000;
 
+/**
+ * 試合中のルームの索引（D1 の rooms）を書き直す間隔。索引は1手ごとには書かないが、試合中も最後の書き込みから
+ * この時間が経っていれば、次の手の確定時に書き直す（一覧の鮮度の絞り込みで、長い試合が消えないように）。
+ */
+export const PLAYING_INDEX_REFRESH_MS = 60 * 60 * 1000;
+
+/**
+ * 試合中のルームを一覧（GET /rooms?status=playing）に出す期間の余裕。最後の索引の書き込みから
+ * 「そのルームの持ち時間 + これ」を過ぎた行は出さない。生きている試合は持ち時間以内に必ず手が確定し
+ * （時間切れも含む）、PLAYING_INDEX_REFRESH_MS ごとに書き直すので、これより短くしないこと。
+ * エンジンが無くなった・D1 への書き込みを諦めた・掃除で行を消せなかったルームが、観戦一覧に残り続けないようにする。
+ */
+export const PLAYING_LIST_GRACE_MS = 2 * PLAYING_INDEX_REFRESH_MS;
+
 /** 待機中のルームを消すまでの期間（最後の作成・join・退出から）。DO のストレージごと消す。 */
 export const WAITING_ROOM_TTL_MS = 24 * 60 * 60 * 1000;
 

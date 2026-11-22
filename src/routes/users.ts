@@ -109,6 +109,7 @@ userRoutes.openapi(
         },
       },
       404: errors[404],
+      429: errors[429],
     },
   }),
   async (c) => {
@@ -174,6 +175,7 @@ userRoutes.openapi(
     responses: {
       200: { description: "Matches", content: { "application/json": { schema: z.array(MatchSchema) } } },
       400: errors[400],
+      429: errors[429],
     },
   }),
   async (c) => {

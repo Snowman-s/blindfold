@@ -43,8 +43,8 @@ export interface GameDefinition<S, A, O = null> {
    * ルール・action の形・勝敗の決め方・init / apply / onTimeout / onResign の結果が変わる変更、
    * rng を引く順番や回数が変わる変更（見た目のルールが同じでも、過去のログから別の試合が再現されてしまう）。
    * docs の文言・view の形・practiceAction だけの変更では上げない（view の破壊的変更は viewVersion）。
-   * ルームは開始時の値を記録する。サーバーは古い版のエンジンを残さないので、上げると前の版で始めたルームは
-   * 進行中・終了済みとも GAME_REMOVED になる（リプレイできなくなる。/log は返す）。
+   * ルームは作成時（init）の値を記録する。サーバーは古い版のエンジンを残さないので、上げると前の版で作ったルームは
+   * 待機中・進行中・終了済みとも GAME_REMOVED になる（リプレイできなくなる。終了済みなら /log は返す）。
    */
   rulesVersion: number;
   /**

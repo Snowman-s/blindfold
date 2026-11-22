@@ -36,6 +36,17 @@ export const CHANGELOG: ChangelogEntry[] = [
         "longer turned into `BAD_REQUEST`.",
       "Whether you may act is decided by `currentPlayers`, not by the presence of `legal`. Games may now leave out " +
         "`legal` entirely (`listsLegalActions: false` in `GET /games` and `/games/{id}/rules`); every current game still lists it.",
+      "A room records its game's `rulesVersion` when it is created, not when it starts: `rulesVersion` in the room state " +
+        "is never `null` (also while waiting), and when the rules version goes up, rooms still waiting fail with " +
+        "410 `GAME_REMOVED` as well.",
+      "When the server finds that a room's game or rules version is gone, it closes the room's open sockets with " +
+        "close code 4002 and removes the room from `GET /rooms`. Do not reconnect.",
+      "`GET /rooms?status=playing` leaves out rooms with no activity for longer than their time per turn plus 2 hours.",
+      "WebSocket connections are limited: at most 4 per token (opening a fifth closes the oldest with close code 4004; " +
+        "do not reconnect it) and 50 spectators per room (more fail with 503 `TOO_MANY_CONNECTIONS`).",
+      "A WebSocket that gets more than 20 `error` messages in a burst (one is forgiven every 10 seconds) is closed with " +
+        "close code 4003. Applied actions and resignations do not count. Only the exact string `{\"type\":\"ping\"}` is " +
+        "answered without counting; other pings are still answered but count like an error.",
     ],
     added: [
       "Game-specific options: `gameOptions` in `POST /rooms` and `POST /quickmatch`, described by `optionsSchema`, " +
@@ -46,7 +57,8 @@ export const CHANGELOG: ChangelogEntry[] = [
         "`gameOptions` and `result` were added to it (and `gameOptions` to the REST state).",
       "`listsLegalActions` in `GET /games` and `/games/{id}/rules`.",
       "Per-IP rate limits on `POST /users`, `POST /rooms`, `POST /quickmatch`, `POST /rooms/{id}/join` and " +
-        "`POST /rooms/{id}/rematch`: over the limit they fail with 429 `RATE_LIMITED` and a `Retry-After` header.",
+        "`POST /rooms/{id}/rematch`, on WebSocket upgrades, and on the other room endpoints, `GET /rooms`, " +
+        "`GET /matches` and `GET /users/{id}`: over the limit they fail with 429 `RATE_LIMITED` and a `Retry-After` header.",
       "`POST /users/{id}/key` issues a new API key; the old one stops working.",
     ],
   },

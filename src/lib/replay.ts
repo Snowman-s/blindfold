@@ -15,7 +15,7 @@ export interface LogEntry {
 
 export interface ReplayLog {
   game: string;
-  /** 試合の開始時に記録したルールの版（GameDefinition.rulesVersion）。再現はこの版のエンジン（getGame(game, rulesVersion)）で行う。 */
+  /** ルームの作成時に記録したルールの版（GameDefinition.rulesVersion）。再現はこの版のエンジン（getGame(game, rulesVersion)）で行う。 */
   rulesVersion: number;
   seed: Seed;
   /** ゲーム固有のオプション（既定値を補った値。optionsSchema の無いゲームは null）。init にそのまま渡す。 */

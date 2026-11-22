@@ -4,7 +4,17 @@ import type { AnyGame } from "../games/types";
 import { sha256Hex, WS_PROTOCOL, WS_TOKEN_PROTOCOL_PREFIX } from "./auth";
 import { DEFAULT_TURN_TIME_MS, FINISHED_ROOM_TTL_MS, roomOptions, WAITING_LIST_TTL_MS, WAITING_ROOM_TTL_MS } from "./options";
 import { compactJson, gameExamples } from "./examples";
-import { CLOSE_LEFT_ROOM, CLOSE_ROOM_DELETED } from "./protocol";
+import {
+  CLOSE_GAME_REMOVED,
+  CLOSE_LEFT_ROOM,
+  CLOSE_REPLACED,
+  CLOSE_ROOM_DELETED,
+  CLOSE_TOO_MANY_ERRORS,
+  MAX_SOCKETS_PER_SEAT,
+  MAX_SPECTATOR_SOCKETS,
+  WS_MAX_STRIKES,
+  WS_STRIKE_DECAY_MS,
+} from "./protocol";
 import { replayFrames } from "./replay";
 import { API_VERSION } from "./version";
 
@@ -240,12 +250,13 @@ function connect(roomId, token, onMessage, delay = 1000, failures = 0) {
   });
   ws.addEventListener("close", async (ev) => {
     clearInterval(pinger);
-    // ${CLOSE_LEFT_ROOM} = you left the room (1.2), ${CLOSE_ROOM_DELETED} = the room was deleted (1.10)
-    if (ended || ev.code === ${CLOSE_LEFT_ROOM} || ev.code === ${CLOSE_ROOM_DELETED}) return;
+    // ${CLOSE_LEFT_ROOM} = you left the room (1.2), ${CLOSE_ROOM_DELETED} = the room was deleted, ${CLOSE_GAME_REMOVED} = its game was removed (1.10)
+    // ${CLOSE_TOO_MANY_ERRORS} = too many errors (a bug), ${CLOSE_REPLACED} = a newer connection with this token took over
+    if (ended || [${CLOSE_LEFT_ROOM}, ${CLOSE_ROOM_DELETED}, ${CLOSE_GAME_REMOVED}, ${CLOSE_TOO_MANY_ERRORS}, ${CLOSE_REPLACED}].includes(ev.code)) return;
     if (!opened && ++failures % 3 === 0) {
-      // A refused upgrade looks like any other drop (code 1006). Ask REST why, and stop for good on 401 / 404.
+      // A refused upgrade looks like any other drop (code 1006). Ask REST why, and stop for good on 401 / 404 / 410.
       const res = await fetch(\`\${BASE}/rooms/\${roomId}/state\`, { headers: { Authorization: \`Bearer \${token}\` } }).catch(() => null);
-      if (res && (res.status === 401 || res.status === 404)) return console.error("seat is gone:", res.status);
+      if (res && [401, 404, 410].includes(res.status)) return console.error("seat is gone:", res.status);
     }
     const wait = delay * (0.5 + Math.random());
     setTimeout(() => connect(roomId, token, onMessage, Math.min(delay * 2, 30_000), failures), wait);
@@ -262,7 +273,7 @@ const MESSAGE_TYPES = `// Client -> server (WebSocket text frames, JSON)
 type ClientMessage =
   | { type: "action"; turn: number; action: unknown } // turn = \`turn\` of the latest state; action = e.g. one element of \`legal\`
   | { type: "resign" }                               // give up (by default: you lose, everyone else wins, the game ends)
-  | { type: "ping" };                                 // answered with { type: "pong" } (free keepalive)
+  | { type: "ping" };                                 // answered with { type: "pong" } (free keepalive if sent exactly like this)
 
 // Server -> client
 // The "state" message is the same object as GET /rooms/{id}/state returns, plus type: "state".
@@ -270,7 +281,7 @@ type ServerMessage =
   | {
       type: "state";
       game: string;                 // game ID
-      rulesVersion: number | null;  // rules version the game is played with; null while waiting
+      rulesVersion: number;         // rules version of this room (fixed when the room is created)
       gameOptions: unknown;         // the room's game options (defaults filled in); null for games without options
       status: "waiting" | "playing" | "finished";
       turn: number;                 // number of actions applied so far; echo it when acting
@@ -440,11 +451,13 @@ function buildGuide(): string {
     "  (`status` may be `waiting`), and if the game is already over, an `end` message right after it.",
     "- Reconnecting is always safe: the first `state` tells you everything. You do not need to keep local state (see 1.10).",
     "- If the upgrade is refused (404 unknown room, 401 invalid token, 400 token in the URL or a missing / malformed",
-    "  subprotocol, 410 the game is no longer available),",
+    "  subprotocol, 410 the game is no longer available, 429 too many upgrades from your IP address, 503 too many",
+    "  spectators in the room),",
     "  a browser `WebSocket` cannot read the status or the body: it only fires `error` and `close` (usually code 1006).",
     "  To find out why, call `GET /rooms/{id}/state` with the same token in `Authorization: Bearer`: an unknown room (404)",
     "  or an invalid token (401) fails there too, with a JSON error body. If `/state` succeeds, check the URL (no `?token=`)",
-    "  and the subprotocol list (exactly `[\"" + WS_PROTOCOL + "\", \"" + WS_TOKEN_PROTOCOL_PREFIX + "<token>\"]`).",
+    "  and the subprotocol list (exactly `[\"" + WS_PROTOCOL + "\", \"" + WS_TOKEN_PROTOCOL_PREFIX + "<token>\"]`). 429 and 503",
+    "  are not visible from `/state`: keep backing off.",
     "",
     "### 1.5 The game loop",
     "",
@@ -471,7 +484,7 @@ function buildGuide(): string {
     "| `ILLEGAL_ACTION` | the move breaks the rules | send an element of `legal` (or, without `legal`, another action) |",
     "| `NOT_PLAYING` | the game has not started yet or is already over (for example an action sent after `end`) | wait for a `playing` state, or stop |",
     "| `UNAUTHORIZED` | the connection has no valid player token (a spectator, or a seat that was left) | reconnect with a player token |",
-    "| `GAME_REMOVED` | the game (or the rules version the room was started with) is no longer on the server | stop; nothing can be done in this room |",
+    "| `GAME_REMOVED` | the game (or the rules version the room was created with) is no longer on the server | stop; nothing can be done in this room |",
     "| `BAD_REQUEST` | malformed JSON / message / action shape | fix the message format |",
     "| `INTERNAL` | server-side failure while handling the message | resend the same action if its `turn` is still current; otherwise wait for the next `state` (or reconnect) |",
     "",
@@ -484,12 +497,15 @@ function buildGuide(): string {
     "an ID that is not 12 lowercase hex characters), `NOT_FOUND` (404: unknown",
     "route, unknown game in `/games/{id}/rules`, unknown user in `/users/{id}`), `ALREADY_STARTED` / `ROOM_FULL` / `ALREADY_JOINED` /",
     "`NOT_ENOUGH_PLAYERS` / `NOT_PLAYING` / `STALE_TURN` (409), `GAME_REMOVED` (410: the game, or the rules version the",
-    "room was started with, is no longer on the server; nothing can be done in that room, but `/log` still works),",
-    "`UPGRADE_REQUIRED` (426), `RATE_LIMITED` (429), `INTERNAL` (500).",
+    "room was created with, is no longer on the server; nothing can be done in that room, but the `/log` of a finished one still works),",
+    "`UPGRADE_REQUIRED` (426), `RATE_LIMITED` (429), `INTERNAL` (500), `TOO_MANY_CONNECTIONS` (503: the room already has",
+    "the most spectator WebSockets it accepts).",
     "",
-    "- Creating users, creating or joining rooms, quick match and rematch are rate-limited per IP address. Over the",
-    "  limit they fail with 429 `RATE_LIMITED` and a `Retry-After` header (seconds): wait that long before retrying.",
-    "  Normal play is not affected; actions and state go over the WebSocket, which is not limited.",
+    "- Every endpoint that reads or changes a room, `GET /rooms`, `GET /matches`, `GET /users/{id}`, user creation and",
+    "  WebSocket upgrades are rate-limited per IP address. Over the limit they fail with 429 `RATE_LIMITED` and a",
+    "  `Retry-After` header (seconds): wait that long before retrying. Normal play is not affected: messages on an open",
+    "  WebSocket are not rate-limited (only errors are, see \"Errors are limited\" in 1.10), and the limits leave room for",
+    "  reconnecting with backoff and for an occasional `/state`, but not for polling `/state` every second.",
     "- `GET /rooms/{id}/state` with an **invalid** token fails with 401 `UNAUTHORIZED`. It does not fall back to the",
     "  spectator view; to spectate, send no `Authorization` header at all.",
     "- **Not every error response is JSON.** When the service's daily request limit is used up (it resets at 00:00 UTC),",
@@ -554,19 +570,29 @@ function buildGuide(): string {
     "Reconnect and act before `deadline` and nothing is lost. If you stay disconnected past the deadline, the turn times",
     "out exactly as if you had been connected and idle (by default you lose). Other players are not told that you left.",
     "",
-    "**Several connections per token are allowed.** You may open more than one WebSocket with the same token (for",
-    "example a bot and a UI, or an old socket that has not noticed it is dead). Every connection receives every",
+    `**Several connections per token are allowed, up to ${MAX_SOCKETS_PER_SEAT}.** You may open more than one WebSocket with the same`,
+    "token (for example a bot and a UI, or an old socket that has not noticed it is dead). Every connection receives every",
     "broadcast. Only the first action for a `turn` is applied; the same-turn action from another connection gets",
-    "`STALE_TURN`. Any number of spectators may connect as well.",
+    `\`STALE_TURN\`. Opening one more than ${MAX_SOCKETS_PER_SEAT} closes the oldest connection of that seat with close code ${CLOSE_REPLACED}.`,
+    `A room accepts up to ${MAX_SPECTATOR_SOCKETS} spectator connections; beyond that the upgrade fails with 503 \`TOO_MANY_CONNECTIONS\`.`,
     "",
     "**Keepalive.** While a socket is open, send `{\"type\":\"ping\"}` about every 30 seconds. The server answers",
-    "`{\"type\":\"pong\"}` without waking the room, so pings do not use the request budget. A silent socket may be dropped",
+    "`{\"type\":\"pong\"}` without waking the room, so pings do not use the request budget. This works only for that exact",
+    "string (no spaces, no extra fields); any other ping is still answered but counts like an error (see below). A silent socket may be dropped",
     "by proxies, and the pong tells you the socket is still alive: if nothing arrives within about 10 seconds of a ping,",
     "close the socket and reconnect.",
+    "",
+    `**Errors are limited.** Every \`error\` the server sends on a socket counts against it. The count drops by one every`,
+    `${WS_STRIKE_DECAY_MS / 1000} seconds; when it goes over ${WS_MAX_STRIKES}, the server closes the socket with close code ${CLOSE_TOO_MANY_ERRORS}.`,
+    "Applied actions and resignations never count. A client that waits for its turn and sends the `turn` it was given",
+    "never gets near the limit, so being closed this way means a bug: fix it before reconnecting.",
     "",
     "**When the server closes a socket.** In normal operation the server never closes a socket by itself, not even after",
     "`end`; that is up to you. It closes one only when it echoes a close you started, when you left the room",
     `(close code ${CLOSE_LEFT_ROOM}; do not reconnect), when the room is deleted (close code ${CLOSE_ROOM_DELETED}; do not reconnect, see below),`,
+    `when the room's game or rules version is no longer on the server (close code ${CLOSE_GAME_REMOVED}; do not reconnect, see below),`,
+    `when a newer connection with the same token replaced it (close code ${CLOSE_REPLACED}; do not reconnect),`,
+    `when it sent too many errors (close code ${CLOSE_TOO_MANY_ERRORS}; do not reconnect until the bug is fixed),`,
     "or when the platform reports an error on the socket (close code 1011).",
     "A socket can also drop without a close frame (code 1006 in browsers) when",
     "the network fails or the service is redeployed. Treat every unexpected `close` the same way: reconnect.",
@@ -579,7 +605,7 @@ function buildGuide(): string {
     "- Forget which `turn` you already answered. If the first `state` still has that `turn` and lists you in",
     "  `currentPlayers`, your action was lost: send it again. Had it been applied, the turn would have moved on.",
     "- Stop after an `end` message. A browser cannot see why an upgrade failed (see 1.4), so after a few failed attempts",
-    "  call `GET /rooms/{id}/state` with the token: 404 (unknown room) or 401 (invalid token) means stop; anything else",
+    "  call `GET /rooms/{id}/state` with the token: 404 (unknown room), 401 (invalid token) or 410 (`GAME_REMOVED`) means stop; anything else",
     "  means keep retrying with backoff.",
     "",
     code("js", RECONNECT_CLIENT),
@@ -594,6 +620,9 @@ function buildGuide(): string {
     `- A waiting room is deleted ${WAITING_ROOM_TTL_MS / 3600000} hours after its last change (creation, join or leave). It drops out of`,
     `  \`GET /rooms\` and quick match much earlier, ${WAITING_LIST_TTL_MS / 60000} minutes after its last update, but can be joined by \`roomId\` until it is deleted.`,
     "- A game in progress is never deleted; an abandoned one ends by itself as its deadlines run out.",
+    "- When a game's `rulesVersion` goes up (or a game is withdrawn), every room created with the old version, waiting,",
+    `  in progress or finished, answers 410 \`GAME_REMOVED\` and its open sockets are closed with code ${CLOSE_GAME_REMOVED}. It is no`,
+    `  longer listed and is deleted within ${FINISHED_ROOM_TTL_MS / 86400000} days; the \`/log\` of a finished one stays available until then.`,
     `- A finished room keeps its \`state\`, \`/log\` and \`/replay\` for ${FINISHED_ROOM_TTL_MS / 86400000} days after the end. Download`,
     "  `/rooms/{id}/log` within that time if you need a permanent record. `GET /matches` and `GET /users/{id}` keep the result.",
     "",
@@ -665,11 +694,12 @@ function buildGuide(): string {
     "- [ ] `STALE_TURN` and other errors do not crash the client; it waits for the next `state`.",
     "- [ ] REST responses that are not JSON (or are 5xx) are retried later instead of crashing the JSON parser.",
     "- [ ] A 429 `RATE_LIMITED` response waits for its `Retry-After` seconds before the same request is retried.",
+    `- [ ] The client does not poll \`/state\`, and does not reconnect after close code ${CLOSE_TOO_MANY_ERRORS} or ${CLOSE_REPLACED}.`,
     "- [ ] The UI handles `status: \"waiting\"` (before start) and `view` fields that only some viewers receive.",
     "- [ ] On `end`, the result is shown and the socket is closed.",
     "- [ ] Countdowns use `deadline - now` from the `state`, not the local clock.",
     "- [ ] `roomId`, `playerId` and `token` are saved; an unexpected `close` leads to a reconnect with backoff.",
-    "- [ ] While the socket is open, `{\"type\":\"ping\"}` is sent about every 30 seconds.",
+    "- [ ] While the socket is open, exactly `{\"type\":\"ping\"}` (no spaces) is sent about every 30 seconds.",
     "- [ ] Unknown fields, unknown message `type`s and unknown error codes are ignored, not treated as fatal.",
     "- [ ] Unknown values of `status`, `reason`, `outcome` and other enum-like fields in responses are handled (see",
     "  section 9), not treated as fatal.",
@@ -688,7 +718,7 @@ function buildGuide(): string {
     "| Name | Where | Meaning |",
     "|---|---|---|",
     "| `version` | heading of this guide and of `/games/{id}/rules.md`, `version` in `/games/{id}/rules`, `ETag` | Hash of the content. Changes on any edit, even a typo fix. Use it only as a cache key (`If-None-Match` returns 304 while it is unchanged) |",
-    "| `rulesVersion` | `/games`, `/games/{id}/rules`, and per game in `GET /rooms/{id}/state`, `/log`, `/replay`, `/matches` | Version of one game's rules, an integer. Bumped when a game's rules or `action` format change, or anything else that makes an old log replay differently. A room records the value when it starts. The server keeps only the current version: rooms started with an older one (in progress or finished) fail with `GAME_REMOVED` (410), and their `/replay` too; `/log` stays available |",
+    "| `rulesVersion` | `/games`, `/games/{id}/rules`, and per game in `GET /rooms/{id}/state`, `/log`, `/replay`, `/matches` | Version of one game's rules, an integer. Bumped when a game's rules or `action` format change, or anything else that makes an old log replay differently. A room records the value when it is created. The server keeps only the current version: rooms created with an older one (waiting, in progress or finished) fail with `GAME_REMOVED` (410), and their `/replay` too; `/log` of a finished room stays available |",
     "| `viewVersion` | `/games`, `/games/{id}/rules` | Version of the shape of one game's `view`, an integer. Bumped when a `view` field is removed or renamed, changes type or meaning, or gets a new value in a fixed set (such as a new kind of cell); not when a field is added. Unlike `rulesVersion`, a room in progress switches to the new shape |",
     `| WebSocket subprotocol | \`${WS_PROTOCOL}\` (section 1.4) | Version of the WebSocket messages. Negotiated per connection |`,
     `| \`apiVersion\` | TL;DR above, \`apiVersion\` in \`/games/{id}/rules\`, \`info.version\` in \`/openapi.json\` | Version of the API, in semver. Currently \`${API_VERSION}\` |`,
@@ -714,7 +744,7 @@ function buildGuide(): string {
     "",
     "**Breaking changes**: removing or renaming a field, changing its type or meaning, making a request field",
     "required, changing authentication, and changing a game's rules or its `action` format. A game's rules and",
-    "`action` format change only together with its `rulesVersion`; rooms started with the old version then end with",
+    "`action` format change only together with its `rulesVersion`; rooms created with the old version then end with",
     "`GAME_REMOVED`, and their replays are no longer available (the log is).",
     "Breaking changes to a game's `view` bump its `viewVersion`.",
     "",

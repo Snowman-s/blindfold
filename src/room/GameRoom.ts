@@ -6,20 +6,28 @@ import {
   DEFAULT_TURN_TIME_MS,
   FINISHED_ROOM_TTL_MS,
   parseGameOptions,
+  PLAYING_INDEX_REFRESH_MS,
   roomOptions,
   WAITING_ROOM_TTL_MS,
 } from "../lib/options";
 import {
   clientMessage,
+  CLOSE_GAME_REMOVED,
   CLOSE_LEFT_ROOM,
+  CLOSE_REPLACED,
   CLOSE_ROOM_DELETED,
+  CLOSE_TOO_MANY_ERRORS,
   errBody,
+  MAX_SOCKETS_PER_SEAT,
+  MAX_SPECTATOR_SOCKETS,
   type RoomState,
   type ServerMessage,
+  WS_MAX_STRIKES,
+  WS_STRIKE_DECAY_MS,
 } from "../lib/protocol";
 import { replayFrames, type LogEntry, type ReplayLog } from "../lib/replay";
 import { practiceAction } from "../lib/practice";
-import { createRng, rngForTurn, type Seed } from "../lib/rng";
+import { createRng, type Seed } from "../lib/rng";
 import { matchStatements, roomIndexStatement } from "./d1";
 import {
   decideAction,
@@ -72,8 +80,19 @@ export interface ReplayFrames {
  * WS に持たせる情報。tokenHash は接続時に使ったトークンのハッシュ（attachment も保存されるので、トークンそのものは持たない）。
  * 再戦ルームでは退出した席に同じ ID で座り直せるので、ID だけでなくトークンも一致する接続だけをその席として扱う。
  * protocol は交渉したサブプロトコル（apigames.v1 など）。版ごとに配信を変えるときに使う。
+ * at は接続した時刻（同じ席の接続が上限を超えたとき、いちばん古いものを閉じるため。getWebSockets() の順序は保証されない）。
+ * strikes / strikeAt はエラーのリーキーバケット（WS_MAX_STRIKES）。strikeAt の時点で strikes 溜まっていた、という意味。
  */
-type Attachment = { playerId: null; protocol: string } | { playerId: string; tokenHash: string; protocol: string };
+type Attachment = ({ playerId: null } | { playerId: string; tokenHash: string }) & {
+  protocol: string;
+  at: number;
+  strikes: number;
+  strikeAt: number;
+};
+
+/** WS のタグ（acceptWebSocket の第2引数）。getWebSockets(tag) で接続を数える。 */
+const SPECTATOR_TAG = "spectator";
+const seatTag = (pid: string) => `seat:${pid}`;
 
 /**
  * D1 への結果書き込みが失敗したときの再試行（alarm で指数バックオフ、最大1時間おき）。
@@ -119,11 +138,11 @@ export class GameRoom extends DurableObject<Env> {
   // ---- エンジン ----
 
   /**
-   * このルームのエンジン。開始後は記録した rulesVersion と今の版が一致するときだけ返す（古い state を新しいルールで
-   * 動かさない）。waiting の間は今の版（開始時にその版を記録する）。無ければ null（GAME_REMOVED）。
+   * このルームのエンジン。作成時（init）に記録した rulesVersion と今の版が一致するときだけ返す（古い state や、
+   * 古い optionsSchema で検証した gameOptions を新しいルールで動かさない）。無ければ null（GAME_REMOVED）。
    */
   private engine(): AnyGame | null {
-    return getGame(this.store.gameId()!, this.store.rulesVersion() ?? undefined) ?? null;
+    return getGame(this.store.gameId()!, this.store.rulesVersion()) ?? null;
   }
 
   /** check() を通った後で使う。 */
@@ -133,11 +152,56 @@ export class GameRoom extends DurableObject<Env> {
     return g;
   }
 
-  /** RPC の入口で呼ぶ：ルームが無ければ ROOM_NOT_FOUND、エンジンが無ければ GAME_REMOVED。 */
+  /**
+   * RPC の入口で呼ぶ：ルームが無ければ ROOM_NOT_FOUND、エンジンが無ければ GAME_REMOVED。
+   * 同期関数のまま保つ（通った後は commit まで await を挟まないため）。失敗したときは reject() で返す。
+   */
   private check(): RoomError | null {
     if (!this.store.exists()) return NOT_FOUND;
     if (this.engine()) return null;
-    return gameRemoved(this.store.gameId()!, this.store.rulesVersion());
+    return gameRemoved(this.store.gameId()!, this.store.rulesVersion(), this.store.status() === "finished");
+  }
+
+  /** check() の失敗を返す。GAME_REMOVED なら、その場でルームを畳む（retire）。 */
+  private async reject(e: RoomError): Promise<RoomError> {
+    if (e.code === "GAME_REMOVED") await this.retire();
+    return e;
+  }
+
+  /**
+   * エンジンが無いと分かったルームを畳む（入口の check か alarm で見つけたとき。2回目以降は何もしない）。
+   * 進めようがないので、全接続を CLOSE_GAME_REMOVED で閉じ（再接続しても 410）、一覧の索引（D1 の rooms）の行を消し、
+   * 進行中だったルームは終了したルームと同じ期間の後に掃除する（待機中・終了済みは cleanupAt が既にある）。
+   * 索引の行は indexStatement（エンジンを使う）で上書きせず、直接消す。失敗しても一覧の鮮度の絞り込みで
+   * いずれ出なくなる。
+   */
+  private async retire(): Promise<void> {
+    if (this.store.getMeta("retired") === "1") return;
+    this.ctx.storage.transactionSync(() => {
+      this.store.setMeta("retired", "1");
+      if (this.store.status() === "playing") {
+        this.store.setMeta("cleanupAt", String(Date.now() + FINISHED_ROOM_TTL_MS));
+      }
+    });
+    console.error(`retiring room ${this.store.getMeta("roomId")}: ${this.check()?.message}`);
+    this.closeAll(CLOSE_GAME_REMOVED, "game removed");
+    // D1 への書き込みの再試行を待っているなら、その alarm を掃除で上書きしない（再試行が済んだら掃除を張る）
+    if (!this.persistPending()) await this.armCleanup();
+    const id = this.store.getMeta("roomId");
+    if (id && this.store.getMeta("indexRev") !== null && this.env.DB) {
+      await this.attempt("delete room index", () => this.env.DB.prepare("DELETE FROM rooms WHERE id = ?").bind(id).run());
+    }
+  }
+
+  /** 全接続を閉じる。 */
+  private closeAll(code: number, reason: string): void {
+    for (const ws of this.ctx.getWebSockets()) {
+      try {
+        ws.close(code, reason);
+      } catch {
+        // すでに閉じている
+      }
+    }
   }
 
   // ---- 状態の読み出し ----
@@ -156,22 +220,24 @@ export class GameRoom extends DurableObject<Env> {
     const status = this.store.status();
     const players = this.store.playerIds();
     const gameOptions = this.store.gameOptions();
+    const rulesVersion = this.store.rulesVersion();
     if (status === "waiting") {
       return {
-        game, status, rulesVersion: null, gameOptions, players, snap: null, currentPlayers: [], deadline: null, result: null, rematch: null,
+        game, status, rulesVersion, gameOptions, players, snap: null, currentPlayers: [], deadline: null, result: null, rematch: null,
       };
     }
     const snap = this.store.loadSnapshot();
     return {
       game,
       status,
-      rulesVersion: this.store.rulesVersion(),
+      rulesVersion,
       gameOptions,
       players,
       snap,
       currentPlayers: status === "playing" ? game.currentPlayers(snap.state) : [],
       deadline: this.deadline(),
-      result: this.resultNow(game, snap.state),
+      // 終了後は確定した結果（playing の間は決着していないので null）
+      result: status === "finished" ? this.store.result() : null,
       rematch: status === "finished" ? this.store.rematchInfo() : null,
     };
   }
@@ -198,6 +264,50 @@ export class GameRoom extends DurableObject<Env> {
    * 接続のプレイヤー ID。もう席にいない（退出した）プレイヤーの接続や、座り直す前のトークンの接続は観戦者として扱う
    * （退出時に閉じるが、閉じ損ねても他人の視点が漏れず、行動もできないように）。
    */
+  /** クライアントの誤りによるエラーを返し、エラーの上限（strike）に数える。INTERNAL（サーバーの誤り）には使わない。 */
+  private sendError(ws: WebSocket, code: string, message: string): void {
+    this.send(ws, { type: "error", code, message });
+    this.strike(ws);
+  }
+
+  /**
+   * エラーのリーキーバケットに1つ足す。WS_STRIKE_DECAY_MS ごとに1つ減り、WS_MAX_STRIKES を超えたら接続を閉じる
+   * （受信は 20 通で1リクエスト。HTTP のレート制限は WS のメッセージには効かないので、DO の中で止める）。
+   */
+  private strike(ws: WebSocket): void {
+    const att = ws.deserializeAttachment() as Attachment | null;
+    if (!att) return;
+    const now = Date.now();
+    const strikes = Math.max(0, att.strikes - (now - att.strikeAt) / WS_STRIKE_DECAY_MS) + 1;
+    if (strikes > WS_MAX_STRIKES) {
+      try {
+        ws.close(CLOSE_TOO_MANY_ERRORS, "too many errors");
+      } catch {
+        // すでに閉じている
+      }
+      return;
+    }
+    ws.serializeAttachment({ ...att, strikes, strikeAt: now } satisfies Attachment);
+  }
+
+  /**
+   * 席 pid に新しい接続を受け入れる前に、同じ席の接続が MAX_SOCKETS_PER_SEAT 本未満になるよう古い順に閉じる。
+   * 退出前の別のトークンの接続（再戦ルームで座り直した席）も同じ席のタグなので、まとめて古い順に数える。
+   */
+  private evictOldSockets(pid: string): void {
+    const socks = this.ctx
+      .getWebSockets(seatTag(pid))
+      .map((ws) => ({ ws, at: (ws.deserializeAttachment() as Attachment | null)?.at ?? 0 }))
+      .sort((a, b) => a.at - b.at);
+    for (const { ws } of socks.slice(0, Math.max(0, socks.length - (MAX_SOCKETS_PER_SEAT - 1)))) {
+      try {
+        ws.close(CLOSE_REPLACED, "replaced by a newer connection");
+      } catch {
+        // すでに閉じている
+      }
+    }
+  }
+
   private socketPlayer(ws: WebSocket, seats: Map<string, string>): string | null {
     const att = ws.deserializeAttachment() as Attachment | null;
     if (!att || att.playerId === null) return null;
@@ -250,6 +360,7 @@ export class GameRoom extends DurableObject<Env> {
       if (result) {
         const now = Date.now();
         this.store.setMeta("status", "finished");
+        this.store.setMeta("result", JSON.stringify(result));
         this.store.setMeta("finishedAt", String(now));
         this.store.setMeta("cleanupAt", String(now + FINISHED_ROOM_TTL_MS));
         return { kind: "finished", result };
@@ -270,7 +381,13 @@ export class GameRoom extends DurableObject<Env> {
     }
     await this.armAlarm(out.kind === "playing" ? out.deadline : out.cleanupAt);
     await this.attempt("broadcast", () => this.broadcast());
-    if (out.kind === "playing") await this.runBots();
+    if (out.kind === "playing") {
+      // 索引は1手ごとには書かないが、一覧の鮮度の絞り込み（PLAYING_LIST_GRACE_MS）で長い試合が消えないよう、
+      // 最後の書き込みから PLAYING_INDEX_REFRESH_MS 経っていれば書き直す（開始時の書き込みは startGame が行う）
+      const indexedAt = this.store.indexedAt();
+      if (indexedAt !== null && Date.now() - indexedAt >= PLAYING_INDEX_REFRESH_MS) await this.syncIndex();
+      await this.runBots();
+    }
   }
 
   /** 投了・時間切れの解決を書く（commit の write の中で呼ぶ）。 */
@@ -313,10 +430,16 @@ export class GameRoom extends DurableObject<Env> {
         // Bot の乱数はシードと無関係に作る（手はログに残るので再現には不要）
         const pick = practiceAction(game, snap.state, bot, createRng(randomHex(16)));
         if (!pick) return; // 打てる手がなければ持ち時間切れに任せる
-        // 読み込みから commit まで await を挟まない（他の行動と入れ替わらない）
-        const next = game.apply(snap.state, bot, pick.action, rngForTurn(this.store.seed(), snap.turn));
+        // 人間の手と同じ検証を通す（actionSchema を満たさない手がログに入るとリプレイできなくなる）。
+        // ログには検証済み（zod の出力）の手を書く。読み込みから commit まで await を挟まない
+        const r = decideAction(game, snap, bot, snap.turn, pick.action, this.store.seed());
+        if (!r.ok) {
+          console.error(`practice bot ${bot} chose an invalid action: ${r.code} ${r.message}`);
+          return; // 持ち時間切れに任せる
+        }
+        const { action, next } = r.data;
         await this.commit(() => {
-          this.store.appendAction(snap.turn, bot, pick.action);
+          this.store.appendAction(snap.turn, bot, action);
           this.store.saveSnapshot(snap.turn + 1, next);
         }, pending);
       }
@@ -362,14 +485,13 @@ export class GameRoom extends DurableObject<Env> {
 
   /**
    * 今張っておくべき alarm の時刻。playing なら手番の締め切り、終了後で D1 未書き込みなら今（再試行）、それ以外は掃除。
-   * エンジンが無いルームは時間切れも D1 の再試行もできないので掃除だけ（毎回失敗する alarm でリクエストを消費しないように）。
+   * エンジンが無いルームは時間切れを処理できないので掃除だけ（毎回失敗する alarm でリクエストを消費しないように）。
+   * D1 の再試行はエンジンを使わない（meta の result）ので、エンジンが無くても続ける。
    */
   private wantedAlarm(): number | null {
     const status = this.store.status();
-    if (this.engine()) {
-      if (status === "playing") return this.store.deadline();
-      if (status === "finished" && this.store.getMeta("persisted") !== "1" && !this.persistGaveUp()) return Date.now();
-    }
+    if (status === "playing" && this.engine()) return this.store.deadline();
+    if (this.persistPending()) return Date.now();
     return this.cleanupDueAt();
   }
 
@@ -408,13 +530,14 @@ export class GameRoom extends DurableObject<Env> {
       const id = this.store.getMeta("roomId");
       // 練習試合は戦績・試合一覧に載せない（ランダム相手の勝ち数で戦績が水増しされないように）
       if (!id || !this.env.DB || this.store.options().practice) return true;
-      const index = this.indexStatement();
+      // 畳んだルームは索引の行を消してあるので書き直さない（indexStatement はエンジンも使う）
+      const index = this.store.getMeta("retired") === "1" ? null : this.indexStatement();
       await this.env.DB.batch([
         ...(index ? [index] : []),
         ...matchStatements(this.env.DB, {
           id,
           game: this.store.gameId()!,
-          rulesVersion: this.store.rulesVersion()!,
+          rulesVersion: this.store.rulesVersion(),
           seed: this.store.seed(),
           gameOptions: this.store.gameOptions(),
           players: this.store.playerUsers(),
@@ -453,11 +576,23 @@ export class GameRoom extends DurableObject<Env> {
     return this.store.getMeta("persistGaveUp") === "1";
   }
 
-  /** 終了済みで D1 への書き込みが済んでいなければ再試行する（alarm から呼ぶ）。済んでいれば掃除の alarm を張る。 */
+  /** 終了済みで、D1 への書き込みが済んでおらず、諦めてもいないか。 */
+  private persistPending(): boolean {
+    return this.store.status() === "finished" && this.store.getMeta("persisted") !== "1" && !this.persistGaveUp();
+  }
+
+  /**
+   * 終了済みで D1 への書き込みが済んでいなければ再試行する（alarm から呼ぶ）。済んでいれば掃除の alarm を張る。
+   * 結果は終了時に meta に保存したものを使うので、エンジンが無くなったルームでも書ける。
+   */
   private async retryPersist(): Promise<void> {
-    if (this.store.getMeta("persisted") === "1" || this.persistGaveUp()) return this.armCleanup();
-    const result = this.resultNow(this.game(), this.store.loadSnapshot().state);
-    if (!result) return;
+    if (!this.persistPending()) return this.armCleanup();
+    const result = this.store.result();
+    if (!result) {
+      console.error(`finished room ${this.store.getMeta("roomId")} has no stored result; giving up persisting`);
+      this.store.setMeta("persistGaveUp", "1");
+      return this.armCleanup();
+    }
     if (await this.persistResult(result)) await this.armCleanup();
     else await this.schedulePersistRetry();
   }
@@ -472,13 +607,7 @@ export class GameRoom extends DurableObject<Env> {
   private async cleanup(): Promise<void> {
     const id = this.store.getMeta("roomId");
     const indexed = this.store.getMeta("indexRev") !== null;
-    for (const ws of this.ctx.getWebSockets()) {
-      try {
-        ws.close(CLOSE_ROOM_DELETED, "room deleted");
-      } catch {
-        // すでに閉じている
-      }
-    }
+    this.closeAll(CLOSE_ROOM_DELETED, "room deleted");
     await this.ctx.storage.deleteAlarm();
     await this.ctx.storage.deleteAll();
     this.store = new RoomStore(this.ctx.storage.sql); // テーブルが無い状態として読み直す
@@ -497,7 +626,9 @@ export class GameRoom extends DurableObject<Env> {
     // 再戦ルームは決まったメンバーしか入れないので載せない
     if (!id || !this.env.DB || opts.unlisted || opts.practice || this.store.reservedSeats()) return null;
     const rev = Number(this.store.getMeta("indexRev") ?? "0") + 1;
+    const now = Date.now();
     this.store.setMeta("indexRev", String(rev));
+    this.store.setMeta("indexedAt", String(now));
     const game = this.game();
     return roomIndexStatement(this.env.DB, {
       id,
@@ -509,7 +640,7 @@ export class GameRoom extends DurableObject<Env> {
       autoStart: opts.autoStart ?? false,
       turnTimeMs: opts.turnTimeMs ?? DEFAULT_TURN_TIME_MS,
       createdAt: Number(this.store.getMeta("createdAt") ?? Date.now()),
-      updatedAt: Date.now(),
+      updatedAt: now,
       rev,
     });
   }
@@ -556,6 +687,9 @@ export class GameRoom extends DurableObject<Env> {
       s.createTables();
       s.setMeta("roomId", roomId);
       s.setMeta("gameId", gameId);
+      // gameOptions を検証したエンジンの版。開始時ではなくここで記録する（待機中に版が上がったら、古い版で
+      // 検証した gameOptions のまま新しい init で始めず GAME_REMOVED にする）
+      s.setMeta("rulesVersion", String(game.rulesVersion));
       s.setMeta("options", JSON.stringify(opts.data));
       s.setMeta("gameOptions", JSON.stringify(gopts.value));
       s.setMeta("hostTokenHash", hostTokenHash);
@@ -576,7 +710,7 @@ export class GameRoom extends DurableObject<Env> {
     const token = newToken();
     const tokenHash = await sha256Hex(token); // 状態を読む前に（ここから commit まで await を挟まない）
     const bad = this.check();
-    if (bad) return bad;
+    if (bad) return this.reject(bad);
     if (this.store.reservedSeats()) return fail(403, "ROOM_RESERVED", "this room is reserved for a rematch");
     if (this.store.status() !== "waiting") return fail(409, "ALREADY_STARTED", "game already started");
     const n = this.store.playerIds().length;
@@ -610,7 +744,7 @@ export class GameRoom extends DurableObject<Env> {
   ): Promise<RoomResult<{ playerId: string; token: string }>> {
     const tokenHash = await sha256Hex(token); // 状態を読む前に
     const bad = this.check();
-    if (bad) return bad;
+    if (bad) return this.reject(bad);
     const reserved = this.store.reservedSeats();
     const seat = reserved?.[origin];
     if (!reserved || !seat) return fail(403, "ROOM_RESERVED", "no seat is reserved for this player");
@@ -635,7 +769,7 @@ export class GameRoom extends DurableObject<Env> {
   async leave(token: string | null): Promise<RoomResult<RoomState>> {
     const tokenHash = await hashToken(token);
     const bad = this.check();
-    if (bad) return bad;
+    if (bad) return this.reject(bad);
     const pid = this.store.playerByTokenHash(tokenHash);
     if (!pid) return fail(401, "UNAUTHORIZED", "valid player token required");
     if (this.store.status() !== "waiting") return fail(409, "ALREADY_STARTED", "game already started (resign instead)");
@@ -662,7 +796,7 @@ export class GameRoom extends DurableObject<Env> {
   async rematch(token: string | null): Promise<RoomResult<{ roomId: string; playerId: string; token: string }>> {
     const tokenHash = await hashToken(token);
     const bad = this.check();
-    if (bad) return bad;
+    if (bad) return this.reject(bad);
     const pid = this.store.playerByTokenHash(tokenHash);
     if (!pid) return fail(401, "UNAUTHORIZED", "valid player token required");
     if (this.store.status() !== "finished") return fail(403, "NOT_FINISHED", "rematch is available after the game has finished");
@@ -711,7 +845,7 @@ export class GameRoom extends DurableObject<Env> {
   async start(token: string | null): Promise<RoomResult<RoomState>> {
     const tokenHash = await hashToken(token);
     const bad = this.check();
-    if (bad) return bad;
+    if (bad) return this.reject(bad);
     if (!tokenHash) return fail(401, "UNAUTHORIZED", "host token required");
     if (tokenHash !== this.store.getMeta("hostTokenHash")) {
       return this.store.playerByTokenHash(tokenHash)
@@ -743,8 +877,6 @@ export class GameRoom extends DurableObject<Env> {
       });
       if (botIds.length) s.setMeta("bots", JSON.stringify(botIds));
       s.setMeta("seed", String(seed));
-      // init と同じトランザクションで記録する（この版のエンジンで始めた、という記録なので）
-      s.setMeta("rulesVersion", String(game.rulesVersion));
       s.setMeta("startedAt", String(Date.now()));
       s.deleteMeta("cleanupAt"); // 試合中は消さない（決着すると終了時から数え直す）
       s.saveSnapshot(0, game.init(s.playerIds(), seed, s.gameOptions()));
@@ -758,7 +890,7 @@ export class GameRoom extends DurableObject<Env> {
   async getState(token: string | null): Promise<RoomResult<RoomState>> {
     const tokenHash = await hashToken(token);
     const bad = this.check();
-    if (bad) return bad;
+    if (bad) return this.reject(bad);
     await this.ensureAlarm();
     let pid: string | null = null;
     if (tokenHash) {
@@ -772,7 +904,7 @@ export class GameRoom extends DurableObject<Env> {
   async act(token: string | null, turn: number, rawAction: unknown): Promise<RoomResult<RoomState>> {
     const tokenHash = await hashToken(token);
     const bad = this.check();
-    if (bad) return bad;
+    if (bad) return this.reject(bad);
     const pid = this.store.playerByTokenHash(tokenHash);
     if (!pid) return fail(401, "UNAUTHORIZED", "valid player token required");
     const r = await this.actAs(pid, turn, rawAction);
@@ -783,7 +915,7 @@ export class GameRoom extends DurableObject<Env> {
   async resign(token: string | null): Promise<RoomResult<RoomState>> {
     const tokenHash = await hashToken(token);
     const bad = this.check();
-    if (bad) return bad;
+    if (bad) return this.reject(bad);
     const pid = this.store.playerByTokenHash(tokenHash);
     if (!pid) return fail(401, "UNAUTHORIZED", "valid player token required");
     const r = await this.resignAs(pid);
@@ -856,7 +988,7 @@ export class GameRoom extends DurableObject<Env> {
     }
     return ok({
       game: gameId,
-      rulesVersion: this.store.rulesVersion()!,
+      rulesVersion: this.store.rulesVersion(),
       seed: this.store.seed(),
       gameOptions: this.store.gameOptions(),
       players: this.store.playerIds(),
@@ -871,7 +1003,7 @@ export class GameRoom extends DurableObject<Env> {
     // 記録した版のエンジンでだけ再生する（今の版で古いログを再生すると、別の試合が再現されたり例外になったりする）。
     // ルールの版が上がっていれば断る。ログ自体（/log）は正しい記録なので返し続ける。
     const bad = this.check();
-    if (bad) return bad;
+    if (bad) return this.reject(bad);
     const game = this.game();
     const { frames, result } = replayFrames(game, log.data);
     return ok({
@@ -901,7 +1033,10 @@ export class GameRoom extends DurableObject<Env> {
     const auth = extractWsAuth(request);
     const tokenHash = auth.ok ? await hashToken(auth.token) : null;
     const bad = this.check();
-    if (bad) return error(bad.status, bad.code, bad.message);
+    if (bad) {
+      await this.reject(bad);
+      return error(bad.status, bad.code, bad.message);
+    }
     await this.ensureAlarm();
     if (!auth.ok) return error(400, "BAD_REQUEST", auth.message);
     let pid: string | null = null;
@@ -910,13 +1045,22 @@ export class GameRoom extends DurableObject<Env> {
       if (!pid) return error(401, "UNAUTHORIZED", "invalid token");
     }
 
+    // 接続数の制限（接続1本 = 1リクエスト。拒否してもこの呼び出しの分は数えられるが、配信先が際限なく増えるのを防ぐ）。
+    // 観戦は認証なしで張れるので上限で拒否する。席は本人しか張れないので、拒否せずいちばん古い接続を閉じる
+    // （死んだことに気づいていない古い接続が残っていても、再接続が通るように）
+    if (!pid && this.ctx.getWebSockets(SPECTATOR_TAG).length >= MAX_SPECTATOR_SOCKETS) {
+      return error(503, "TOO_MANY_CONNECTIONS", `this room already has ${MAX_SPECTATOR_SOCKETS} spectators`);
+    }
+    if (pid) this.evictOldSockets(pid);
+
     const pair = new WebSocketPair();
     const [client, server] = [pair[0], pair[1]];
-    this.ctx.acceptWebSocket(server); // Hibernation API。server.accept() は使わない
+    // Hibernation API。server.accept() は使わない
+    this.ctx.acceptWebSocket(server, [pid ? seatTag(pid) : SPECTATOR_TAG]);
+    const now = Date.now();
+    const base = { protocol: auth.protocol, at: now, strikes: 0, strikeAt: now };
     server.serializeAttachment(
-      (pid
-        ? { playerId: pid, tokenHash: tokenHash!, protocol: auth.protocol }
-        : { playerId: null, protocol: auth.protocol }) satisfies Attachment,
+      (pid ? { playerId: pid, tokenHash: tokenHash!, ...base } : { playerId: null, ...base }) satisfies Attachment,
     );
 
     const s = this.buildState(pid);
@@ -929,26 +1073,35 @@ export class GameRoom extends DurableObject<Env> {
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     try {
       if (typeof message !== "string") {
-        return this.send(ws, { type: "error", code: "BAD_REQUEST", message: "text frames only" });
+        return this.sendError(ws, "BAD_REQUEST", "text frames only");
       }
       let json: unknown;
       try {
         json = JSON.parse(message);
       } catch {
-        return this.send(ws, { type: "error", code: "BAD_REQUEST", message: "invalid JSON" });
+        return this.sendError(ws, "BAD_REQUEST", "invalid JSON");
       }
       const msg = clientMessage.safeParse(json);
       if (!msg.success) {
-        return this.send(ws, { type: "error", code: "BAD_REQUEST", message: "invalid message" });
+        return this.sendError(ws, "BAD_REQUEST", "invalid message");
       }
-      if (msg.data.type === "ping") return this.send(ws, { type: "pong" });
+      if (msg.data.type === "ping") {
+        // 自動応答（setWebSocketAutoResponse）と文字列が一致しない ping だけがここに来る。DO を起こしているので数える
+        this.send(ws, { type: "pong" });
+        return this.strike(ws);
+      }
 
+      const bad = this.check();
+      if (bad) {
+        // エラーを送ってから閉じる（retire が全接続を閉じる）
+        this.send(ws, { type: "error", code: bad.code, message: bad.message });
+        await this.reject(bad);
+        return;
+      }
       const pid = this.socketPlayer(ws, this.store.seatTokenHashes());
-      const r =
-        this.check() ??
-        (msg.data.type === "resign" ? await this.resignAs(pid) : await this.actAs(pid, msg.data.turn, msg.data.action));
+      const r = msg.data.type === "resign" ? await this.resignAs(pid) : await this.actAs(pid, msg.data.turn, msg.data.action);
       // REST と同じコードをそのまま返す（読み替えると、観戦者なのか手番でないのかが区別できなくなる）
-      if (!r.ok) this.send(ws, { type: "error", code: r.code, message: r.message });
+      if (!r.ok) this.sendError(ws, r.code, r.message);
       // 成功時の state は commit の broadcast で全員に届く
     } catch (e) {
       console.error("webSocketMessage failed", e);
@@ -979,18 +1132,18 @@ export class GameRoom extends DurableObject<Env> {
     if (!this.store.exists()) return;
     const cleanupAt = this.cleanupDueAt();
     if (cleanupAt !== null && Date.now() >= cleanupAt) return this.cleanup();
+    // D1 への書き込みの再試行はエンジンを使わないので、エンジンが無くなっていても先に済ませる（戦績を失わないように）
+    if (this.store.status() === "finished") {
+      if (!this.engine()) await this.retire();
+      return this.retryPersist();
+    }
     if (!this.engine()) {
-      // 例外にすると alarm が再試行され続ける（1回 = 1リクエスト）ので、記録して掃除だけ予約する。
-      // 進行中だったルームは cleanupAt が無い（待機中の値は使わない）ので、ここで決める
-      console.error(`alarm skipped: ${this.check()?.message}`);
-      if (this.store.status() === "playing") {
-        this.store.setMeta("cleanupAt", String(Date.now() + FINISHED_ROOM_TTL_MS));
-      }
-      await this.armCleanup();
+      // 例外にすると alarm が再試行され続ける（1回 = 1リクエスト）ので、畳んで掃除だけ予約する
+      await this.retire();
+      await this.armCleanup(); // 畳み済みでも、早すぎた alarm なら掃除の時刻で張り直す
       return;
     }
     const status = this.store.status();
-    if (status === "finished") return this.retryPersist();
     if (status !== "playing") {
       // 早すぎた（待機中に更新された）掃除の alarm。今の時刻で張り直す
       if (cleanupAt !== null) await this.armAlarm(cleanupAt);

@@ -1,10 +1,10 @@
 import { SELF, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { isRoomId, newRoomId, sha256Hex, WS_PROTOCOL, WS_TOKEN_PROTOCOL_PREFIX } from "../../src/lib/auth";
+import { isRoomId, newRoomId, sha256Hex, WS_PROTOCOL } from "../../src/lib/auth";
 import { FINISHED_ROOM_TTL_MS, WAITING_ROOM_TTL_MS } from "../../src/lib/options";
 import { CLOSE_ROOM_DELETED } from "../../src/lib/protocol";
-import { BASE, call, newRoom, playOut } from "./helpers";
+import { BASE, call, connect, newRoom, playOut } from "./helpers";
 
 const stub = (id: string) => env.GAME_ROOM.getByName(id);
 const alarmOf = (id: string) => runInDurableObject(stub(id), (_i, state) => state.storage.getAlarm());
@@ -27,21 +27,6 @@ async function expire(id: string) {
 const indexRows = async (id: string) =>
   (await env.DB.prepare("SELECT COUNT(*) AS n FROM rooms WHERE id = ?").bind(id).first<{ n: number }>())!.n;
 
-async function connect(roomId: string, token?: string) {
-  const protocols = token ? `${WS_PROTOCOL}, ${WS_TOKEN_PROTOCOL_PREFIX}${token}` : WS_PROTOCOL;
-  const res = await SELF.fetch(`${BASE}/rooms/${roomId}/ws`, {
-    headers: { Upgrade: "websocket", "Sec-WebSocket-Protocol": protocols },
-  });
-  const ws = res.webSocket!;
-  // 閉じられないまま待ち続けるとスイート全体が止まるので、2 秒で失敗にする
-  const closed = Promise.race([
-    new Promise<number>((resolve) => ws.addEventListener("close", (e) => resolve(e.code))),
-    new Promise<number>((_, reject) => setTimeout(() => reject(new Error("socket was not closed")), 2000)),
-  ]);
-  closed.catch(() => {});
-  ws.accept();
-  return { ws, closed };
-}
 
 describe("ルーム ID の形式チェック", () => {
   it("newRoomId は形式に合う", () => {

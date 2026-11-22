@@ -10,10 +10,20 @@ import {
   parseGameOptions,
   roomOptions,
   turnTimeMs,
+  PLAYING_LIST_GRACE_MS,
   WAITING_LIST_TTL_MS,
   WAITING_ROOM_TTL_MS,
 } from "../lib/options";
-import { actionBody, CLOSE_LEFT_ROOM } from "../lib/protocol";
+import {
+  actionBody,
+  CLOSE_LEFT_ROOM,
+  CLOSE_REPLACED,
+  CLOSE_TOO_MANY_ERRORS,
+  MAX_SOCKETS_PER_SEAT,
+  MAX_SPECTATOR_SOCKETS,
+  WS_MAX_STRIKES,
+  WS_STRIKE_DECAY_MS,
+} from "../lib/protocol";
 import { gameRules, rulesMarkdown, type GameRules } from "../lib/rules";
 import type { RoomResult } from "../room/GameRoom";
 import {
@@ -87,7 +97,7 @@ const GAME_OPTIONS_IN = z
 const GameInfo = z
   .object({
     id: z.string(),
-    rulesVersion: z.number().int().describe("Version of the game's rules (an integer, bumped whenever a change could make an old log replay differently). Rooms started with an older version fail with GAME_REMOVED"),
+    rulesVersion: z.number().int().describe("Version of the game's rules (an integer, bumped whenever a change could make an old log replay differently). Rooms created with an older version (waiting, in progress or finished) fail with GAME_REMOVED"),
     viewVersion: z
       .number()
       .int()
@@ -138,7 +148,7 @@ const GameRulesSchema = z
       .string()
       .describe("Hash of the content (also sent as ETag). Changes on any edit, even a typo fix; it is a cache key, not a compatibility signal"),
     apiVersion: z.string().describe("API version (semver), the same as in the guide and the OpenAPI spec"),
-    rulesVersion: z.number().int().describe("Version of the game's rules (an integer, bumped whenever a change could make an old log replay differently). Rooms started with an older version fail with GAME_REMOVED"),
+    rulesVersion: z.number().int().describe("Version of the game's rules (an integer, bumped whenever a change could make an old log replay differently). Rooms created with an older version (waiting, in progress or finished) fail with GAME_REMOVED"),
     viewVersion: z
       .number()
       .int()
@@ -300,7 +310,8 @@ routes.openapi(
     summary: "List public rooms (waiting or playing)",
     description:
       "`status=waiting` (default): waiting rooms with a free seat, updated within the last 30 minutes. " +
-      "`status=playing`: games in progress (for spectating). Finished games are in `/matches`. " +
+      "`status=playing`: games in progress (for spectating), as long as the room has shown activity within its time per turn plus " +
+        `${PLAYING_LIST_GRACE_MS / 3600000} hours. Finished games are in \`/matches\`. ` +
       "Unlisted and practice rooms are never listed. The list is an index and may lag: if a join fails with `ROOM_FULL` or similar, try the next room.",
     request: {
       query: z.object({
@@ -312,6 +323,7 @@ routes.openapi(
     responses: {
       200: { description: "Rooms, most recently updated first", content: { "application/json": { schema: z.array(RoomSummary) } } },
       400: errors[400],
+      429: errors[429],
     },
   }),
   async (c) => {
@@ -321,9 +333,10 @@ routes.openapi(
        FROM rooms
        WHERE status = ?1 AND (?2 IS NULL OR game = ?2)
          AND (?1 <> 'waiting' OR (players < max_players AND updated_at > ?3))
+         AND (?1 <> 'playing' OR updated_at > ?5 - turn_time_ms)
        ORDER BY updated_at DESC, id LIMIT ?4`,
     )
-      .bind(status, game ?? null, Date.now() - WAITING_LIST_TTL_MS, limit)
+      .bind(status, game ?? null, Date.now() - WAITING_LIST_TTL_MS, limit, Date.now() - PLAYING_LIST_GRACE_MS)
       .all<{
         id: string; game: string; game_options: string; status: "waiting" | "playing"; players: number; max_players: number;
         auto_start: number; turn_time_ms: number; created_at: number; updated_at: number;
@@ -481,6 +494,7 @@ routes.openapi(
       404: errors[404],
       410: errors[410],
       409: errors[409],
+      429: errors[429],
     },
   }),
   async (c) => respond(c, await room(c).start(extractToken(c.req.raw))),
@@ -501,6 +515,7 @@ routes.openapi(
       401: errors[401],
       404: errors[404],
       410: errors[410],
+      429: errors[429],
     },
   }),
   async (c) => respond(c, await room(c).getState(extractToken(c.req.raw))),
@@ -536,6 +551,7 @@ routes.openapi(
       404: errors[404],
       410: errors[410],
       409: errors[409],
+      429: errors[429],
     },
   }),
   async (c) => {
@@ -562,6 +578,7 @@ routes.openapi(
       404: errors[404],
       410: errors[410],
       409: errors[409],
+      429: errors[429],
     },
   }),
   async (c) => respond(c, await room(c).resign(extractToken(c.req.raw))),
@@ -586,6 +603,7 @@ routes.openapi(
       404: errors[404],
       410: errors[410],
       409: errors[409],
+      429: errors[429],
     },
   }),
   async (c) => respond(c, await room(c).leave(extractToken(c.req.raw))),
@@ -688,6 +706,7 @@ routes.openapi(
       200: { description: "Action log", content: { "application/json": { schema: LogSchema } } },
       403: errors[403],
       404: errors[404],
+      429: errors[429],
     },
   }),
   async (c) => respond(c, await room(c).getLog()),
@@ -715,6 +734,7 @@ routes.openapi(
       404: errors[404],
       410: errors[410],
       409: errors[409],
+      429: errors[429],
     },
   }),
   async (c) => respond(c, await room(c).getReplay()),
@@ -733,6 +753,9 @@ routes.openAPIRegistry.registerPath({
     `The server answers with the \`${WS_PROTOCOL}\` subprotocol. Clients that can set headers may send \`Authorization: Bearer\` instead of the token subprotocol. ` +
     `The \`${WS_PROTOCOL}\` subprotocol (the version of the WebSocket messages) is required, also for spectators and with Bearer. ` +
     "Without a token you are a spectator. `?token=` is rejected with 400.\n\n" +
+    `Connections are limited: up to ${MAX_SOCKETS_PER_SEAT} per token (one more closes the oldest with close code ${CLOSE_REPLACED}) ` +
+    `and ${MAX_SPECTATOR_SOCKETS} spectators per room (503 \`TOO_MANY_CONNECTIONS\`). A socket that receives more than ${WS_MAX_STRIKES} ` +
+    `errors in a burst (one is forgiven every ${WS_STRIKE_DECAY_MS / 1000} s) is closed with close code ${CLOSE_TOO_MANY_ERRORS}.\n\n` +
     "Server -> client: `state` / `error` / `end` / `pong`. " +
     'Client -> server: `{"type":"action","turn":N,"action":{...}}`, `{"type":"resign"}` and `{"type":"ping"}`.',
   request: { params: RoomIdParam },
@@ -743,6 +766,8 @@ routes.openAPIRegistry.registerPath({
     404: errors[404],
     410: errors[410],
     426: errors[426],
+    429: errors[429],
+    503: errors[503],
   },
 });
 

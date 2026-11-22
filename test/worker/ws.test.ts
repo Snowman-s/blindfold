@@ -297,6 +297,36 @@ describe("練習相手（options.practice）", () => {
     expect(s.json.status).toBe("finished");
   });
 
+  it("練習相手の手も actionSchema で検証し、満たさない手はログに入れない（持ち時間切れに任せる）。ログには検証後の手を書く", async () => {
+    const id = "test-practice-validate";
+    const base = games.tictactoe!;
+    const legal = (s: unknown, pid: string) => base.legalActions!(s as never, pid);
+    // p2（練習相手）は1手目だけ余計なフィールド付きの手（strip される）、2手目は範囲外の手を返す
+    let calls = 0;
+    games[id] = {
+      ...(base as any),
+      id,
+      practiceAction: (s: unknown, pid: string) => (++calls === 1 ? { ...(legal(s, pid)[0] as object), extra: 1 } : { cell: 99 }),
+    };
+    try {
+      const { json } = await call("POST", "/rooms", { body: { game: id, options: { practice: true } } });
+      const a = (await call("POST", `/rooms/${json.roomId}/join`)).json;
+      await call("POST", `/rooms/${json.roomId}/start`, { token: json.hostToken });
+      const s1 = (await call("POST", `/rooms/${json.roomId}/action`, { token: a.token, body: { turn: 0, action: { cell: 0 } } })).json;
+      expect(s1.turn).toBe(2); // p2 の1手目は通る
+      const s2 = (await call("POST", `/rooms/${json.roomId}/action`, { token: a.token, body: { turn: 2, action: { cell: 3 } } })).json;
+      expect(s2.status).toBe("playing");
+      expect(s2.turn).toBe(3); // p2 の2手目は弾かれ、p2 の手番のまま
+      expect(s2.currentPlayers).toEqual(["p2"]);
+      const rows = await runInDurableObject(stub(json.roomId), (_i, st) =>
+        st.storage.sql.exec("SELECT player, action FROM actions ORDER BY turn").toArray(),
+      );
+      expect(rows.map((r) => JSON.parse(r.action as string))).toEqual([{ cell: 0 }, { cell: 1 }, { cell: 3 }]);
+    } finally {
+      delete games[id];
+    }
+  });
+
   it("1回で打つ手数の上限に達したら、続きは alarm で打つ", async () => {
     const { json } = await call("POST", "/rooms", { body: { game: "tictactoe", options: { practice: true } } });
     const roomId: string = json.roomId;

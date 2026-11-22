@@ -26,13 +26,13 @@ export const fail = (status: RoomError["status"], code: string, message: string)
 export const ok = <T>(data: T): RoomResult<T> => ({ ok: true, data });
 export const NOT_FOUND = fail(404, "ROOM_NOT_FOUND", "room not found");
 
-/** エンジン（ゲーム、または記録したルールの版）がもうサーバーに無いルーム。 */
-export function gameRemoved(gameId: string, rulesVersion: number | null): RoomError {
+/** エンジン（ゲーム、または記録したルールの版）がもうサーバーに無いルーム。logAvailable は終了済み（/log が返る）か。 */
+export function gameRemoved(gameId: string, rulesVersion: number, logAvailable: boolean): RoomError {
   return fail(
     410,
     "GAME_REMOVED",
-    `the game ${gameId}${rulesVersion === null ? "" : ` (rules version ${rulesVersion})`} is no longer available on this server` +
-      (rulesVersion === null ? "" : "; the log is still available from /rooms/{id}/log"),
+    `the game ${gameId} (rules version ${rulesVersion}) is no longer available on this server` +
+      (logAvailable ? "; the log is still available from /rooms/{id}/log" : ""),
   );
 }
 
@@ -42,8 +42,8 @@ export type Snapshot = { turn: number; state: unknown };
 export type RoomCore = {
   game: AnyGame;
   status: RoomStatus;
-  /** waiting の間は null */
-  rulesVersion: number | null;
+  /** ルームの作成時に記録したルールの版 */
+  rulesVersion: number;
   gameOptions: unknown;
   players: string[];
   snap: Snapshot | null;

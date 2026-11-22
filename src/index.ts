@@ -78,6 +78,15 @@ const limitRooms = rateLimit((env) => env.RL_ROOMS, 60);
 app.use("/users", limitUsers);
 app.use("/users/:id/key", limitUsers);
 for (const path of ["/rooms", "/quickmatch", "/rooms/:id/join", "/rooms/:id/rematch"]) app.use(path, limitRooms);
+// WS のアップグレード（接続1本 = DO の1リクエスト）と、DO・D1 を読むその他のルート。
+// 429 でも Worker の1リクエストは数えられるが、DO の起動と D1 の読み取りは防げる（DO にも1日10万リクエストの枠がある）
+app.use("/rooms/:id/ws", rateLimit((env) => env.RL_WS, 60, ["GET"]));
+const limitReads = rateLimit((env) => env.RL_READS, 60, ["GET"]);
+const limitRoomPosts = rateLimit((env) => env.RL_READS, 60, ["POST"]);
+for (const path of ["/rooms", "/rooms/:id/state", "/rooms/:id/log", "/rooms/:id/replay", "/matches", "/users/:id"]) {
+  app.use(path, limitReads);
+}
+for (const path of ["/rooms/:id/action", "/rooms/:id/resign", "/rooms/:id/start", "/rooms/:id/leave"]) app.use(path, limitRoomPosts);
 
 app.route("/", routes);
 app.route("/", userRoutes);

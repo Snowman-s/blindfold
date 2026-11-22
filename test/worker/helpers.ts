@@ -1,4 +1,5 @@
 import { SELF } from "cloudflare:test";
+import { WS_PROTOCOL, WS_TOKEN_PROTOCOL_PREFIX } from "../../src/lib/auth";
 
 export const BASE = "https://example.com";
 
@@ -35,4 +36,21 @@ export async function playOut(roomId: string, host: string, a: { token: string }
   for (const [i, [p, cell]] of moves.entries()) {
     await call("POST", `/rooms/${roomId}/action`, { token: p.token, body: { turn: i, action: { cell } } });
   }
+}
+
+/** WS で接続する（token が無ければ観戦）。closed は閉じられたときの close コード（2 秒で閉じられなければ失敗）。 */
+export async function connect(roomId: string, token?: string) {
+  const protocols = token ? `${WS_PROTOCOL}, ${WS_TOKEN_PROTOCOL_PREFIX}${token}` : WS_PROTOCOL;
+  const res = await SELF.fetch(`${BASE}/rooms/${roomId}/ws`, {
+    headers: { Upgrade: "websocket", "Sec-WebSocket-Protocol": protocols },
+  });
+  const ws = res.webSocket!;
+  // 閉じられないまま待ち続けるとスイート全体が止まるので、2 秒で失敗にする
+  const closed = Promise.race([
+    new Promise<number>((resolve) => ws.addEventListener("close", (e) => resolve(e.code))),
+    new Promise<number>((_, reject) => setTimeout(() => reject(new Error("socket was not closed")), 2000)),
+  ]);
+  closed.catch(() => {});
+  ws.accept();
+  return { ws, closed };
 }

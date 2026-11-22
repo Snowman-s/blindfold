@@ -37,6 +37,7 @@ export const errors = {
   429: errorResponse(
     "Too many requests from your IP address (RATE_LIMITED). Wait for the number of seconds in the Retry-After header before retrying",
   ),
+  503: errorResponse("The room already has the most spectator WebSockets it accepts (TOO_MANY_CONNECTIONS)"),
 } as const;
 
 /**
@@ -61,8 +62,7 @@ export const RoomStateSchema = z
     rulesVersion: z
       .number()
       .int()
-      .nullable()
-      .describe("Rules version this game is played with (recorded at start). null while waiting"),
+      .describe("Rules version of this room, recorded when the room was created. If the game's rulesVersion goes up, the room fails with GAME_REMOVED"),
     gameOptions: z
       .unknown()
       .describe("Game-specific options of this room (defaults filled in; see optionsSchema in /games/{id}/rules). null for games without options"),

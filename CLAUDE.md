@@ -100,7 +100,7 @@ export interface GameDefinition<S, A, O = null> {    // O = ゲーム固有の�
   result(s: S): null | { winners: string[]; scores?: Record<string, number> };
   onTimeout?(s: S, pids: string[], rng: Rng): S; // 任意。未定義なら時間切れのプレイヤーの負け
   onResign?(s: S, pid: string, rng: Rng): S;   // 任意。未定義なら投了者の負け（残り全員の勝ち）。3人以上で投了者だけ抜けて続けるときなどに定義
-  practiceAction?(s: S, pid: string, rng: Rng): A; // 練習相手の打ち方。未定義なら合法手からランダム。legalActions が無いゲームでは必須
+  practiceAction?(s: S, pid: string, rng: Rng): A; // 練習相手の打ち方。未定義なら合法手からランダム。legalActions が無いゲームでは必須。返した手は人間の手と同じく検証し（decideAction）、通らなければ持ち時間切れ
 }
 ```
 

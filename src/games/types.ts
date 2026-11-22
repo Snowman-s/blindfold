@@ -102,6 +102,7 @@ export interface GameDefinition<S, A, O = null> {
   onResign?(s: S, pid: string, rng: Rng): S;
   /**
    * 練習相手（options.practice）の打ち方。pid が今行動できるときだけ呼ばれ、合法手を返すこと。
+   * 返した手は人間の手と同じく actionSchema と apply で検証する（decideAction）。通らなければ打たず、その手番は持ち時間切れになる。
    * 未定義のゲームは合法手（legalActions）からランダムに選ぶ。legalActions を定義しないゲームでは必須。
    * ランダムでは決着しにくいゲームは、決着に向かう簡単な打ち方を定義する。
    */

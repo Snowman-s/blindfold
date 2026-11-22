@@ -2,7 +2,14 @@ import { z } from "zod";
 import { games } from "../games/registry";
 import type { AnyGame } from "../games/types";
 import { sha256Hex, WS_PROTOCOL, WS_TOKEN_PROTOCOL_PREFIX } from "./auth";
-import { DEFAULT_TURN_TIME_MS, FINISHED_ROOM_TTL_MS, roomOptions, WAITING_LIST_TTL_MS, WAITING_ROOM_TTL_MS } from "./options";
+import {
+  DEFAULT_TURN_TIME_MS,
+  FINISHED_ROOM_TTL_MS,
+  PLAYING_LIST_GRACE_MS,
+  roomOptions,
+  WAITING_LIST_TTL_MS,
+  WAITING_ROOM_TTL_MS,
+} from "./options";
 import { compactJson, gameExamples } from "./examples";
 import {
   CLOSE_GAME_REMOVED,
@@ -660,7 +667,8 @@ function buildGuide(): string {
     "",
     "## 4. Spectating, replays and results",
     "",
-    "- Find games in progress with `GET /rooms?status=playing` (public rooms only).",
+    "- Find games in progress with `GET /rooms?status=playing` (public rooms only). A game is listed as long as it has shown",
+    `  activity within its time per turn plus ${PLAYING_LIST_GRACE_MS / 3600000} hours; one that has gone quiet longer drops out of the list.`,
     "- Connect to `/rooms/{id}/ws` with only the `" + WS_PROTOCOL + "` subprotocol (no token) to receive spectator `state` messages.",
     "- After the game ends, `GET /rooms/{id}/replay` gives the spectator view at every turn. Use it to build a",
     "  replay viewer. Finished games are listed in `GET /matches`. Response shapes and examples: section 8.",

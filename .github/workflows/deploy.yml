@@ -1,0 +1,57 @@
+# master に入ったら（= PR のマージ）本番にデプロイする。
+# 必要な Secrets：CLOUDFLARE_API_TOKEN（Workers Scripts: Edit と D1: Edit だけを持つトークン）、CLOUDFLARE_ACCOUNT_ID
+name: Deploy
+
+on:
+  push:
+    branches: [master]
+    # Worker の中身に関わらない変更ではデプロイしない（デプロイのたびに DO が作り直され、WS が切れるため）
+    paths-ignore:
+      - "**.md"
+      - "doc/**"
+      - "bots/**"
+      - "test/**"
+      - ".claude/**"
+      - ".github/workflows/ci.yml"
+  workflow_dispatch:
+
+# デプロイは直列にする。走っている途中のデプロイは取り消さない（マイグレーションとデプロイの間で止まらないように）
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      # PR で通っていても、マージ後のコミットは PR のブランチと中身が違いうるので、もう一度確かめる
+      - run: pnpm typecheck
+      - run: pnpm test
+
+      # D1 のマイグレーションは Worker より先に流す（未適用だと結果の書き込みが失敗し続ける）
+      - name: Apply D1 migrations
+        run: pnpm wrangler d1 migrations apply blindfold --remote
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Deploy Worker
+        run: pnpm wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

@@ -84,6 +84,7 @@ describe("roomState / stateMessage", () => {
     snap: { turn: 0, state },
     currentPlayers: game.currentPlayers(state),
     deadline: 10,
+    phaseTurn: 0,
     result: null,
     rematch: null,
   });

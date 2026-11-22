@@ -297,6 +297,7 @@ type ServerMessage =
       view: unknown;                // game-specific board as seen by the receiver (hidden info removed); null while waiting
       legal?: unknown[];            // present only if the receiver may act now and the game lists legal moves
       deadline: number | null;      // epoch ms (server clock) by which currentPlayers must act; null when not playing
+      phaseTurn: number | null;     // turn at which the current (simultaneous) turn began; equals turn otherwise; null when not playing (1.5)
       now: number;                  // server clock (epoch ms) when this message was built; time left = deadline - now
       result: { winners: string[]; scores?: Record<string, number> } | null; // set once finished (same as in "end")
       rematch?: { roomId: string; requestedBy: string[] }; // only after the end, once someone asked for a rematch (1.9)
@@ -479,6 +480,10 @@ function buildGuide(): string {
     '   `legal` and send `{"type":"action","turn":<state.turn>,"action":<element>}`. Send at most one action per `turn`.',
     "   On a simultaneous turn the `turn` goes up each time another player acts. An action carrying an older `turn` of the",
     "   same simultaneous turn is still accepted as long as you may still act, so you do not need to resend.",
+    "   A `state` built before your action was processed can still arrive after you sent it (another player acted",
+    "   first). Remember the `turn` you sent: if it is `>= state.phaseTurn` and you are still in `currentPlayers`, your",
+    "   action is on its way; do not act again. `phaseTurn` is the turn at which the current turn began (it stays the",
+    "   same through a simultaneous turn), so once it moves past the `turn` you sent, it is a new turn and you may act.",
     "   In a game that does not list legal moves (`listsLegalActions: false`), `legal` is absent: build the action",
     "   from the game's action schema; if it is rejected with `ILLEGAL_ACTION`, you may send another one for the same `turn`.",
     "3. Otherwise wait. The next `state` arrives when anyone acts (including on simultaneous turns, where",

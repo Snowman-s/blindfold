@@ -64,6 +64,7 @@ src/
     auth.ts           # Issuing and verifying player tokens
     protocol.ts       # zod schemas for WS messages
     replay.ts         # Reproduction from the action log, timeout resolution (pure functions)
+    turns.ts          # Whether the same simultaneous turn continues (sameSimultaneousTurn; used by room/logic.ts and examples.ts)
     practice.ts       # How the practice opponent picks a move (practiceAction, otherwise a random legal move)
     version.ts        # API_VERSION and output JSON Schemas (outputJsonSchema)
     options.ts        # Validation of room options (turnTimeMs, practice) and game-specific options (parseGameOptions)
@@ -168,12 +169,12 @@ Client → server:
 
 Server → client:
 ```json
-{ "type": "state", "game": "tictactoe", "rulesVersion": 1, "gameOptions": null, "status": "playing", "turn": 13, "players": ["p1", "p2"], "currentPlayers": ["p1"], "view": { ... }, "legal": [ ... ], "deadline": 1732190000000, "now": 1732189710000, "result": null }
+{ "type": "state", "game": "tictactoe", "rulesVersion": 1, "gameOptions": null, "status": "playing", "turn": 13, "players": ["p1", "p2"], "currentPlayers": ["p1"], "view": { ... }, "legal": [ ... ], "deadline": 1732190000000, "phaseTurn": 13, "now": 1732189710000, "result": null }
 { "type": "error", "code": "ILLEGAL_ACTION" | "NOT_YOUR_TURN" | "STALE_TURN" | "NOT_PLAYING" | "UNAUTHORIZED" | "BAD_REQUEST" | ..., "message": "..." }
 { "type": "end", "winners": ["p1"], "scores": { ... }, "reason": "normal" | "timeout" | "resign" }
 ```
 
-- Actions whose `turn` doesn't match the current turn are rejected with `STALE_TURN` (prevents double sends and stale moves). Exception: within one simultaneous turn (a run of turns where `currentPlayers` only shrinks; the same test as keeping the deadline, `sameSimultaneousTurn` in `room/logic.ts`), an older `turn` is accepted while the sender is still in `currentPlayers` (`acceptsTurn`). The turn where that run began is `meta.phaseTurn`, written by `settle` with the deadline. Otherwise every other player's move would make in-flight actions stale.
+- Actions whose `turn` doesn't match the current turn are rejected with `STALE_TURN` (prevents double sends and stale moves). Exception: within one simultaneous turn (a run of turns where `currentPlayers` only shrinks; the same test as keeping the deadline, `sameSimultaneousTurn` in `lib/turns.ts`), an older `turn` is accepted while the sender is still in `currentPlayers` (`acceptsTurn`). The turn where that run began is `meta.phaseTurn`, written by `settle` with the deadline. Otherwise every other player's move would make in-flight actions stale. It is also sent in the state as `phaseTurn` (`null` unless playing), so a client can tell a `state` built before its own in-flight action (sent `turn` >= `phaseTurn` and still in `currentPlayers`) from a new turn.
 - Actions arriving after the deadline also settle the timeout on the spot, without waiting for the Alarm, and are then rejected with `STALE_TURN`.
 - `state` is the same object as REST `GET /rooms/:id/state` plus `type` (`RoomState` is the single definition, in `src/lib/protocol.ts`).
 - `error` `code`s are the same codes as REST, unchanged (no remapping).

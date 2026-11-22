@@ -32,8 +32,15 @@ describe("frontier（部屋で通しで遊ぶ）", () => {
     await call("POST", `/rooms/${json.roomId}/start`, { token: json.hostToken });
     const send = (p: { token: string }, turn: number) =>
       call("POST", `/rooms/${json.roomId}/action`, { token: p.token, body: { turn, action: { orders: [] } } });
+    const start = (await call("GET", `/rooms/${json.roomId}/state`)).json;
+    expect(start.phaseTurn).toBe(0);
     // 3人とも turn 0 の state を見て送る
     expect((await send(ps[0], 0)).status).toBe(200);
+    // p1 が出した後の state（p2 には、自分の手より前に作られたものとして届きうる）：turn は進むが phaseTurn は 0 のまま
+    const mid = (await call("GET", `/rooms/${json.roomId}/state`)).json;
+    expect(mid.turn).toBe(1);
+    expect(mid.phaseTurn).toBe(0);
+    expect(mid.currentPlayers).toEqual([ps[1].playerId, ps[2].playerId]);
     const dup = await send(ps[0], 0); // 二重送信
     expect(dup.status).toBe(409);
     expect(dup.json.error.code).toBe("STALE_TURN");
@@ -42,6 +49,7 @@ describe("frontier（部屋で通しで遊ぶ）", () => {
     const s = (await call("GET", `/rooms/${json.roomId}/state`)).json;
     expect(s.turn).toBe(3);
     expect(s.view.round).toBe(1);
+    expect(s.phaseTurn).toBe(3); // 新しいラウンドは turn 3 に始まった
     // 次のラウンドでは、前のラウンドの turn は受け付けない
     const old = await send(ps[1], 1);
     expect(old.json.error.code).toBe("STALE_TURN");

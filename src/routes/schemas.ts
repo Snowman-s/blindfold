@@ -76,6 +76,15 @@ export const RoomStateSchema = z
       .optional()
       .describe("Present only if the caller may act now and the game lists legal moves (listsLegalActions in /games). Whether you may act is decided by currentPlayers, not by legal"),
     deadline: z.number().nullable().describe("Deadline of the current turn (epoch ms, server clock). null unless playing"),
+    phaseTurn: z
+      .number()
+      .int()
+      .nullable()
+      .describe(
+        "The turn at which the current turn began. On a simultaneous turn, turn goes up each time someone acts but phaseTurn stays the same; " +
+          "otherwise it equals turn. If you sent an action with a turn >= phaseTurn and you are still in currentPlayers, this state was built " +
+          "before your action was processed: wait for the next state instead of acting again. null unless playing",
+      ),
     now: z.number().describe("Server clock (epoch ms) when this response was built. Time left = deadline - now (do not use the client's clock)"),
     result: ResultSchema.nullable(),
     rematch: z

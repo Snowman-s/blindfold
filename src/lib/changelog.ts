@@ -20,6 +20,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.9.0",
+    date: "2026-11-22",
+    added: [
+      "`phaseTurn` in the room state (REST and WebSocket `state`): the turn at which the current turn began. It stays the same " +
+        "through a simultaneous turn and equals `turn` otherwise (null unless playing). A `state` built before your action was " +
+        "processed can arrive after you sent it; if the `turn` you sent is `>= phaseTurn` and you are still in `currentPlayers`, " +
+        "wait instead of acting again.",
+    ],
+  },
+  {
     version: "0.8.0",
     date: "2026-11-22",
     added: [

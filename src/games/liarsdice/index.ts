@@ -8,6 +8,10 @@ import { docs } from "./docs";
  * 各自がダイスを振って自分の目だけを見る。手番の人は「全員のダイスの中に face の目が quantity 個以上ある」という
  * 宣言を前より大きくするか、直前の宣言にダウト（challenge）をかける。外れた側がダイスを1個失い、最後に残った1人が勝ち。
  * 乱数はラウンドの始め（ダイスを振るとき）だけ引く。ルールの説明（英語）は docs.ts。
+ *
+ * ラウンドの途中で抜けた人（投了・時間切れ）のダイスは、そのラウンドが終わるまで場に残す（隠したまま数に入る）。
+ * 振り直すと、手番でない人の投了（ルームは「行動できる人が変わらないので同じ手番が続く」とみなし、締め切りと
+ * phaseTurn を引き継いで送信中の手を受け付ける）でラウンドの中身だけが変わってしまうため。
  */
 
 export const MIN_PLAYERS = 2;
@@ -32,7 +36,7 @@ export interface Reveal {
   caller: string;
   /** 宣言の face に数えられたダイスの数（ワイルドを含む）。 */
   count: number;
-  /** ダイスを1個失ったプレイヤー。exact が当たったときは null。 */
+  /** 外れた側（ダイスを1個失う。もう抜けていれば誰も失わない）。exact が当たったときは null。 */
   loser: string | null;
   /** exact が当たってダイスを1個取り戻したプレイヤー（上限で増えなかったときも caller）。 */
   gainer: string | null;
@@ -51,8 +55,10 @@ export interface LiarsDiceState {
   out: Record<string, OutReason>;
   /** 抜けたときに、すでに抜けていた人数（順位の点数になる）。 */
   outRank: Record<string, number>;
-  /** 各自の今ラウンドの目（昇順）。抜けた人は []。 */
+  /** 各自の今ラウンドの目（昇順）。ラウンドの途中で抜けた人の目は、そのラウンドが終わるまで残る。 */
   dice: Record<string, number[]>;
+  /** 今ラウンドのダイスが場にある人（ラウンド開始時の alive。途中で抜けても残る）。 */
+  inRound: string[];
   /** 今のラウンドの番号（1 から。ダイスを振るたびに増える）。 */
   round: number;
   /** 今ラウンドの宣言（古い順）。 */
@@ -107,8 +113,10 @@ const viewSchema = z.strictObject({
   players: z.array(z.string()).describe("All player IDs in seat order"),
   alive: z.array(z.string()).describe("Players who still have dice, in seat order"),
   out: pidMap(z.enum(["eliminated", "resigned", "timedOut"])).describe("Player ID -> why that player left the game"),
-  diceCounts: pidMap(z.number().int().min(0)).describe("Player ID -> number of dice they hold"),
-  totalDice: z.number().int().min(0).describe("Total dice in play (the sum of diceCounts). No bid may exceed it"),
+  diceCounts: pidMap(z.number().int().min(0)).describe(
+    "Player ID -> number of their dice in this round (a player who left mid-round keeps theirs on the table until the round ends)",
+  ),
+  totalDice: z.number().int().min(0).describe("Total dice in this round (the sum of diceCounts). No bid may exceed it"),
   bids: z.array(bidSchema).describe("Bids made this round, oldest first"),
   currentBid: bidSchema.nullable().describe("The bid to beat (the last of `bids`), or null at the start of a round"),
   minBids: z
@@ -123,7 +131,10 @@ const viewSchema = z.strictObject({
       call: z.enum(["challenge", "exact"]),
       caller: z.string(),
       count: z.number().int().describe("How many dice counted for the called bid's face (wild ones included)"),
-      loser: z.string().nullable().describe("Who lost a die, or null when an exact call was right"),
+      loser: z
+        .string()
+        .nullable()
+        .describe("Who was wrong and lost a die (nobody loses one if that player had already left), or null when an exact call was right"),
       gainer: z.string().nullable().describe("Who won back a die with a right exact call, or null"),
     })
     .nullable()
@@ -131,16 +142,16 @@ const viewSchema = z.strictObject({
   myDice: z
     .array(z.number().int().min(1).max(FACES))
     .optional()
-    .describe("Players only (absent for spectators): your dice this round, ascending. Empty once you are out"),
+    .describe("Players only (absent for spectators): your dice this round, ascending. Empty from the round after you are out"),
 });
 
 // ---- 補助 ----
 
 const isOver = (s: LiarsDiceState): boolean => s.alive.length <= 1;
-const totalDice = (s: LiarsDiceState): number => s.alive.reduce((t, p) => t + s.dice[p]!.length, 0);
+const totalDice = (s: LiarsDiceState): number => s.inRound.reduce((t, p) => t + s.dice[p]!.length, 0);
 const counts = (d: number, f: number, wild: boolean) => d === f || (wild && f !== 1 && d === 1);
 const countFace = (s: LiarsDiceState, f: number): number =>
-  s.alive.reduce((t, p) => t + s.dice[p]!.filter((d) => counts(d, f, s.options.wildOnes)).length, 0);
+  s.inRound.reduce((t, p) => t + s.dice[p]!.filter((d) => counts(d, f, s.options.wildOnes)).length, 0);
 
 /** 席順で p の次にいる、まだ遊んでいるプレイヤー（p 自身が抜けていても、その席の次から探す）。 */
 function nextAlive(s: LiarsDiceState, p: string): string {
@@ -180,30 +191,40 @@ function roll(n: number, rng: Rng): number[] {
   return Array.from({ length: n }, () => 1 + rng.int(FACES)).sort((a, b) => a - b);
 }
 
-/** 新しいラウンド：残っている全員が振り直し、starter から始める。決着していれば手番なし。 */
+/** 新しいラウンド：抜けた人のダイスを片付け、残っている全員が振り直して starter（抜けていれば席順で次の人）から始める。決着していれば手番なし。 */
 function newRound(s: LiarsDiceState, starter: string, rng: Rng): LiarsDiceState {
-  if (isOver(s)) return { ...s, bids: [], turnPlayer: null };
   const dice = { ...s.dice };
+  for (const p of s.players) if (!s.alive.includes(p)) dice[p] = [];
+  if (isOver(s)) return { ...s, dice, inRound: [...s.alive], bids: [], turnPlayer: null };
   for (const p of s.alive) dice[p] = roll(dice[p]!.length, rng); // 席順に振る（再現のため順番は固定）
-  return { ...s, dice, round: s.round + 1, bids: [], turnPlayer: s.alive.includes(starter) ? starter : nextAlive(s, starter) };
+  return {
+    ...s,
+    dice,
+    inRound: [...s.alive],
+    round: s.round + 1,
+    bids: [],
+    turnPlayer: s.alive.includes(starter) ? starter : nextAlive(s, starter),
+  };
 }
 
-/** プレイヤーを抜けさせる（ダイスを失う）。ラウンドはまだ振り直さない。 */
+/** プレイヤーを抜けさせる。ダイスは今のラウンドが終わるまで場に残す（newRound が片付ける）。 */
 function drop(s: LiarsDiceState, pids: string[], reason: OutReason): LiarsDiceState {
   const rank = s.players.length - s.alive.length;
   const out = { ...s.out };
   const outRank = { ...s.outRank };
-  const dice = { ...s.dice };
   for (const p of pids) {
     out[p] = reason;
     outRank[p] = rank;
-    dice[p] = [];
   }
-  return { ...s, alive: s.alive.filter((p) => !pids.includes(p)), out, outRank, dice };
+  return { ...s, alive: s.alive.filter((p) => !pids.includes(p)), out, outRank };
 }
 
-/** p のダイスを delta 個増減する（上限 startDice）。0 個になったら脱落。目は次のラウンドで振り直すので、個数だけが意味を持つ。 */
+/**
+ * p のダイスを delta 個増減する（上限 startDice）。0 個になったら脱落。もう抜けた人は変えない。
+ * 目は次のラウンドで振り直すので、個数だけが意味を持つ。
+ */
 function changeDice(s: LiarsDiceState, p: string, delta: number): LiarsDiceState {
+  if (!s.alive.includes(p)) return s;
   const cur = s.dice[p]!;
   const n = Math.min(s.options.startDice, cur.length + delta);
   if (n <= 0) return drop(s, [p], "eliminated");
@@ -211,10 +232,15 @@ function changeDice(s: LiarsDiceState, p: string, delta: number): LiarsDiceState
   return { ...s, dice: { ...s.dice, [p]: dice } };
 }
 
-/** ラウンドの途中で誰かが抜けたとき：そのラウンドは無効にして振り直す（抜けた人のダイスも数に入っていたため）。 */
-function leave(s: LiarsDiceState, pids: string[], reason: OutReason, rng: Rng): LiarsDiceState {
-  // 手番の人が残っていればその人から、抜けたなら席順でその次の人からやり直す（newRound が次の人を探す）
-  return newRound(drop(s, pids, reason), s.turnPlayer ?? pids[0]!, rng);
+/**
+ * ラウンドの途中で抜ける（投了・時間切れ）。ラウンドはそのまま続く（抜けた人のダイスも数に入ったまま）。
+ * 手番の人が抜けたら席順で次の人へ。残り1人になったら決着（手番なし）。
+ */
+function leave(s: LiarsDiceState, pids: string[], reason: OutReason): LiarsDiceState {
+  const next = drop(s, pids, reason);
+  if (isOver(next)) return { ...next, turnPlayer: null };
+  const t = s.turnPlayer;
+  return { ...next, turnPlayer: t !== null && next.alive.includes(t) ? t : nextAlive(next, t ?? pids[0]!) };
 }
 
 // ---- 練習相手 ----
@@ -269,6 +295,7 @@ export const liarsdice: GameDefinition<LiarsDiceState, LiarsDiceAction, LiarsDic
       out: {},
       outRank: {},
       dice: Object.fromEntries(players.map((p) => [p, Array<number>(options.startDice).fill(1)])),
+      inRound: [...players],
       round: 0,
       bids: [],
       turnPlayer: null,
@@ -315,7 +342,7 @@ export const liarsdice: GameDefinition<LiarsDiceState, LiarsDiceAction, LiarsDic
     else loser = pid;
     const reveal: Reveal = {
       round: s.round,
-      dice: Object.fromEntries(s.alive.map((p) => [p, s.dice[p]!])),
+      dice: Object.fromEntries(s.inRound.map((p) => [p, s.dice[p]!])),
       bids: s.bids,
       call: a.type,
       caller: pid,
@@ -325,7 +352,7 @@ export const liarsdice: GameDefinition<LiarsDiceState, LiarsDiceAction, LiarsDic
     };
     let next: LiarsDiceState = { ...s, lastRound: reveal };
     next = loser !== null ? changeDice(next, loser, -1) : changeDice(next, gainer!, +1);
-    // 次のラウンドはダイスを失った人（抜けたらその次の人）、exact が当たったら当てた人から
+    // 次のラウンドは外れた人（抜けていればその次の人）、exact が当たったら当てた人から
     return newRound(next, loser ?? gainer!, rng);
   },
 
@@ -339,7 +366,7 @@ export const liarsdice: GameDefinition<LiarsDiceState, LiarsDiceAction, LiarsDic
       players: s.players,
       alive: s.alive,
       out: s.out,
-      diceCounts: Object.fromEntries(s.players.map((p) => [p, s.dice[p]!.length])),
+      diceCounts: Object.fromEntries(s.players.map((p) => [p, s.inRound.includes(p) ? s.dice[p]!.length : 0])),
       totalDice: totalDice(s),
       bids: s.bids,
       currentBid: s.bids.at(-1) ?? null,
@@ -358,14 +385,14 @@ export const liarsdice: GameDefinition<LiarsDiceState, LiarsDiceAction, LiarsDic
     };
   },
 
-  onTimeout(s, pids, rng) {
+  onTimeout(s, pids) {
     const gone = pids.filter((p) => s.alive.includes(p));
-    return gone.length ? leave(s, gone, "timedOut", rng) : s;
+    return gone.length ? leave(s, gone, "timedOut") : s;
   },
 
-  onResign(s, pid, rng) {
+  onResign(s, pid) {
     if (!s.alive.includes(pid)) throw new GameError("ILLEGAL_ACTION", "you are already out of the game");
-    return leave(s, [pid], "resigned", rng);
+    return leave(s, [pid], "resigned");
   },
 
   practiceAction(s, pid, rng) {

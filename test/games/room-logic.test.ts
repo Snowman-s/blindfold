@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { games } from "../../src/games/registry";
 import { highcard } from "../../src/games/highcard";
+import { liarsdice, type LiarsDiceState } from "../../src/games/liarsdice";
 import type { AnyGame } from "../../src/games/types";
 import {
   decideAction,
@@ -188,6 +189,45 @@ describe("同時手番の phaseTurn と acceptsTurn", () => {
     expect(decideAction(hc, snap, "p2", 6, { card: p2card }, "s", 4)).toMatchObject({ code: "STALE_TURN" });
     // phaseTurn を渡さなければ完全一致だけ
     expect(decideAction(hc, snap, "p2", 4, { card: p2card }, "s")).toMatchObject({ code: "STALE_TURN" });
+  });
+});
+
+describe("手番制で同じ人が続けて行動するゲーム（liarsdice）", () => {
+  const ld = liarsdice as AnyGame;
+  const P3 = ["p1", "p2", "p3"];
+  const s0: LiarsDiceState = {
+    ...liarsdice.init(P3, "s", { startDice: 2, wildOnes: true, spotOn: false }),
+    dice: { p1: [4, 4], p2: [2, 3], p3: [5, 6] },
+    turnPlayer: "p1",
+  };
+  const base = { game: ld, forfeit: null, prevDeadline: 5000, turnTimeMs: 1000 };
+  const s1 = liarsdice.apply(s0, "p1", { type: "bid", quantity: 2, face: 4 }, createRng("1")); // p2 の手番
+
+  it("ダウトして負けた人が次のラウンドも最初に打つときは、新しい手番（締め切りを延ばし、前の turn は STALE_TURN）", () => {
+    const r = decideAction(ld, { turn: 1, state: s1 }, "p2", 1, { type: "challenge" }, "s", 1);
+    expect(r.ok).toBe(true);
+    const next = r.ok ? (r.data.next as LiarsDiceState) : s1;
+    expect(liarsdice.currentPlayers(next)).toEqual(["p2"]); // 4 は 2 個あるので p2 の負け、p2 から
+    expect(settle({ status: "playing", ...base, state: next, prev: ["p2"], turn: 2, prevPhaseTurn: 1 }, 10)).toEqual({
+      kind: "playing",
+      deadline: 1010,
+      phaseTurn: 2,
+    });
+    expect(decideAction(ld, { turn: 2, state: next }, "p2", 1, { type: "challenge" }, "s", 2)).toMatchObject({ code: "STALE_TURN" });
+  });
+
+  it("手番でない人の投了は同じ手番が続き、送信中の手はそのままのラウンドに対して受け付ける", () => {
+    const r = decideResign(ld, { turn: 1, state: s1 }, "p3", P3, "s");
+    const next = (r.ok ? r.data.state : s1) as LiarsDiceState;
+    expect(r.ok && r.data.endReason).toBeNull();
+    expect(next.bids).toEqual(s1.bids);
+    expect(next.dice).toEqual(s1.dice);
+    expect(settle({ status: "playing", ...base, state: next, prev: ["p2"], turn: 2, prevPhaseTurn: 1, resign: true }, 10)).toEqual({
+      kind: "playing",
+      deadline: 5000,
+      phaseTurn: 1,
+    });
+    expect(decideAction(ld, { turn: 2, state: next }, "p2", 1, { type: "bid", quantity: 3, face: 4 }, "s", 1).ok).toBe(true);
   });
 });
 

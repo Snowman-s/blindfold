@@ -16,6 +16,7 @@ function board(dice: Record<string, number[]>, over: Partial<LiarsDiceState> = {
     out: {},
     outRank: {},
     dice,
+    inRound: players,
     round: 1,
     bids: [],
     turnPlayer: players[0]!,
@@ -117,28 +118,46 @@ describe("liarsdice: ダウト", () => {
 });
 
 describe("liarsdice: 抜ける", () => {
-  it("途中で投了するとそのラウンドは無効になって振り直し、手番の人から続く", () => {
-    const s0 = g.init(seats(3), "r", opts);
-    const first = s0.turnPlayer!;
-    const s1 = bid(s0, first, 2, 3);
-    const other = s1.players.find((p) => p !== first && p !== s1.turnPlayer)!;
-    const s = g.onResign!(s1, other, rngForTurn("r", 1));
-    expect(s.out).toEqual({ [other]: "resigned" });
-    expect(s.dice[other]).toEqual([]);
-    expect(s.round).toBe(2);
-    expect(s.bids).toEqual([]);
-    expect(s.lastRound).toBeNull();
-    expect(s.turnPlayer).toBe(s1.turnPlayer);
-    expect(() => g.onResign!(s, other, rng)).toThrow(GameError);
+  it("手番でない人が投了しても、ラウンド（目・宣言・手番）はそのまま続き、その人のダイスも数に入る", () => {
+    const s1 = bid(board({ p1: [4, 4], p2: [1, 2], p3: [4, 6] }), "p1", 3, 4);
+    const s = g.onResign!(s1, "p3", rng);
+    expect(s.out).toEqual({ p3: "resigned" });
+    expect(s.alive).toEqual(["p1", "p2"]);
+    expect({ dice: s.dice, bids: s.bids, round: s.round, turnPlayer: s.turnPlayer }).toEqual({
+      dice: s1.dice,
+      bids: s1.bids,
+      round: s1.round,
+      turnPlayer: "p2",
+    });
+    expect(view(s, null)).toMatchObject({ totalDice: 6, diceCounts: { p1: 2, p2: 2, p3: 2 } });
+    expect(view(s, "p3").myDice).toEqual([4, 6]);
+    expect(() => g.onResign!(s, "p3", rng)).toThrow(GameError);
+    // 4 は p1 に 2 個、p2 のワイルド 1 個、抜けた p3 に 1 個 → 4 個。ダウトした p2 の負け
+    const t = g.apply(s, "p2", { type: "challenge" }, rng);
+    expect(t.lastRound).toMatchObject({ count: 4, loser: "p2", dice: { p1: [4, 4], p2: [1, 2], p3: [4, 6] } });
+    expect(t.dice["p3"]).toEqual([]);
+    expect(t.inRound).toEqual(["p1", "p2"]);
+    expect(view(t, null)).toMatchObject({ totalDice: 3, diceCounts: { p1: 2, p2: 1, p3: 0 } });
   });
 
-  it("手番の人が時間切れになると脱落し、次の席の人から。2人なら決着", () => {
-    const s0 = board({ p1: [1, 2], p2: [3, 4], p3: [5, 6] }, { turnPlayer: "p3" });
-    const s = g.onTimeout!(s0, ["p3"], rng);
-    expect(s.out).toEqual({ p3: "timedOut" });
-    expect(s.turnPlayer).toBe("p1");
+  it("外れた人がもう抜けていれば誰もダイスを失わず、次のラウンドは席順でその次の人から", () => {
+    const s1 = bid(board({ p1: [2, 2], p2: [3, 3], p3: [5, 5] }), "p1", 5, 6);
+    const s = g.onResign!(s1, "p1", rng);
+    const t = g.apply(s, "p2", { type: "challenge" }, rng);
+    expect(t.lastRound).toMatchObject({ loser: "p1" });
+    expect(view(t, null)).toMatchObject({ diceCounts: { p1: 0, p2: 2, p3: 2 } });
+    expect(t.turnPlayer).toBe("p2");
+  });
+
+  it("手番の人が時間切れになると脱落し、同じラウンドを次の席の人が続ける。2人なら決着", () => {
+    const s0 = bid(board({ p1: [1, 2], p2: [3, 4], p3: [5, 6] }), "p1", 2, 3);
+    const s = g.onTimeout!({ ...s0 }, ["p2"], rng);
+    expect(s.out).toEqual({ p2: "timedOut" });
+    expect(s.turnPlayer).toBe("p3");
+    expect(s.bids).toEqual(s0.bids);
     const end = g.onTimeout!(board({ p1: [1], p2: [2] }), ["p1"], rng);
     expect(g.result(end)).toEqual({ winners: ["p2"], scores: { p1: 0, p2: 1 } });
+    expect(g.currentPlayers(end)).toEqual([]);
   });
 });
 

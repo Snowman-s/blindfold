@@ -115,7 +115,10 @@ describe.each(Object.keys(suite))("%s", { timeout: 30_000 }, (gameId) => {
     expect(game.docs.examples.length).toBeGreaterThan(0);
     for (const e of game.docs.examples) expect(game.actionSchema.safeParse(e.action).success).toBe(true);
     const r = await gameRules(game);
-    expect(r.actionSchema).toHaveProperty("type", "object");
+    // 1つの object か、種類ごとの object の union（discriminatedUnion は oneOf になる）
+    const schema = r.actionSchema as { type?: string; oneOf?: { type?: string }[]; anyOf?: { type?: string }[] };
+    const variants = schema.oneOf ?? schema.anyOf ?? [schema];
+    for (const v of variants) expect(v).toHaveProperty("type", "object");
     expect(rulesMarkdown(r)).toContain(game.docs.rules);
   });
 

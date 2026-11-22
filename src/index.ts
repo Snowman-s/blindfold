@@ -2,6 +2,7 @@ import { OpenAPIHono } from "@hono/zod-openapi";
 import type { Context } from "hono";
 import { cors } from "hono/cors";
 import { HTTPException } from "hono/http-exception";
+import { changelog } from "./lib/changelog";
 import { guide, renderGuide } from "./lib/guide";
 import { API_VERSION } from "./lib/version";
 import { routes } from "./routes/rooms";
@@ -17,7 +18,8 @@ const corsMw = cors({
   origin: "*",
   allowMethods: ["GET", "POST", "OPTIONS"],
   allowHeaders: ["Authorization", "Content-Type", "X-Api-Key", "If-None-Match"],
-  exposeHeaders: ["ETag"],
+  // Deprecation / Sunset / Link は廃止予定の告知（src/lib/deprecation.ts）。ブラウザのクライアントにも読めるようにする
+  exposeHeaders: ["ETag", "Deprecation", "Sunset", "Link"],
   maxAge: 86400,
 });
 app.use("*", async (c, next) => {
@@ -40,6 +42,17 @@ async function serveGuide(c: Context<{ Bindings: Env }>): Promise<Response> {
 app.get("/guide.md", serveGuide);
 app.get("/llms.txt", serveGuide);
 
+/** API の変更履歴。内容のハッシュを ETag にする。 */
+app.get("/changelog.md", async (c) => {
+  const g = await changelog();
+  const etag = `"${g.version}"`;
+  c.header("ETag", etag);
+  c.header("Cache-Control", "public, max-age=3600");
+  if (c.req.header("If-None-Match") === etag) return c.body(null, 304);
+  c.header("Content-Type", "text/markdown; charset=utf-8");
+  return c.body(g.body);
+});
+
 // ユーザーが最初に貼るのはルート URL なので、ここから迷わずガイドに辿り着けるようにする。
 // Markdown を求めるクライアントにはガイド本文をそのまま返す。
 app.get("/", async (c) => {
@@ -54,6 +67,7 @@ app.get("/", async (c) => {
     guide: `${origin}/guide.md`,
     games: `${origin}/games`,
     openapi: `${origin}/openapi.json`,
+    changelog: `${origin}/changelog.md`,
   });
 });
 app.route("/", routes);

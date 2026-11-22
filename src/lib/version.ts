@@ -4,8 +4,9 @@ import { z } from "zod";
  * API の版（semver）。OpenAPI の info.version・ガイド・rules で共有する。
  * 0.x の間は実験段階で、マイナーを上げるだけで破壊的変更をしてよい（予告なし、changelog は事後）。
  * ガイド・rules の `version`（内容のハッシュ = ETag）とは別物。あちらは誤字1つ直しても変わる。
+ * 上げたら src/lib/changelog.ts の先頭に同じ版のエントリを足す（テストで確認する）。
  */
-export const API_VERSION = "0.2.0";
+export const API_VERSION = "0.3.0";
 
 /**
  * サーバーが返す値（view など）の JSON Schema を配布用に作る。

@@ -61,6 +61,8 @@ src/
     options.ts        # ルームオプション（turnTimeMs、practice）
     rules.ts          # ゲームの説明（/games/:id/rules）の組み立て
     guide.ts          # クライアント開発者向けガイド（/guide.md）の生成
+    changelog.ts      # API の変更履歴（/changelog.md）。API_VERSION を上げたら先頭に足す
+    deprecation.ts    # Deprecation / Sunset ヘッダーのヘルパー（deprecated() ミドルウェア、markDeprecated()）
     examples.ts       # ガイド・rules に載せる state / end / ログの例（実エンジン + 固定シードから作る）
 bots/
   random-bot.ts       # 合法手からランダムに選ぶ Bot（Node で実行）
@@ -77,6 +79,7 @@ wrangler.jsonc
 ```ts
 export interface GameDefinition<S, A> {
   id: string;                                  // "tictactoe" など
+  rulesVersion: number;                        // ルールの版（1 から）。シード + ログの再現が崩れる変更（rng の引き方も含む）で上げる
   minPlayers: number;
   maxPlayers: number;
   actionSchema: z.ZodType<A>;                  // 受信した行動の検証用
@@ -105,7 +108,8 @@ export interface GameDefinition<S, A> {
 | メソッド | パス | 内容 |
 |---|---|---|
 | GET | `/`（`Accept: text/markdown` ならガイド本文）、`/guide.md`、`/llms.txt` | クライアント開発者（コーディングエージェント）向けのガイド。URL を渡すだけでクライアントが書けることが目標。コードから生成し、`version` を ETag にする |
-| GET | `/games` | 利用できるゲームの一覧（`summary`、`rulesUrl` 付き） |
+| GET | `/changelog.md` | API の変更履歴（`src/lib/changelog.ts` から生成。内容のハッシュを ETag にする） |
+| GET | `/games` | 利用できるゲームの一覧（`summary`、`rulesVersion`、`rulesUrl` 付き） |
 | GET | `/games/:id/rules` | ゲームの説明（LLM 向け）。ルール・view の読み方・view / action の JSON Schema・state の例（実エンジンから生成）・共通の遊び方。`version` を ETag にする |
 | GET | `/games/:id/rules.md` | 同じ内容を Markdown 1枚で。プロンプトにそのまま貼れる |
 | POST | `/rooms` | `{ game: string, options?: {...} }` → `{ roomId, hostToken }`。未知のオプションは 400。`options.practice: true` で開始時に空席をサーバー側の練習相手が埋める（打ち方は `practiceAction`、未定義ならランダム。D1 には記録しない）。`options.autoStart: true` で満席になったら自動開始（practice と併用不可）。`options.unlisted: true` で一覧・クイックマッチから外す |
@@ -118,8 +122,8 @@ export interface GameDefinition<S, A> {
 | GET | `/rooms/:id/state` | `Authorization: Bearer <token>` があればそのプレイヤー視点、なければ観戦視点 |
 | POST | `/rooms/:id/resign` | 投了。試合中ならいつでも（手番でなくても）。既定は投了者の負けで残り全員が勝ち、その場で終了（`onResign` があればそれに従う）。WS では `{ "type": "resign" }` |
 | POST | `/rooms/:id/action` | WS を使わない簡易 Bot 向け。`{ turn, action }`。相手の手を待つ手段はないので、単発の行動・デバッグ用（対戦は WS） |
-| GET | `/rooms/:id/log` | 行動ログ（リプレイ用。終了後のみ） |
-| GET | `/rooms/:id/replay` | ログから再現した各ターンの観戦視点（終了後のみ） |
+| GET | `/rooms/:id/log` | 行動ログ（リプレイ用。終了後のみ）。開始時に記録した `rulesVersion` 付き |
+| GET | `/rooms/:id/replay` | ログから再現した各ターンの観戦視点（終了後のみ）。記録した `rulesVersion` が今のエンジンと違えば 409 `RULES_CHANGED`（`/log` は返す） |
 | POST | `/users` | `{ name }` → `{ userId, name, apiKey }`。join 時に `X-Api-Key` を付けると戦績が紐づく |
 | GET | `/users/:id` | ユーザーと戦績 |
 | GET | `/matches` | 終了した試合の一覧（`?game=&limit=`） |
@@ -160,13 +164,14 @@ export interface GameDefinition<S, A> {
 |---|---|---|
 | `version` | ガイド・rules の見出し、`/games/:id/rules` の `version`、ETag | 内容のハッシュ。誤字1つ直しても変わる。**キャッシュの鍵でしかなく、互換性の合図ではない** |
 | `apiVersion` | `src/lib/version.ts` の `API_VERSION`。OpenAPI の `info.version`・ガイドの TL;DR・rules の `apiVersion` が同じ値を参照する | API の版（semver） |
-| ルールの版（未実装。名前は `rulesVersion`） | `GameDefinition` | ゲームのルール・action の形の版。「シード + ログで再現できる」保証に関わる |
+| `rulesVersion` | `GameDefinition.rulesVersion`（整数）。`/games`・rules・state・`/log`・`/replay`・`/matches` で返す | ゲームのルール・action の形の版。「シード + ログで再現できる」保証に関わる。ルームは開始時（`init` と同じトランザクション）に meta へ記録する。D1 の `matches.rules_version` にも残す |
 
 - **0.x の間は実験段階**。破壊的変更は予告なしで出してよい（マイナーを上げる）。changelog は事後に書く。1.0.0 からは破壊的変更でメジャーを上げる。
 - **非破壊（いつでもやる。クライアントは許容する義務がある）**：REST レスポンス・WS メッセージ・`view` へのフィールド追加、新しい WS メッセージ `type`、新しいエラー `code`、新しいゲーム・エンドポイント・省略可能な入力やルームオプション、ガイド・rules・エラーメッセージの文言変更。クライアントの義務（未知のフィールド・`type`・`code` を無視する）はガイドの 9 節・チェックリスト・rules の `COMMON` に書いてある。
 - **破壊的**：フィールドの削除・改名・型や意味の変更、入力を必須にすること、認証方式の変更、ゲームのルール・action の形の変更。
 - **出力の JSON Schema は未知のフィールドを禁止しない**。`viewSchema` は内部では `strictObject`（all-games テストで余計なフィールドが無いことを確かめる用）だが、`/rules` で配るときは `outputJsonSchema()` で `additionalProperties: false` を外す。入力（action・ルームオプション）の Schema は余計なフィールドを拒否するので `z.toJSONSchema` のまま。
-- **告知**：`apiVersion` と `/changelog.md`（未実装。コードから配信し ETag を付ける予定）。廃止を段階的に進めるときに限り、該当するレスポンスに `Deprecation` / `Sunset` ヘッダー（RFC 9745 / 8594）をベストエフォートで付ける（0.x では付かないまま壊すこともある）。
+- **告知**：`apiVersion` と `/changelog.md`（`src/lib/changelog.ts`。先頭の版が `API_VERSION` と一致することをテストで確かめる）。廃止を段階的に進めるときに限り、該当するレスポンスに `Deprecation` / `Sunset` ヘッダー（RFC 9745 / 8594）をベストエフォートで付ける（0.x では付かないまま壊すこともある）。ルート全体なら `deprecated(info)` ミドルウェア、フィールドなど使ったときだけなら `markDeprecated(c, info)`（`src/lib/deprecation.ts`）。CORS の `exposeHeaders` に入れてある。
+- **ルールを変えるとき**は `rulesVersion` を上げる。進行中の試合は古い state のまま新しいエンジンで続くので、デプロイは進行中の試合が無いときに行う（今は止める仕組みは無い）。
 
 ## 無料枠の制約（設計時に必ず守る）
 
@@ -192,7 +197,7 @@ export interface GameDefinition<S, A> {
 5. 終了時に D1 へ結果を書き込む
 
 SQLite テーブル（DO 内）：
-- `meta(key TEXT PRIMARY KEY, value TEXT)` … gameId、seed、players、status
+- `meta(key TEXT PRIMARY KEY, value TEXT)` … gameId、seed、rulesVersion、players、status
 - `actions(turn INTEGER, player TEXT, action TEXT, at INTEGER)`
 - `snapshot(id INTEGER PRIMARY KEY CHECK (id = 1), turn INTEGER, state TEXT)`
 
@@ -227,7 +232,7 @@ pnpm tsx bots/random-bot.ts --url http://localhost:8787 --quickmatch tictactoe
 - TypeScript strict。`any` は使わない（外部入力は zod で `unknown` から検証する）。
 - ゲームロジック（`src/games/`）は Cloudflare の API に依存させない。Node 単体でテストできる状態に保つ。
 - エラーは `GameError(code, message)` で投げ、ルーム側で `error` メッセージに変換する。
-- 新しいゲームを追加するときは、次の3つを必ず用意する：(1) `GameDefinition` の実装（`docs`・`viewSchema` を含む。view が全局面・全視点で `viewSchema` を満たすことは all-games テストで検証される）、(2) `registry.ts` への登録、(3) ランダム Bot で 100 試合が例外なく終わるテスト（練習相手どうしの 100 試合も all-games テストで自動的に走る。ランダムで決着しにくいゲームは `practiceAction` を定義する）。
+- 新しいゲームを追加するときは、次の3つを必ず用意する：(1) `GameDefinition` の実装（`rulesVersion: 1`・`docs`・`viewSchema` を含む。view が全局面・全視点で `viewSchema` を満たすことは all-games テストで検証される）、(2) `registry.ts` への登録、(3) ランダム Bot で 100 試合が例外なく終わるテスト（練習相手どうしの 100 試合も all-games テストで自動的に走る。ランダムで決着しにくいゲームは `practiceAction` を定義する）。
 - `docs` はゲームのディレクトリの `docs.ts` に置き、**英語**で書く（LLM が読む前提。翻訳は Bot 側に任せる）。特に `view` の各フィールドの意味と、視点による違いを省略しない。全ゲーム共通の遊び方（turn・legal・エラー）は `src/lib/rules.ts` の `COMMON` にあるので、各ゲームには書かない。
 - 読み手は主に LLM を想定しているが、**サイトに出る文言（ガイド・rules・docs・OpenAPI）には「LLM 向け」と書かない**。決定論的な Bot も使うため、誰が読んでも通じる書き方にする（コードのコメントには書いてよい）。
 - OpenAPI の `summary`・`description`・`.describe()` も**英語**で書く（ガイド・rules と同じく LLM が読む。テストで日本語が混ざっていないことを確かめている）。コードのコメントは日本語でよい。

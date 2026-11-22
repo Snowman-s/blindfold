@@ -30,7 +30,7 @@ export const errors = {
   401: errorResponse("Invalid token or API key (UNAUTHORIZED)"),
   403: errorResponse("Not allowed, or not available yet (NOT_HOST, NOT_YOUR_TURN, NOT_FINISHED, ROOM_RESERVED)"),
   404: errorResponse("Not found (ROOM_NOT_FOUND, NOT_FOUND)"),
-  409: errorResponse("Not possible in the current state (ALREADY_STARTED, ROOM_FULL, NOT_ENOUGH_PLAYERS, NOT_PLAYING, STALE_TURN)"),
+  409: errorResponse("Not possible in the current state (ALREADY_STARTED, ROOM_FULL, NOT_ENOUGH_PLAYERS, NOT_PLAYING, STALE_TURN, RULES_CHANGED)"),
   426: errorResponse("A WebSocket upgrade is required (UPGRADE_REQUIRED)"),
 } as const;
 
@@ -44,6 +44,11 @@ export const ResultSchema = z
 export const RoomStateSchema = z
   .object({
     game: z.string(),
+    rulesVersion: z
+      .number()
+      .int()
+      .nullable()
+      .describe("Rules version this game is played with (recorded at start). null while waiting"),
     status: z.enum(ROOM_STATUSES),
     turn: z.number().int().describe("Number of actions applied so far. Send this value with your action"),
     players: z.array(z.string()),

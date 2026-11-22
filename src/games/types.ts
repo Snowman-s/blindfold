@@ -33,6 +33,14 @@ export interface GameDocs {
 /** すべてのゲームが実装する。副作用なしの純粋関数にすること。 */
 export interface GameDefinition<S, A> {
   id: string;
+  /**
+   * ルールの版（1 から始める整数）。「シード + 行動ログで試合を再現できる」ことが崩れる変更をしたら必ず上げる：
+   * ルール・action の形・勝敗の決め方・init / apply / onTimeout / onResign の結果が変わる変更、
+   * rng を引く順番や回数が変わる変更（見た目のルールが同じでも、過去のログから別の試合が再現されてしまう）。
+   * docs の文言・view の形・practiceAction だけの変更では上げない。
+   * ルームは開始時の値を記録し、今の値と食い違う試合のリプレイは拒否する（RULES_CHANGED）。
+   */
+  rulesVersion: number;
   minPlayers: number;
   maxPlayers: number;
   actionSchema: z.ZodType<A>;

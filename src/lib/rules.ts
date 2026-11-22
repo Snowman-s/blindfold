@@ -29,6 +29,7 @@ export interface GameRules {
   id: string;
   version: string;
   apiVersion: string;
+  rulesVersion: number;
   minPlayers: number;
   maxPlayers: number;
   summary: string;
@@ -53,6 +54,7 @@ export function gameRules(game: AnyGame): Promise<GameRules> {
       const body = {
         id: game.id,
         apiVersion: API_VERSION,
+        rulesVersion: game.rulesVersion,
         minPlayers: game.minPlayers,
         maxPlayers: game.maxPlayers,
         summary: game.docs.summary,
@@ -78,7 +80,7 @@ export function rulesMarkdown(r: GameRules): string {
   const json = (v: unknown) => ["```json", compactJson(v), "```"].join("\n");
   const states = r.stateExamples.map((e) => `${e.title}:\n${json(e.message)}`).join("\n\n");
   return [
-    `# ${r.id} (${r.minPlayers === r.maxPlayers ? r.minPlayers : `${r.minPlayers}-${r.maxPlayers}`} players, version ${r.version}, API ${r.apiVersion})`,
+    `# ${r.id} (${r.minPlayers === r.maxPlayers ? r.minPlayers : `${r.minPlayers}-${r.maxPlayers}`} players, rulesVersion ${r.rulesVersion}, apiVersion ${r.apiVersion}, version ${r.version})`,
     "",
     r.summary,
     "",

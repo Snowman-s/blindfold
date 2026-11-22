@@ -20,6 +20,7 @@ const remove = (s: ElimState, out: string[]): ElimState => {
 
 export const elimination: GameDefinition<ElimState, { pass: true }> = {
   id: "test-elimination",
+  rulesVersion: 1,
   minPlayers: 2,
   maxPlayers: 3,
   actionSchema: z.object({ pass: z.literal(true) }),

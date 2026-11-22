@@ -36,6 +36,8 @@ const NOT_FOUND = fail(404, "ROOM_NOT_FOUND", "room not found");
 
 export interface RoomState {
   game: string;
+  /** 試合の開始時に記録したルールの版。waiting の間は null */
+  rulesVersion: number | null;
   status: RoomStatus;
   turn: number;
   players: string[];
@@ -60,6 +62,7 @@ export interface RematchInfo {
 
 export interface ReplayFrames {
   game: string;
+  rulesVersion: number;
   seed: Seed;
   players: string[];
   /** frames[i] は turn=i の観戦視点。action はそのターンに適用された行動（最初のフレームは null）。 */
@@ -111,6 +114,8 @@ type Committed =
 type RoomCore = {
   game: AnyGame;
   status: RoomStatus;
+  /** waiting の間は null */
+  rulesVersion: number | null;
   players: string[];
   snap: { turn: number; state: unknown } | null;
   currentPlayers: string[];
@@ -222,6 +227,11 @@ export class GameRoom extends DurableObject<Env> {
     return this.getMeta("seed")!;
   }
 
+  /** 試合の開始時に記録したルールの版（startGame で seed と一緒に書く）。 */
+  private rulesVersion(): number {
+    return Number(this.getMeta("rulesVersion")!);
+  }
+
   private status(): RoomStatus {
     return this.getMeta("status") as RoomStatus;
   }
@@ -261,12 +271,15 @@ export class GameRoom extends DurableObject<Env> {
     const status = this.status();
     const players = this.playerIds();
     if (status === "waiting") {
-      return { game, status, players, snap: null, currentPlayers: [], deadline: null, result: null, rematch: null };
+      return {
+        game, status, rulesVersion: null, players, snap: null, currentPlayers: [], deadline: null, result: null, rematch: null,
+      };
     }
     const snap = this.loadSnapshot();
     return {
       game,
       status,
+      rulesVersion: this.rulesVersion(),
       players,
       snap,
       currentPlayers: status === "playing" ? game.currentPlayers(snap.state) : [],
@@ -277,9 +290,10 @@ export class GameRoom extends DurableObject<Env> {
   }
 
   private stateFor(core: RoomCore, pid: string | null): RoomState {
-    const { game, status, players, snap, currentPlayers, deadline, result, rematch } = core;
+    const { game, status, rulesVersion, players, snap, currentPlayers, deadline, result, rematch } = core;
     const out: RoomState = {
       game: game.id,
+      rulesVersion,
       status,
       turn: snap?.turn ?? 0,
       players,
@@ -537,11 +551,12 @@ export class GameRoom extends DurableObject<Env> {
         ...(index ? [index] : []),
         this.env.DB
           .prepare(
-            "INSERT OR IGNORE INTO matches(id, game, seed, players, started_at, finished_at, reason) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO matches(id, game, rules_version, seed, players, started_at, finished_at, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
           )
           .bind(
             id,
             this.getMeta("gameId"),
+            this.rulesVersion(),
             this.seed(),
             JSON.stringify(players.map((p) => p.id)),
             Number(this.getMeta("startedAt")),
@@ -814,6 +829,8 @@ export class GameRoom extends DurableObject<Env> {
       });
       if (botIds.length) this.setMeta("bots", JSON.stringify(botIds));
       this.setMeta("seed", String(seed));
+      // init と同じトランザクションで記録する（この版のエンジンで始めた、という記録なので）
+      this.setMeta("rulesVersion", String(game.rulesVersion));
       this.setMeta("startedAt", String(Date.now()));
       this.saveSnapshot(0, game.init(this.playerIds(), seed));
       this.setMeta("status", "playing");
@@ -974,7 +991,7 @@ export class GameRoom extends DurableObject<Env> {
       console.error("failed to read action log", e);
       return fail(500, "INTERNAL", "internal error");
     }
-    return ok({ game: gameId, seed: this.seed(), players: this.playerIds(), actions });
+    return ok({ game: gameId, rulesVersion: this.rulesVersion(), seed: this.seed(), players: this.playerIds(), actions });
   }
 
   /** ログから再現した各ターンの観戦視点。終了後のみ。 */
@@ -982,9 +999,20 @@ export class GameRoom extends DurableObject<Env> {
     const log = await this.getLog();
     if (!log.ok) return log;
     const game = getGame(log.data.game)!;
+    // ルールが変わったエンジンで古いログを再生すると、別の試合が再現されたり例外になったりする。
+    // ログ自体（/log）は正しい記録なので返し続け、再現だけを断る。
+    if (log.data.rulesVersion !== game.rulesVersion) {
+      return fail(
+        409,
+        "RULES_CHANGED",
+        `this game was played with rules version ${log.data.rulesVersion}, but the server now runs version ${game.rulesVersion}; ` +
+          "the log is still available from /rooms/{id}/log",
+      );
+    }
     const { frames, result } = replayFrames(game, log.data);
     return ok({
       game: game.id,
+      rulesVersion: log.data.rulesVersion,
       seed: log.data.seed,
       players: log.data.players,
       frames: frames.map((f, i) => ({

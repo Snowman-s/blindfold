@@ -130,7 +130,7 @@ export function gameExamples(game: AnyGame): GameExamples {
     spectator,
     states,
     end,
-    log: { game: game.id, seed, players, actions },
+    log: { game: game.id, rulesVersion: game.rulesVersion, seed, players, actions },
   };
   cache.set(game.id, out);
   return out;

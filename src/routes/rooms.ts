@@ -58,6 +58,7 @@ const ApiKeyHeader = z.object({ "x-api-key": z.string().optional() });
 const GameInfo = z
   .object({
     id: z.string(),
+    rulesVersion: z.number().int().describe("Version of the game's rules (an integer, bumped whenever a change could make an old log replay differently)"),
     minPlayers: z.number().int(),
     maxPlayers: z.number().int(),
     summary: z.string(),
@@ -78,6 +79,7 @@ routes.openapi(
     c.json(
       Object.values(games).map((g) => ({
         id: g.id,
+        rulesVersion: g.rulesVersion,
         minPlayers: g.minPlayers,
         maxPlayers: g.maxPlayers,
         summary: g.docs.summary,
@@ -98,6 +100,7 @@ const GameRulesSchema = z
       .string()
       .describe("Hash of the content (also sent as ETag). Changes on any edit, even a typo fix; it is a cache key, not a compatibility signal"),
     apiVersion: z.string().describe("API version (semver), the same as in the guide and the OpenAPI spec"),
+    rulesVersion: z.number().int().describe("Version of the game's rules (an integer, bumped whenever a change could make an old log replay differently)"),
     minPlayers: z.number().int(),
     maxPlayers: z.number().int(),
     summary: z.string(),
@@ -565,6 +568,10 @@ export const LogEntrySchema = z
 export const LogSchema = z
   .object({
     game: z.string(),
+    rulesVersion: z
+      .number()
+      .int()
+      .describe("Rules version the game was played with. If it differs from rulesVersion in /games/{id}/rules, the current engine may not reproduce this log"),
     seed: z.string().describe("Initial seed (128 bits, 32 hex characters)"),
     players: z.array(z.string()),
     actions: z.array(LogEntrySchema).describe("Every entry in turn order; actions[i].turn === i"),
@@ -574,6 +581,7 @@ export const LogSchema = z
 export const ReplaySchema = z
   .object({
     game: z.string(),
+    rulesVersion: z.number().int().describe("Rules version the game was played with (always equal to the current one; otherwise the replay is refused)"),
     seed: z.string(),
     players: z.array(z.string()),
     frames: z
@@ -616,6 +624,9 @@ routes.openapi(
     tags: ["rooms"],
     operationId: "getReplay",
     summary: "Spectator view for every turn, reproduced from the log",
+    description:
+      "Available only after the game has ended. Fails with `RULES_CHANGED` (409) if the game's rules have changed since it was played " +
+      "(its `rulesVersion` differs from the current one); `/rooms/{id}/log` still returns the log.",
     request: { params: RoomIdParam },
     responses: {
       200: {
@@ -626,6 +637,7 @@ routes.openapi(
       },
       403: errors[403],
       404: errors[404],
+      409: errors[409],
     },
   }),
   async (c) => respond(c, await room(c).getReplay()),

@@ -65,11 +65,15 @@ describe.each(Object.keys(games))("%s", (gameId) => {
   it("初期シード + 行動ログだけで完全に再現できる（JSON 往復を経ても）", () => {
     for (let seed = 0; seed < 100; seed++) {
       const { state, actions } = playRandom(gameId, String(seed));
-      const log = JSON.parse(JSON.stringify({ game: gameId, seed: String(seed), players: PLAYERS, actions }));
+      const log = JSON.parse(JSON.stringify({ game: gameId, rulesVersion: game.rulesVersion, seed: String(seed), players: PLAYERS, actions }));
       const r = replay(game, log);
       expect(r.state).toEqual(state);
       expect(r.result).toEqual(game.result(state));
     }
+  });
+
+  it("rulesVersion は 1 以上の整数", () => {
+    expect(Number.isInteger(game.rulesVersion) && game.rulesVersion >= 1).toBe(true);
   });
 
   it("説明（docs）が揃っていて、行動の例は actionSchema を満たす", async () => {
@@ -242,7 +246,7 @@ describe("投了（applyResign / replay）", () => {
     expect(mid.forfeit).toBeNull();
     expect(elimination.result(mid.state as ElimState)).toBeNull();
 
-    const r = replay(elimination as AnyGame, { game: elimination.id, seed: "s", players, actions });
+    const r = replay(elimination as AnyGame, { game: elimination.id, rulesVersion: 1, seed: "s", players, actions });
     expect(r.turn).toBe(3);
     expect(r.result).toEqual({ winners: ["p3"] });
   });

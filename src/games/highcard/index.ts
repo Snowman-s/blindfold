@@ -52,6 +52,7 @@ const viewSchema = z.strictObject({
 
 export const highcard: GameDefinition<HighCardState, HighCardAction> = {
   id: "highcard",
+  rulesVersion: 1,
   minPlayers: 2,
   maxPlayers: 2,
   actionSchema,

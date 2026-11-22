@@ -7,6 +7,7 @@ import { gameExamples } from "../../src/lib/examples";
 type S = { players: string[]; turn: number };
 const threePlayer: GameDefinition<S, { pass: true }> = {
   id: "test-three",
+  rulesVersion: 1,
   minPlayers: 3,
   maxPlayers: 3,
   actionSchema: z.object({ pass: z.literal(true) }),

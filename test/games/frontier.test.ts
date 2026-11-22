@@ -294,7 +294,7 @@ describe("frontier: 霧", () => {
 
 describe.each([3, 4])("frontier: %i 人", (n) => {
   const players = seats(n);
-  const vg = g as AnyGame;
+  const vg: AnyGame = g;
 
   it("練習相手どうし（時間切れ・投了を混ぜて）100 試合が止まらずに終わり、ログから再現でき、全視点で viewSchema を満たす", () => {
     for (let seed = 0; seed < 100; seed++) {

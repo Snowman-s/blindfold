@@ -12,7 +12,7 @@ export type { AnyGame } from "./types";
 export const games: Record<string, AnyGame> = {
   [tictactoe.id]: tictactoe,
   [highcard.id]: highcard,
-  [frontier.id]: frontier as AnyGame,
+  [frontier.id]: frontier,
 };
 
 /**

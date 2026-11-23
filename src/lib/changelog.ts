@@ -27,8 +27,8 @@ export const CHANGELOG: ChangelogEntry[] = [
     ],
     added: [
       "`last` in the room state (REST and WebSocket `state`): the event that produced this state, the last action-log entry " +
-        "without its action (`{ turn, player, at, timeout?, resign? }`; null before the first action). Animate a `state` only " +
-        "when `last.turn` changes, and draw the first `state` of a connection without animation (guide section 1.5).",
+        "without its action (`{ turn, player, at, timeout?, resign? }`; null before the first action). If you animate events (optional), " +
+        "animate a `state` only when `last.turn` changes, and draw the first `state` of a connection without animation (guide section 1.5).",
       "`endReason` in the room state: why the game ended (`normal`, `timeout`, `resign`, the same as `reason` in `end`); null " +
         "unless finished. `GET /rooms/{id}/state` now shows it too.",
       "`tictactoe` view: `lastCell` (the cell of the latest mark) and `winLine` (the three winning cells).",

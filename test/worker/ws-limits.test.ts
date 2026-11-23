@@ -34,7 +34,7 @@ async function conn(roomId: string, token?: string) {
 }
 
 /** 受信を待つ（DO の処理は非同期なので、条件を満たすまで少し待つ）。 */
-async function until(pred: () => boolean, ms = 2000) {
+async function until(pred: () => boolean, ms = 10_000) {
   const end = Date.now() + ms;
   while (!pred()) {
     if (Date.now() > end) throw new Error("timed out");

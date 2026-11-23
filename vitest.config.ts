@@ -17,7 +17,14 @@ export default defineConfig({
             },
           })),
         ],
-        test: { name: "worker", include: ["test/worker/**/*.test.ts"], setupFiles: ["./test/worker/setup.ts"] },
+        test: {
+          name: "worker",
+          include: ["test/worker/**/*.test.ts"],
+          setupFiles: ["./test/worker/setup.ts"],
+          // games プロジェクトの重い検査（全ゲーム × 100 試合 × 全視点）と並んで走ると、WS を多く張るテストが
+          // 既定の 5 秒を超えることがある（単独なら 1 秒未満）。本当に止まったテストはこれでも落ちる
+          testTimeout: 20_000,
+        },
       },
     ],
   },

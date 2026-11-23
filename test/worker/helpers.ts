@@ -38,17 +38,17 @@ export async function playOut(roomId: string, host: string, a: { token: string }
   }
 }
 
-/** WS で接続する（token が無ければ観戦）。closed は閉じられたときの close コード（2 秒で閉じられなければ失敗）。 */
+/** WS で接続する（token が無ければ観戦）。closed は閉じられたときの close コード（10 秒で閉じられなければ失敗）。 */
 export async function connect(roomId: string, token?: string) {
   const protocols = token ? `${WS_PROTOCOL}, ${WS_TOKEN_PROTOCOL_PREFIX}${token}` : WS_PROTOCOL;
   const res = await SELF.fetch(`${BASE}/rooms/${roomId}/ws`, {
     headers: { Upgrade: "websocket", "Sec-WebSocket-Protocol": protocols },
   });
   const ws = res.webSocket!;
-  // 閉じられないまま待ち続けるとスイート全体が止まるので、2 秒で失敗にする
+  // 閉じられないまま待ち続けるとスイート全体が止まるので、10 秒で失敗にする（スイート全体を並列で回すと遅くなるので余裕を持たせる）
   const closed = Promise.race([
     new Promise<number>((resolve) => ws.addEventListener("close", (e) => resolve(e.code))),
-    new Promise<number>((_, reject) => setTimeout(() => reject(new Error("socket was not closed")), 2000)),
+    new Promise<number>((_, reject) => setTimeout(() => reject(new Error("socket was not closed")), 10_000)),
   ]);
   closed.catch(() => {});
   ws.accept();

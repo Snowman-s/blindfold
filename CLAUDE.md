@@ -172,7 +172,7 @@ Client → server:
 
 Server → client:
 ```json
-{ "type": "state", "game": "tictactoe", "rulesVersion": 1, "gameOptions": null, "status": "playing", "turn": 13, "players": ["p1", "p2"], "currentPlayers": ["p1"], "view": { ... }, "legal": [ ... ], "deadline": 1732190000000, "phaseTurn": 13, "now": 1732189710000, "result": null }
+{ "type": "state", "game": "tictactoe", "rulesVersion": 1, "gameOptions": null, "status": "playing", "turn": 13, "players": ["p1", "p2"], "currentPlayers": ["p1"], "view": { ... }, "legal": [ ... ], "deadline": 1732190000000, "phaseTurn": 13, "now": 1732189710000, "result": null, "endReason": null, "last": { "turn": 12, "player": "p2", "at": 1732189709000 } }
 { "type": "error", "code": "ILLEGAL_ACTION" | "NOT_YOUR_TURN" | "STALE_TURN" | "NOT_PLAYING" | "UNAUTHORIZED" | "BAD_REQUEST" | ..., "message": "..." }
 { "type": "end", "winners": ["p1"], "scores": { ... }, "reason": "normal" | "timeout" | "resign" }
 ```
@@ -182,6 +182,8 @@ Server → client:
 - `state` is the same object as REST `GET /rooms/:id/state` plus `type` (`RoomState` is the single definition, in `src/lib/protocol.ts`).
 - `error` `code`s are the same codes as REST, unchanged (no remapping).
 - `legal` is included only when the receiving player can act now and the game defines `legalActions`. Clients are told to decide whose turn it is from `currentPlayers`.
+- `last` is the event that produced the state: the last row of the action log without `action` (`{ turn, player, at, timeout?, resign? }`, the same shape as `/log` entries; `RoomStore.lastEvent()`). `null` before the first action. What the move was is the game's `view`'s job (e.g. tictactoe `lastCell` / `winLine`, frontier `lastBattles`), so hidden information stays inside `view`. Animation is optional for clients; the guide tells those that animate to draw the first state of a connection without animation and animate later ones when `last.turn` changes (broadcasts reach every connection in order, so gaps only happen across reconnects).
+- `endReason` is the same value as `end`'s `reason` (`null` unless finished), so `GET /state` shows it too.
 - `now` is the server time when the message was built (epoch ms). Clients compute remaining time as `deadline - now` (guards against client clock skew).
 - Resigns and timeouts advance one turn as server-written log rows (`player = ""`, `action = {"$resign":"p1"}` / `{"$timeout":[...]}`). By default (`onTimeout` / `onResign` undefined) the state is unchanged and the outcome is meta's `forfeit`. Only when that ends the match is the reason kept in `endReason` (D1 `matches.reason`).
 

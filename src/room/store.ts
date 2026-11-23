@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { GameResult } from "../games/types";
 import { roomOptions, type RoomOptions } from "../lib/options";
-import type { EndReason, RematchInfo, RoomStatus } from "../lib/protocol";
+import type { EndReason, LastEvent, RematchInfo, RoomStatus } from "../lib/protocol";
 import type { LogEntry } from "../lib/replay";
 import type { Seed } from "../lib/rng";
 import type { Settlement, Snapshot } from "./logic";
@@ -396,16 +396,31 @@ export class RoomStore {
     return this.sql
       .exec("SELECT turn, player, action, at FROM actions ORDER BY turn")
       .toArray()
-      .map((r) => {
-        const action = JSON.parse(r.action as string) as unknown;
-        const at = r.at as number;
-        if (r.player === SYSTEM_PLAYER) {
-          const base = { turn: r.turn as number, player: null, action: null, at };
-          const ev = systemEvent.safeParse(action);
-          if (!ev.success) throw new Error(`corrupt system log row at turn ${base.turn}`);
-          return "$resign" in ev.data ? { ...base, resign: ev.data.$resign } : { ...base, timeout: ev.data.$timeout };
-        }
-        return { turn: r.turn as number, player: r.player as string, action, at };
-      });
+      .map(decodeRow);
   }
+
+  /**
+   * 最後の行（この状態を作った出来事）から action を除いたもの。行が無ければ null。
+   * 状態を作るたびに呼ぶので、索引の無い turn ではなく rowid で引く（行はターン順に追記するだけなので最大の rowid が最後のターン）。
+   */
+  lastEvent(): LastEvent | null {
+    const r = this.sql.exec("SELECT turn, player, action, at FROM actions ORDER BY rowid DESC LIMIT 1").toArray()[0];
+    if (!r) return null;
+    const { action: _, ...rest } = decodeRow(r);
+    return rest;
+  }
+}
+
+/** actions の1行を LogEntry に戻す（appendAction / appendSystem と対）。 */
+function decodeRow(r: Record<string, SqlStorageValue>): LogEntry {
+  const action = JSON.parse(r.action as string) as unknown;
+  const turn = r.turn as number;
+  const at = r.at as number;
+  if (r.player === SYSTEM_PLAYER) {
+    const base = { turn, player: null, action: null, at };
+    const ev = systemEvent.safeParse(action);
+    if (!ev.success) throw new Error(`corrupt system log row at turn ${turn}`);
+    return "$resign" in ev.data ? { ...base, resign: ev.data.$resign } : { ...base, timeout: ev.data.$timeout };
+  }
+  return { turn, player: r.player as string, action, at };
 }

@@ -57,7 +57,7 @@ export const docs: GameDocs = {
     "- `diceCounts`: player ID -> number of their dice in this round. A player who leaves mid-round keeps theirs here until the round ends; from the next round they have 0. `totalDice`: the sum, the largest quantity anyone may bid.",
     "- `bids`: the bids made this round, oldest first, each `{ player, quantity, face }`. `currentBid`: the last of them (the bid to beat or call), or `null` at the start of a round.",
     "- `minBids`: an array of 6 entries; `minBids[f - 1]` is the smallest quantity that may be bid on face `f` now, or `null` if no bid on face `f` is allowed. It is the same for everyone; only the player in `currentPlayers` may use it. All `null` after the game ends.",
-    "- `lastRound`: how the last round was settled, or `null` before the first call: `{ round, dice, bids, call, caller, count, loser, gainer }`.",
+    "- `lastRound`: how the last round was settled, or `null` before the first call: `{ round, dice, bids, call, caller, count, loser, gainer }`. It stays the same until the next call, so several `state` messages carry the same one; if you animate the reveal, do it when `lastRound.round` changes.",
     "  `dice` is player ID -> that player's dice in that round (ascending), for everyone who was in the round. `call` is `challenge` or `exact`. `count` is how many dice counted for the called bid's face (ones included when wild).",
     "  `loser` is who was wrong and lost a die (`null` when an exact call was right; if that player had already left, nobody lost one); `gainer` is the caller of a right exact call (`null` otherwise).",
     "- `myDice` (players only): your dice this round, ascending. Empty from the round after you are out.",

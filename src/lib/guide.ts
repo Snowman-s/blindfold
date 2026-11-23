@@ -300,6 +300,14 @@ type ServerMessage =
       phaseTurn: number | null;     // turn at which the current (simultaneous) turn began; equals turn otherwise; null when not playing (1.5)
       now: number;                  // server clock (epoch ms) when this message was built; time left = deadline - now
       result: { winners: string[]; scores?: Record<string, number> } | null; // set once finished (same as in "end")
+      endReason: "normal" | "timeout" | "resign" | null; // set once finished (same as reason in "end"); null otherwise
+      last: {                       // what produced this state (the last log entry without its action); null before the first action (1.5)
+        turn: number;               // the turn it was applied at; this state's turn is last.turn + 1
+        player: string | null;      // who acted; null for a timeout or resignation
+        at: number;                 // when it was applied (epoch ms, server clock)
+        timeout?: string[];         // only on a timeout: the players who ran out of time
+        resign?: string;            // only on a resignation: the player who resigned
+      } | null;
       rematch?: { roomId: string; requestedBy: string[] }; // only after the end, once someone asked for a rematch (1.9)
     }
   | { type: "error"; code: string; message: string } // the same codes as REST (1.6), e.g. "STALE_TURN"
@@ -495,6 +503,17 @@ function buildGuide(): string {
     "Your own seat is your `playerId` from `join`; compare it with `currentPlayers` and the IDs in `view`. In games that",
     "list legal moves, `legal` is present exactly when you may act, so checking for it works too.",
     "",
+    "**What just happened (optional).** Every `state` carries `last`, the event that produced it: who acted (`player`), or",
+    "who timed out (`timeout`) or resigned (`resign`). What the move was is up to the game's `view` (for example the last",
+    "cell played or the battles of the last round; see the game's rules), so only what you may see is shown. The server",
+    "sends every change to every connection in order, so within one connection you never miss a `state`. A client",
+    "that only plays can ignore all of this. If you want to show or animate each event:",
+    "- Treat the first `state` after connecting (or reconnecting) as the current position: draw it without animation.",
+    "  Its `last` may be long past (`now - last.at` tells how long).",
+    "- Animate only `state`s received after that on the same connection, and only when `last.turn` changes. The same",
+    "  `last` can arrive again (for example the extra `state` after a rematch request), and in games with rounds the",
+    "  round's events stay in `view` while several `state`s of the next round arrive; the game's rules say how to tell.",
+    "",
     "### 1.6 Errors",
     "",
     "WebSocket errors arrive as `{ \"type\": \"error\", code, message }` and do not close the connection.",
@@ -568,7 +587,8 @@ function buildGuide(): string {
     "",
     "Everyone receives `{ \"type\": \"end\", \"winners\": [...], \"scores\": {...}, \"reason\": \"...\" }` after the final",
     "`state` (`status: \"finished\"`). An empty `winners` means a draw. `reason` is `normal` (decided by the game's rules),",
-    "`timeout` or `resign`. You may close the socket (the server does not close it for you).",
+    "`timeout` or `resign`; the final `state` (and `GET /rooms/{id}/state` afterwards) has the same value in `endReason`.",
+    "You may close the socket (the server does not close it for you).",
     "",
     "**Rematch.** To play again with the same players, every player calls `POST /rooms/{roomId}/rematch` on the",
     "finished room with their own token. The first call creates a new room (same game and options); each call seats the",

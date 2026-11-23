@@ -3,7 +3,7 @@ import { defaultGameOptions } from "./options";
 import { practiceAction } from "./practice";
 import type { LogEntry, ReplayLog } from "./replay";
 import { createRng, rngForTurn } from "./rng";
-import type { ServerMessage } from "./protocol";
+import type { LastEvent, ServerMessage } from "./protocol";
 import { sameSimultaneousTurn } from "./turns";
 
 /**
@@ -52,6 +52,7 @@ function stateMessage(
   turn: number,
   pid: string | null,
   status: "playing" | "finished",
+  last: LogEntry | null,
   phaseTurn: number = turn,
 ): StateMessage {
   const current = status === "playing" ? game.currentPlayers(state) : [];
@@ -71,8 +72,13 @@ function stateMessage(
     phaseTurn: status === "playing" ? phaseTurn : null,
     now: EXAMPLE_NOW,
     result: game.result(state),
+    endReason: status === "finished" ? "normal" : null,
+    last: last && lastEvent(last),
   };
 }
+
+/** ログの行から action を除いたもの（RoomState.last）。 */
+const lastEvent = ({ action: _, ...rest }: LogEntry): LastEvent => rest;
 
 /** 例の最初の手。合法手を列挙するゲームはその先頭、しないゲームは練習相手の打ち方（固定シード）。 */
 function firstActionOf(game: AnyGame, s: unknown, pid: string, seed: string): unknown {
@@ -96,14 +102,15 @@ export function gameExamples(game: AnyGame): GameExamples {
   const first = game.currentPlayers(s0)[0]!;
   const firstAction = firstActionOf(game, s0, first, seed);
   const s1 = game.apply(s0, first, firstAction, rngForTurn(seed, 0));
+  const firstEntry: LogEntry = { turn: 0, player: first, action: firstAction, at: EXAMPLE_STARTED_AT };
   const actor = game.currentPlayers(s1)[0] ?? first;
   // 1手目で同時手番が続いていれば、今の手番は turn 0 に始まったまま（GameRoom の settle と同じ判定）
   const phase1 = sameSimultaneousTurn(game.currentPlayers(s0), EXAMPLE_DEADLINE, game.currentPlayers(s1)) ? 0 : 1;
-  const player = stateMessage(game, s1, 1, actor, "playing", phase1);
-  const spectator = stateMessage(game, s1, 1, null, "playing", phase1);
+  const player = stateMessage(game, s1, 1, actor, "playing", firstEntry, phase1);
+  const spectator = stateMessage(game, s1, 1, null, "playing", firstEntry, phase1);
 
   const states: ExampleState[] = [
-    { title: `Start of the game (turn 0), as **${first}** (may act now)`, message: stateMessage(game, s0, 0, first, "playing") },
+    { title: `Start of the game (turn 0), as **${first}** (may act now)`, message: stateMessage(game, s0, 0, first, "playing", null) },
     {
       title: `After ${first} played \`${JSON.stringify(firstAction)}\` (turn 1), as **${actor}** (may act now)`,
       message: player,
@@ -111,7 +118,7 @@ export function gameExamples(game: AnyGame): GameExamples {
   ];
   // 今打った人の視点が観戦視点と違う（同時手番で伏せた札が見えるなど）ときだけ載せる
   if (actor !== first) {
-    const mover = stateMessage(game, s1, 1, first, "playing", phase1);
+    const mover = stateMessage(game, s1, 1, first, "playing", firstEntry, phase1);
     if (JSON.stringify(mover.view) !== JSON.stringify(spectator.view) || mover.legal) {
       states.push({ title: `The same moment as **${first}**, who has just acted`, message: mover });
     }
@@ -119,7 +126,7 @@ export function gameExamples(game: AnyGame): GameExamples {
   states.push({ title: "The same moment as a **spectator** (no token)", message: spectator });
 
   // 決着まで進める
-  const actions: LogEntry[] = [{ turn: 0, player: first, action: firstAction, at: EXAMPLE_STARTED_AT }];
+  const actions: LogEntry[] = [firstEntry];
   const rng = createRng(`${seed}:practice`);
   let s = s1;
   let turn = 1;
@@ -134,7 +141,7 @@ export function gameExamples(game: AnyGame): GameExamples {
   const result = game.result(s)!;
   states.push({
     title: `After the last action (turn ${turn}), as **${first}**. \`status\` is \`finished\`; an \`end\` message follows`,
-    message: stateMessage(game, s, turn, first, "finished"),
+    message: stateMessage(game, s, turn, first, "finished", actions.at(-1)!),
   });
   const end: EndMessage = {
     type: "end",

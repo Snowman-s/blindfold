@@ -41,6 +41,16 @@ describe("tictactoe", () => {
     expect(g.result(s)?.winners).toEqual(["b"]);
   });
 
+  it("view の lastCell と winLine", () => {
+    const v = (cells: number[]) => g.view(play(cells), null) as { lastCell: number | null; winLine: number[] | null };
+    expect(v([])).toMatchObject({ lastCell: null, winLine: null });
+    expect(v([4, 0])).toMatchObject({ lastCell: 0, winLine: null });
+    expect(v([0, 3, 1, 4, 2])).toMatchObject({ lastCell: 2, winLine: [0, 1, 2] });
+    // この版より前のスナップショット（lastCell が無い）も読める
+    const { lastCell: _, ...old } = play([4]);
+    expect(g.view(old, null)).toMatchObject({ lastCell: null });
+  });
+
   it("引き分け", () => {
     const s = play([0, 1, 2, 4, 3, 5, 7, 6, 8]);
     expect(g.result(s)).toEqual({ winners: [], scores: { a: 0.5, b: 0.5 } });

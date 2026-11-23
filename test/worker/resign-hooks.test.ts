@@ -5,7 +5,7 @@ import { games } from "../../src/games/registry";
 import type { AnyGame } from "../../src/games/types";
 import { WS_PROTOCOL } from "../../src/lib/auth";
 import { elimination } from "../fixtures/elimination";
-import { BASE, call, playOut } from "./helpers";
+import { BASE, call, newRoom, playOut } from "./helpers";
 
 // onResign / onTimeout を持つテスト専用のゲームを、このファイルの間だけ登録する
 beforeAll(() => {
@@ -56,14 +56,18 @@ describe("onResign を定義したゲーム", () => {
     expect(r1.status).toBe(200);
     expect(r1.json).toMatchObject({ status: "playing", turn: 1, currentPlayers: ["p1"], view: { alive: ["p1", "p3"] } });
     expect(r1.json.deadline).toBeGreaterThan(Date.now());
+    expect(r1.json.last).toEqual({ turn: 0, player: null, at: expect.any(Number), resign: "p2" });
+    expect(r1.json.endReason).toBeNull();
 
     const again = await call("POST", `/rooms/${roomId}/resign`, { token: p2!.token });
     expect(again.status).toBe(400);
     expect(again.json.error.code).toBe("ILLEGAL_ACTION");
 
-    await call("POST", `/rooms/${roomId}/action`, { token: p1!.token, body: { turn: 1, action: { pass: true } } });
+    const a1 = await call("POST", `/rooms/${roomId}/action`, { token: p1!.token, body: { turn: 1, action: { pass: true } } });
+    expect(a1.json.last).toEqual({ turn: 1, player: "p1", at: expect.any(Number) });
     const r2 = await call("POST", `/rooms/${roomId}/resign`, { token: p1!.token });
-    expect(r2.json).toMatchObject({ status: "finished", turn: 3, result: { winners: ["p3"] } });
+    expect(r2.json).toMatchObject({ status: "finished", turn: 3, result: { winners: ["p3"] }, endReason: "resign" });
+    expect(r2.json.last).toMatchObject({ turn: 2, player: null, resign: "p1" });
 
     expect(await endMessage(roomId)).toMatchObject({ winners: ["p3"], reason: "resign" });
     expect(await reasonInD1(roomId)).toBe("resign");
@@ -79,9 +83,28 @@ describe("onResign を定義したゲーム", () => {
     });
     expect(await runDurableObjectAlarm(stub(roomId))).toBe(true);
     const s = (await call("GET", `/rooms/${roomId}/state`)).json;
-    expect(s).toMatchObject({ status: "finished", result: { winners: ["p2"] } });
+    expect(s).toMatchObject({ status: "finished", result: { winners: ["p2"] }, endReason: "timeout" });
+    expect(s.last).toMatchObject({ turn: 0, player: null, timeout: ["p1"] });
     expect(await endMessage(roomId)).toMatchObject({ reason: "timeout" });
     expect(await reasonInD1(roomId)).toBe("timeout");
+  });
+});
+
+describe("state の last と endReason", () => {
+  it("待機中・開始直後は null、手を打てばその行、通常の決着は endReason=normal", async () => {
+    const { roomId, host, a } = await newRoom("tictactoe");
+    expect((await call("GET", `/rooms/${roomId}/state`)).json).toMatchObject({ last: null, endReason: null });
+    const started = await call("POST", `/rooms/${roomId}/start`, { token: host });
+    expect(started.json).toMatchObject({ status: "playing", last: null, endReason: null });
+    const moved = await call("POST", `/rooms/${roomId}/action`, { token: a.token, body: { turn: 0, action: { cell: 4 } } });
+    expect(moved.json.last).toEqual({ turn: 0, player: "p1", at: expect.any(Number) });
+    expect(moved.json.view).toMatchObject({ lastCell: 4, winLine: null });
+
+    const r2 = await newRoom("tictactoe");
+    await playOut(r2.roomId, r2.host, r2.a, r2.b);
+    const end = (await call("GET", `/rooms/${r2.roomId}/state`)).json;
+    expect(end).toMatchObject({ status: "finished", endReason: "normal", last: { turn: 4, player: "p1" } });
+    expect(end.view).toMatchObject({ lastCell: 2, winLine: [0, 1, 2] });
   });
 });
 

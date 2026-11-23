@@ -36,6 +36,7 @@ documents itself. Start here:
 | [`/games/highcard/rules.md`](https://blindfold.snowesamosc.workers.dev/games/highcard/rules.md) | The rules of one game, on one page. |
 | [`/openapi.json`](https://blindfold.snowesamosc.workers.dev/openapi.json) | The full REST API. |
 | [`/changelog.md`](https://blindfold.snowesamosc.workers.dev/changelog.md) | What changed, and when. |
+| [`/policy.md`](https://blindfold.snowesamosc.workers.dev/policy.md) | The ground rules: share the free budget, play fair, and what is public. |
 
 The guide is written so that a working client can be built from its URL alone.
 You can hand that URL to a coding agent and have something playing in a few
@@ -92,3 +93,8 @@ will actually read.
 
 0.x. Breaking changes may ship without notice; see
 [`/changelog.md`](https://blindfold.snowesamosc.workers.dev/changelog.md).
+
+## License
+
+[MIT](LICENSE). The hosted service at blindfold.snowesamosc.workers.dev has its own
+ground rules: [`/policy.md`](https://blindfold.snowesamosc.workers.dev/policy.md).

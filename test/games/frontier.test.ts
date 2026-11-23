@@ -34,6 +34,7 @@ function board(over: Partial<FrontierState> = {}): FrontierState {
     orders: { p1: null, p2: null },
     missed: { p1: 0, p2: 0 },
     lastMoves: [],
+    lastBattles: [],
     ...over,
   };
 }
@@ -108,9 +109,32 @@ describe("frontier: 解決", () => {
     expect(s.nodes[2]).toEqual({ production: 1, owner: "p1", troops: 1 + 1 }); // 3 対 4 → p1 が 1 残し、産出 +1
     expect(s.nodes[0]).toEqual({ production: 1, owner: "p1", troops: 1 + 1 });
     expect(s.lastMoves).toEqual([
-      { player: "p1", from: 0, to: 2, count: 6 },
-      { player: "p2", from: 2, to: 0, count: 2 },
+      { player: "p1", from: 0, to: 2, count: 6, toOwner: "p2" },
+      { player: "p2", from: 2, to: 0, count: 2, toOwner: "p1" },
     ]);
+    // 衝突 → ノードでの戦闘の順。p2 の2人は衝突で消えたので、ノード 0 は戦闘にならない
+    expect(s.lastBattles).toEqual([
+      {
+        type: "clash",
+        groups: [
+          { player: "p1", from: 0, to: 2, count: 6 },
+          { player: "p2", from: 2, to: 0, count: 2 },
+        ],
+        lost: 2,
+      },
+      { type: "battle", node: 2, owner: "p2", sides: [{ player: "p1", troops: 4 }, { player: "p2", troops: 3 }], winner: "p1", troops: 1 },
+    ]);
+    // view の lastMoves には toOwner を出さない
+    expect((g.view(s, null) as { lastMoves: unknown[] }).lastMoves[0]).toEqual({ player: "p1", from: 0, to: 2, count: 6 });
+  });
+
+  it("lastBattles：中立との戦闘・同数の全滅を記録し、自分のノードへの援軍だけなら記録しない", () => {
+    // 0（p1, 7）→ 1（中立 2）に 2：同数で全滅。2（p2）→ 3（p2）は援軍
+    const s = both(board({ edges: [[0, 1], [1, 2], [1, 3], [2, 3]] }), [{ from: 0, to: 1, count: 2 }], [{ from: 2, to: 3, count: 5 }]);
+    expect(s.lastBattles).toEqual([
+      { type: "battle", node: 1, owner: null, sides: [{ player: null, troops: 2 }, { player: "p1", troops: 2 }], winner: null, troops: 0 },
+    ]);
+    expect(s.nodes[1]).toEqual({ production: 2, owner: null, troops: 0 });
   });
 
   it("命令を出す順番に結果が依存しない", () => {
@@ -297,6 +321,37 @@ describe("frontier: 霧", () => {
     const end = both({ ...fogged, maxRounds: 1 }, [], []);
     expect(troops(g.view(end, null))).toEqual([8, 2, 6, 1]);
   });
+  it("霧でも、自分が関わった移動と戦闘は、ノードを失って脱落しても見える", () => {
+    // 0（p1, 1）- 1（p2, 9）- 2（p2）、1 - 3（p3）。p2 が 1 → 0 に 9 送り、p1 の唯一のノードを奪う
+    const s3 = board({
+      fog: true,
+      players: ["p1", "p2", "p3"],
+      alive: ["p1", "p2", "p3"],
+      nodes: [
+        { production: 1, owner: "p1", troops: 1 },
+        { production: 1, owner: "p2", troops: 9 },
+        { production: 1, owner: "p2", troops: 0 },
+        { production: 1, owner: "p3", troops: 0 },
+      ],
+      orders: { p1: null, p2: null, p3: null },
+      missed: { p1: 0, p2: 0, p3: 0 },
+    });
+    const t = act(act(act(s3, "p1", []), "p2", [{ from: 1, to: 0, count: 9 }]), "p3", []);
+    expect(t.out).toEqual({ p1: "eliminated" });
+    expect(isOver(t)).toBe(false);
+    const v1 = g.view(t, "p1") as { nodes: { troops: number | null }[]; lastMoves: unknown[]; lastBattles: unknown[] };
+    expect(v1.nodes.every((n) => n.troops === null)).toBe(true); // 抜けた人には兵数は見えない
+    expect(v1.lastMoves).toEqual([{ player: "p2", from: 1, to: 0, count: 9 }]);
+    expect(v1.lastBattles).toEqual([
+      { type: "battle", node: 0, owner: "p1", sides: [{ player: "p2", troops: 9 }, { player: "p1", troops: 1 }], winner: "p2", troops: 8 },
+    ]);
+    // p3 に見えるのは 3 と隣の 1 だけ：1 から出た移動は見えるが、0 での戦闘は見えない
+    const v3 = g.view(t, "p3") as { lastMoves: unknown[]; lastBattles: unknown[] };
+    expect(v3.lastMoves).toHaveLength(1);
+    expect(v3.lastBattles).toEqual([]);
+    expect((g.view(t, null) as { lastBattles: unknown[] }).lastBattles).toEqual([]);
+  });
+
   it("見えない移動は lastMoves に出ず、相手の今ラウンドの命令は誰にも見えない", () => {
     const s0 = board({
       fog: true,
@@ -306,6 +361,7 @@ describe("frontier: 霧", () => {
     const s = both(s0, [], [{ from: 4, to: 3, count: 3 }]);
     expect((g.view(s, "p1") as { lastMoves: unknown[] }).lastMoves).toEqual([]);
     expect((g.view(s, "p2") as { lastMoves: unknown[] }).lastMoves).toHaveLength(1);
+    expect((g.view(s, "p1") as { lastBattles: unknown[] }).lastBattles).toEqual([]);
     const pending = act(board(), "p1", [{ from: 0, to: 1, count: 3 }]);
     for (const viewer of ["p2", null]) {
       const v = g.view(pending, viewer) as Record<string, unknown>;

@@ -1,7 +1,7 @@
 import { z } from "@hono/zod-openapi";
 import type { Context } from "hono";
 import { ROOM_ID_RE } from "../lib/auth";
-import { errBody, ROOM_STATUSES } from "../lib/protocol";
+import { END_REASONS, errBody, ROOM_STATUSES } from "../lib/protocol";
 
 export { errBody };
 
@@ -56,6 +56,27 @@ export const ResultSchema = z
   })
   .openapi("GameResult");
 
+export const LogEntrySchema = z
+  .object({
+    turn: z.number().int().describe("The turn this entry was applied at (0, 1, 2, ...). Applying it produced turn + 1"),
+    player: z.string().nullable().describe("Who acted. null for a timeout or resignation entry (written by the server)"),
+    action: z.unknown().describe("The action as sent (an element of legal). null for a timeout or resignation entry"),
+    at: z.number().describe("When it was applied (epoch ms, server clock)"),
+    timeout: z.array(z.string()).optional().describe("Present only on a timeout entry: the players who ran out of time"),
+    resign: z.string().optional().describe("Present only on a resignation entry: the player who resigned"),
+  })
+  .openapi("LogEntry");
+
+export const LastEventSchema = LogEntrySchema.omit({ action: true })
+  .nullable()
+  .describe(
+    "What produced this state: the last entry of the action log, without the action. last.turn is the turn it was applied at, " +
+      "so this state's turn is last.turn + 1. player is who acted; on a timeout entry player is null and timeout lists who ran out " +
+      "of time; on a resignation entry player is null and resign is who resigned. What the move was is shown by the game's view, " +
+      "as far as you may see it. null until the first action. Within one connection, a state whose last.turn you have already seen " +
+      "is a repeat (for example a rematch request after the end), not a new event",
+  );
+
 export const RoomStateSchema = z
   .object({
     game: z.string(),
@@ -87,6 +108,11 @@ export const RoomStateSchema = z
       ),
     now: z.number().describe("Server clock (epoch ms) when this response was built. Time left = deadline - now (do not use the client's clock)"),
     result: ResultSchema.nullable(),
+    endReason: openEnum(
+      END_REASONS,
+      "Why the game ended (the same as reason in the end message). normal = decided by the game's rules; treat an unknown value as normal. null unless finished.",
+    ).nullable(),
+    last: LastEventSchema,
     rematch: z
       .object({
         roomId: z.string().describe("The new room. Call POST /rooms/{id}/rematch on this (finished) room to take your seat there"),

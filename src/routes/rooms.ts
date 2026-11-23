@@ -35,6 +35,7 @@ import {
   ResultSchema,
   RoomIdParam,
   RoomStateSchema,
+  LogEntrySchema,
   validationHook,
 } from "./schemas";
 
@@ -654,16 +655,8 @@ routes.openapi(
   async (c) => respond(c, await room(c).rematch(extractToken(c.req.raw))),
 );
 
-export const LogEntrySchema = z
-  .object({
-    turn: z.number().int().describe("The turn this entry was applied at (0, 1, 2, ...). Applying it produced turn + 1"),
-    player: z.string().nullable().describe("Who acted. null for a timeout or resignation entry (written by the server)"),
-    action: z.unknown().describe("The action as sent (an element of legal). null for a timeout or resignation entry"),
-    at: z.number().describe("When it was applied (epoch ms, server clock)"),
-    timeout: z.array(z.string()).optional().describe("Present only on a timeout entry: the players who ran out of time"),
-    resign: z.string().optional().describe("Present only on a resignation entry: the player who resigned"),
-  })
-  .openapi("LogEntry");
+
+export { LogEntrySchema };
 
 export const LogSchema = z
   .object({

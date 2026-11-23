@@ -20,6 +20,24 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.11.0",
+    date: "2026-11-23",
+    breaking: [
+      "`frontier` rules version 2 (the state now records the round's battles). Rooms created with version 1 answer 410 `GAME_REMOVED`.",
+    ],
+    added: [
+      "`last` in the room state (REST and WebSocket `state`): the event that produced this state, the last action-log entry " +
+        "without its action (`{ turn, player, at, timeout?, resign? }`; null before the first action). Animate a `state` only " +
+        "when `last.turn` changes, and draw the first `state` of a connection without animation (guide section 1.5).",
+      "`endReason` in the room state: why the game ended (`normal`, `timeout`, `resign`, the same as `reason` in `end`); null " +
+        "unless finished. `GET /rooms/{id}/state` now shows it too.",
+      "`tictactoe` view: `lastCell` (the cell of the latest mark) and `winLine` (the three winning cells).",
+      "`frontier` view: `lastBattles`, the clashes on edges and battles at nodes of the previous round in the order they were " +
+        "resolved. With fog on, `lastMoves` and `lastBattles` now also include those you took part in even if you no longer " +
+        "see the node (for example a node you lost, or the battle that eliminated you).",
+    ],
+  },
+  {
     version: "0.10.0",
     date: "2026-11-23",
     added: [

@@ -11,6 +11,8 @@ export interface TicTacToeState {
   turn: 0 | 1; // 次に打つ players のインデックス
   winner: string | null;
   draw: boolean;
+  /** 最後に置いたマス。この版より前に作ったスナップショットには無い（view では null として読む）。 */
+  lastCell?: number | null;
 }
 
 export type TicTacToeAction = { cell: number };
@@ -21,10 +23,11 @@ const LINES = [
   [0, 4, 8], [2, 4, 6],
 ] as const;
 
-function findWinnerMark(board: Cell[]): Mark | null {
+/** 揃った3マス（無ければ null）。 */
+function findWinLine(board: Cell[]): [number, number, number] | null {
   for (const [a, b, c] of LINES) {
     const m = board[a];
-    if (m && m === board[b] && m === board[c]) return m;
+    if (m && m === board[b] && m === board[c]) return [a, b, c];
   }
   return null;
 }
@@ -38,6 +41,11 @@ const viewSchema = z.strictObject({
     .length(9)
     .describe("Cells 0-8 in row-major order. null = empty"),
   next: z.string().nullable().describe("Player ID to move next, or null once the game is over"),
+  lastCell: z.number().int().min(0).max(8).nullable().describe("The cell the last mark was placed on, or null before the first move"),
+  winLine: z
+    .tuple([z.number().int(), z.number().int(), z.number().int()])
+    .nullable()
+    .describe("The three cells of the winning line, or null if nobody has three in a row"),
 });
 
 export const tictactoe: GameDefinition<TicTacToeState, TicTacToeAction> = {
@@ -60,6 +68,7 @@ export const tictactoe: GameDefinition<TicTacToeState, TicTacToeAction> = {
       turn: 0,
       winner: null,
       draw: false,
+      lastCell: null,
     };
   },
 
@@ -84,13 +93,14 @@ export const tictactoe: GameDefinition<TicTacToeState, TicTacToeAction> = {
     const mark: Mark = s.turn === 0 ? "X" : "O";
     const board = s.board.slice();
     board[a.cell] = mark;
-    const won = findWinnerMark(board) !== null;
+    const won = findWinLine(board) !== null;
     return {
       players: s.players,
       board,
       turn: s.turn === 0 ? 1 : 0,
       winner: won ? pid : null,
       draw: !won && board.every((c) => c !== null),
+      lastCell: a.cell,
     };
   },
 
@@ -100,6 +110,8 @@ export const tictactoe: GameDefinition<TicTacToeState, TicTacToeAction> = {
       players: s.players,
       board: s.board,
       next: s.winner !== null || s.draw ? null : s.players[s.turn],
+      lastCell: s.lastCell ?? null,
+      winLine: findWinLine(s.board),
     };
   },
 

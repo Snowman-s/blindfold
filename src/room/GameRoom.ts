@@ -242,7 +242,7 @@ export class GameRoom extends DurableObject<Env> {
     if (status === "waiting") {
       return {
         game, status, rulesVersion, gameOptions, players, snap: null, currentPlayers: [], deadline: null, phaseTurn: null, result: null,
-        rematch: null,
+        endReason: null, last: null, rematch: null,
       };
     }
     const snap = this.store.loadSnapshot();
@@ -259,6 +259,8 @@ export class GameRoom extends DurableObject<Env> {
       phaseTurn: status === "playing" ? (this.store.getMeta("phaseTurn") ?? snap.turn) : null,
       // 終了後は確定した結果（playing の間は決着していないので null）
       result: status === "finished" ? this.store.result() : null,
+      endReason: status === "finished" ? this.store.endReason() : null,
+      last: this.store.lastEvent(),
       rematch: status === "finished" ? this.store.rematchInfo() : null,
     };
   }

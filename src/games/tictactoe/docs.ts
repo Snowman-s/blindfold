@@ -23,6 +23,8 @@ export const docs: GameDocs = {
     "- `players`: `[X player, O player]`",
     '- `board`: array of length 9, indexed by cell number. Each element is `"X"`, `"O"` or `null` (empty).',
     "- `next`: the player ID to move next, or `null` once the game is over.",
+    "- `lastCell`: the cell the most recent mark was placed on (whose mark it is: `board[lastCell]`), or `null` before the first move.",
+    "- `winLine`: the three cells of the winning line, e.g. `[0, 4, 8]`, or `null` while nobody has three in a row (also `null` in a draw).",
   ].join("\n"),
   examples: [
     { action: { cell: 4 }, meaning: "Place your mark in the center" },

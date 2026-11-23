@@ -1,5 +1,5 @@
 import { GameError, type AnyGame, type GameResult } from "../games/types";
-import type { EndReason, RematchInfo, RoomState, RoomStatus, ServerMessage } from "../lib/protocol";
+import type { EndReason, LastEvent, RematchInfo, RoomState, RoomStatus, ServerMessage } from "../lib/protocol";
 import { applyResign, applyTimeout } from "../lib/replay";
 import { FINISHED_ROOM_TTL_MS, WAITING_ROOM_TTL_MS, type RoomOptions } from "../lib/options";
 import { rngForTurn, type Seed } from "../lib/rng";
@@ -54,12 +54,17 @@ export type RoomCore = {
   /** 今の手番が始まったターン（playing 以外は null） */
   phaseTurn: number | null;
   result: GameResult | null;
+  /** 試合が終わった理由（finished 以外は null） */
+  endReason: EndReason | null;
+  /** この状態を作った出来事（ログの最後の行。まだ無ければ null） */
+  last: LastEvent | null;
   rematch: RematchInfo | null;
 };
 
 /** pid（観戦者は null）から見た状態。legal は pid が今行動でき、ゲームが合法手を列挙するときだけ付ける。 */
 export function roomState(core: RoomCore, pid: string | null, now: number): RoomState {
-  const { game, status, rulesVersion, gameOptions, players, snap, currentPlayers, deadline, phaseTurn, result, rematch } = core;
+  const { game, status, rulesVersion, gameOptions, players, snap, currentPlayers, deadline, phaseTurn, result, endReason, last, rematch } =
+    core;
   const out: RoomState = {
     game: game.id,
     rulesVersion,
@@ -73,6 +78,8 @@ export function roomState(core: RoomCore, pid: string | null, now: number): Room
     phaseTurn,
     now,
     result,
+    endReason,
+    last,
   };
   if (snap && pid && status === "playing" && currentPlayers.includes(pid) && game.legalActions) {
     out.legal = game.legalActions(snap.state, pid);

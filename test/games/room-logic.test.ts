@@ -87,6 +87,8 @@ describe("roomState / stateMessage", () => {
     deadline: 10,
     phaseTurn: 0,
     result: null,
+    endReason: null,
+    last: null,
     rematch: null,
   });
   it("legal は行動できるプレイヤーにだけ付き、合法手を列挙しないゲームには付かない", () => {

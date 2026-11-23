@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { GameResult } from "../games/types";
+import type { LogEntry } from "./replay";
 
 export const ROOM_STATUSES = ["waiting", "playing", "finished"] as const;
 export type RoomStatus = (typeof ROOM_STATUSES)[number];
@@ -85,9 +86,19 @@ export interface RoomState {
   /** サーバーの現在時刻（epoch ms）。クライアントは deadline - now で残り時間を出す（時計ずれ対策） */
   now: number;
   result: GameResult | null;
+  /** 試合が終わった理由（end メッセージの reason と同じ）。finished 以外は null */
+  endReason: EndReason | null;
+  /**
+   * この状態を作った出来事（行動ログの最後の行から action を除いたもの）。last.turn は適用前のターンで、
+   * 状態の turn は last.turn + 1。まだ1手も無ければ null。手の中身は view が（見せてよい分だけ）持つ
+   */
+  last: LastEvent | null;
   /** 終了後に誰かが再戦を申し込んだときだけ付く */
   rematch?: RematchInfo;
 }
+
+/** この状態を作った出来事。timeout があれば時間切れ、resign があれば投了（どちらも player は null）。 */
+export type LastEvent = Omit<LogEntry, "action">;
 
 /** 再戦の案内。roomId は新しいルーム、requestedBy は申し込んだ（このルームでの）プレイヤー ID。 */
 export interface RematchInfo {

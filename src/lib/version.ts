@@ -6,7 +6,7 @@ import { z } from "zod";
  * ガイド・rules の `version`（内容のハッシュ = ETag）とは別物。あちらは誤字1つ直しても変わる。
  * 上げたら src/lib/changelog.ts の先頭に同じ版のエントリを足す（テストで確認する）。
  */
-export const API_VERSION = "0.10.0";
+export const API_VERSION = "0.11.0";
 
 /**
  * サーバーが返す値（view など）の JSON Schema を配布用に作る。

@@ -26,6 +26,31 @@ export interface Order {
 export interface Move extends Order {
   player: string;
 }
+/** 解決した命令と、解決前の行き先の持ち主（霧のとき、自分のノードへの攻撃を見せるため。view には出さない）。 */
+export interface ResolvedMove extends Move {
+  toOwner: string | null;
+}
+/** エッジ上の衝突：同じエッジを逆向きに進んだ、違うプレイヤーの2つの部隊。どちらも lost だけ減る。 */
+export interface Clash {
+  type: "clash";
+  /** groups[0].from < groups[0].to */
+  groups: [Move, Move];
+  lost: number;
+}
+/** ノードでの戦闘：持ち主の側（残った兵 + 自分の援軍。中立なら守備隊）と、到着した他のプレイヤーの側。 */
+export interface Battle {
+  type: "battle";
+  node: number;
+  /** 戦闘前の持ち主（null は中立） */
+  owner: string | null;
+  /** 勢力ごとの兵数（多い順。player が null なのは中立の守備隊） */
+  sides: { player: string | null; troops: number }[];
+  /** 戦闘後の持ち主（最大が同数なら owner のまま） */
+  winner: string | null;
+  /** 戦闘後に残った兵（産出の前） */
+  troops: number;
+}
+export type RoundEvent = Clash | Battle;
 export interface FrontierNode {
   production: number;
   /** null は中立。 */
@@ -51,7 +76,9 @@ export interface FrontierState {
   /** 連続で時間切れになった回数（alive のみ）。 */
   missed: Record<string, number>;
   /** 直前のラウンドで実行された命令。 */
-  lastMoves: Move[];
+  lastMoves: ResolvedMove[];
+  /** 直前のラウンドの衝突と戦闘（解決した順：エッジ上の衝突、ノードでの戦闘はノード番号順）。 */
+  lastBattles: RoundEvent[];
 }
 
 export type FrontierAction = { orders: Order[] };
@@ -84,6 +111,7 @@ const actionSchema = z.strictObject({
   orders: z.array(orderSchema).max(MAX_ORDERS).describe("Your orders for this round. An empty array holds every node"),
 });
 
+const moveSchema = z.strictObject({ player: z.string(), from: z.number().int(), to: z.number().int(), count: z.number().int() });
 const pidMap = <T extends z.ZodType>(v: T) => z.record(z.string(), v);
 const viewSchema = z.strictObject({
   round: z.number().int().min(0).describe("Number of finished rounds"),
@@ -105,9 +133,28 @@ const viewSchema = z.strictObject({
   edges: z.array(z.tuple([z.number().int(), z.number().int()])).describe("Undirected edges [a, b] with a < b"),
   territory: pidMap(z.number().int()).describe("Player ID -> total production of the nodes they own (the score)"),
   submitted: pidMap(z.boolean()).describe("Player ID (alive players) -> whether they have sent orders this round"),
-  lastMoves: z
-    .array(z.strictObject({ player: z.string(), from: z.number().int(), to: z.number().int(), count: z.number().int() }))
-    .describe("Orders carried out in the previous round that you can see"),
+  lastMoves: z.array(moveSchema).describe("Orders carried out in the previous round that you can see (counts as sent)"),
+  lastBattles: z
+    .array(
+      z.discriminatedUnion("type", [
+        z.strictObject({
+          type: z.literal("clash"),
+          groups: z.tuple([moveSchema, moveSchema]).describe("The two groups that met on the edge (groups[0].from < groups[0].to)"),
+          lost: z.number().int().describe("Troops each group lost (the smaller group's count)"),
+        }),
+        z.strictObject({
+          type: z.literal("battle"),
+          node: z.number().int(),
+          owner: z.string().nullable().describe("Owner before the battle (null = neutral)"),
+          sides: z
+            .array(z.strictObject({ player: z.string().nullable().describe("null = the neutral garrison"), troops: z.number().int() }))
+            .describe("Troops per side, largest first. The owner's side is its remaining troops plus its own arrivals"),
+          winner: z.string().nullable().describe("Owner after the battle (unchanged on a tie for the largest side)"),
+          troops: z.number().int().describe("Troops left on the node after the battle, before production"),
+        }),
+      ]),
+    )
+    .describe("Clashes on edges and battles at nodes in the previous round that you can see, in the order they were resolved"),
   myOrders: z
     .array(z.strictObject({ from: z.number().int(), to: z.number().int(), count: z.number().int() }))
     .nullable()
@@ -166,7 +213,11 @@ function drop(s: FrontierState, pid: string, reason: OutReason): FrontierState {
 /** ラウンドの解決：出発 → エッジ上の衝突 → 到着先での戦闘 → 産出 → 全ノードを失った人の脱落。 */
 function resolve(s: FrontierState): FrontierState {
   const troops = s.nodes.map((n) => n.troops);
-  const moves: Move[] = s.alive.flatMap((p) => (s.orders[p] ?? []).map((o) => ({ player: p, ...o })));
+  const moves: ResolvedMove[] = s.alive.flatMap((p) =>
+    (s.orders[p] ?? []).map((o) => ({ player: p, ...o, toOwner: s.nodes[o.to]!.owner })),
+  );
+  const events: RoundEvent[] = [];
+  const plain = ({ player, from, to, count }: Move): Move => ({ player, from, to, count });
   for (const m of moves) troops[m.from]! -= m.count;
 
   // 同じエッジを逆向きに進む、違うプレイヤーの部隊どうしは、エッジ上で少ない方の数だけ削り合う
@@ -180,6 +231,7 @@ function resolve(s: FrontierState): FrontierState {
   for (const m of moves) {
     const back = moves.find((o) => o.from === m.to && o.to === m.from);
     const loss = back && back.player !== m.player ? Math.min(m.count, back.count) : 0;
+    if (back && loss > 0 && m.from < m.to) events.push({ type: "clash", groups: [plain(m), plain(back)], lost: loss });
     arrive(m.to, m.player, m.count - loss);
   }
 
@@ -193,10 +245,21 @@ function resolve(s: FrontierState): FrontierState {
     const [top, second] = [ranked[0]!, ranked[1]?.[1] ?? 0];
     if (top[1] > second) nodes[i] = { ...node, owner: top[0] === "" ? null : top[0], troops: top[1] - second };
     else nodes[i] = { ...node, troops: 0 }; // 最大が同数：全滅し、持ち主は変わらない
+    // 持ち主の援軍だけが着いたノードは戦闘ではない
+    if (ranked.length > 1) {
+      events.push({
+        type: "battle",
+        node: i,
+        owner: node.owner,
+        sides: ranked.map(([p, n]) => ({ player: p === "" ? null : p, troops: n })),
+        winner: nodes[i]!.owner,
+        troops: nodes[i]!.troops,
+      });
+    }
   }
   for (const n of nodes) if (n.owner !== null) n.troops += n.production;
 
-  let next: FrontierState = { ...s, nodes, round: s.round + 1, lastMoves: moves };
+  let next: FrontierState = { ...s, nodes, round: s.round + 1, lastMoves: moves, lastBattles: events };
   for (const p of s.alive) if (!nodes.some((n) => n.owner === p)) next = drop(next, p, "eliminated");
   return {
     ...next,
@@ -295,7 +358,7 @@ function practice(s: FrontierState, pid: string, rng: Rng): FrontierAction {
 
 export const frontier: GameDefinition<FrontierState, FrontierAction, FrontierOptions> = {
   id: "frontier",
-  rulesVersion: 1,
+  rulesVersion: 2,
   viewVersion: 1,
   minPlayers: MIN_PLAYERS,
   maxPlayers: MAX_PLAYERS,
@@ -322,6 +385,7 @@ export const frontier: GameDefinition<FrontierState, FrontierAction, FrontierOpt
       orders: Object.fromEntries(players.map((p) => [p, null])),
       missed: Object.fromEntries(players.map((p) => [p, 0])),
       lastMoves: [],
+      lastBattles: [],
     };
   },
 
@@ -353,7 +417,15 @@ export const frontier: GameDefinition<FrontierState, FrontierAction, FrontierOpt
       edges: s.edges,
       territory: Object.fromEntries(s.players.map((p) => [p, territoryOf(s, p)])),
       submitted: Object.fromEntries(s.alive.map((p) => [p, isOver(s) || s.orders[p] !== null])),
-      lastMoves: s.lastMoves.filter((m) => vis[m.from] || vis[m.to] || m.player === me),
+      // 霧のときは今見えるノードに関わるものだけ。ただし自分が関わったものは、ノードを失っても・抜けても必ず見せる
+      lastMoves: s.lastMoves
+        .filter((m) => vis[m.from] || vis[m.to] || (me !== null && (m.player === me || m.toOwner === me)))
+        .map(({ player, from, to, count }) => ({ player, from, to, count })),
+      lastBattles: s.lastBattles.filter((e) =>
+        e.type === "clash"
+          ? vis[e.groups[0].from] || vis[e.groups[0].to] || e.groups.some((g) => g.player === me)
+          : vis[e.node] || (me !== null && (e.owner === me || e.sides.some((x) => x.player === me))),
+      ),
       ...(me ? { myOrders: s.orders[me] ?? null } : {}),
     };
   },

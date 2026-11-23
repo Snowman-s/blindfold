@@ -59,6 +59,7 @@ src/
     tictactoe/        # First sample game (index.ts = GameDefinition, docs.ts = description for clients)
     highcard/         # Card game with hidden information + simultaneous turns
     frontier/         # 2-4 player territory game on a generated graph (simultaneous orders, game options, no legalActions, onTimeout / onResign; map.ts = symmetric map generation)
+    liarsdice/        # 2-6 player bluffing dice game (hidden dice, sequential turns, game options, no legalActions; minBids in the view, onTimeout / onResign drop the player and reroll)
   lib/
     rng.ts            # Seeded PRNG (string seed → cyrb128 → sfc32; 128-bit state)
     auth.ts           # Issuing and verifying player tokens

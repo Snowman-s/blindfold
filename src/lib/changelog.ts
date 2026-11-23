@@ -20,6 +20,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.10.0",
+    date: "2026-11-23",
+    added: [
+      "New game `liarsdice`: 2-6 players, each with hidden dice, take turns raising a bid on how many dice on the table " +
+        "show a face, or challenge the last bid. It has game options (`startDice`, `wildOnes`, `spotOn`), does not list " +
+        "legal moves (the view's `minBids` gives the smallest allowed bid per face), and keeps playing when one player " +
+        "resigns or times out. Its action schema is a union of objects keyed by `type`. See `/games/liarsdice/rules.md`.",
+    ],
+  },
+  {
     version: "0.9.0",
     date: "2026-11-22",
     added: [

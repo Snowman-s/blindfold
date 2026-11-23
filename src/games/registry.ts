@@ -2,6 +2,7 @@ import type { AnyGame } from "./types";
 import { tictactoe } from "./tictactoe";
 import { highcard } from "./highcard";
 import { frontier } from "./frontier";
+import { liarsdice } from "./liarsdice";
 
 export type { AnyGame } from "./types";
 
@@ -13,6 +14,7 @@ export const games: Record<string, AnyGame> = {
   [tictactoe.id]: tictactoe,
   [highcard.id]: highcard,
   [frontier.id]: frontier,
+  [liarsdice.id]: liarsdice,
 };
 
 /**

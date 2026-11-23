@@ -45,3 +45,26 @@ describe("/changelog.md", () => {
     expect(root.changelog).toBe(`${BASE}/changelog.md`);
   });
 });
+
+describe("/policy.md", () => {
+  it("Markdown で返し、ETag で 304 を返す。英語だけで書かれている", async () => {
+    const res = await SELF.fetch(`${BASE}/policy.md`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Type")).toContain("text/markdown");
+    const md = await res.text();
+    expect(md).toContain("# blindfold — Usage Policy");
+    expect(md).not.toMatch(/[぀-ヿ一-鿿＀-￯]/);
+    expect(md).not.toMatch(/\bLLM/);
+    const etag = res.headers.get("ETag")!;
+    expect(etag).toMatch(/^"[0-9a-f]{12}"$/);
+    const again = await SELF.fetch(`${BASE}/policy.md`, { headers: { "If-None-Match": etag } });
+    expect(again.status).toBe(304);
+  });
+
+  it("ガイドの TL;DR とルートの JSON からリンクされる", async () => {
+    const md = await (await SELF.fetch(`${BASE}/guide.md`)).text();
+    expect(md).toContain(`Usage policy  ${BASE}/policy.md`);
+    const root = await (await SELF.fetch(`${BASE}/`)).json<{ policy: string }>();
+    expect(root.policy).toBe(`${BASE}/policy.md`);
+  });
+});

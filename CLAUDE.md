@@ -71,6 +71,7 @@ src/
     rules.ts          # Builds the game description (/games/:id/rules)
     guide.ts          # Generates the client developer guide (/guide.md)
     changelog.ts      # API changelog (/changelog.md). Add an entry at the top when bumping API_VERSION
+    policy.ts         # Usage policy (/policy.md)
     deprecation.ts    # Deprecation / Sunset header helpers (deprecated() middleware, markDeprecated())
     ratelimit.ts      # Per-IP rate limiting (Rate Limiting bindings; 429 RATE_LIMITED + Retry-After)
     examples.ts       # state / end / log examples for the guide and rules (built from the real engines + fixed seeds)
@@ -124,6 +125,7 @@ export interface GameDefinition<S, A, O = null> {    // O = game-specific option
 |---|---|---|
 | GET | `/` (guide body if `Accept: text/markdown`), `/guide.md`, `/llms.txt` | Guide for client developers (coding agents). Goal: a client can be written from the URL alone. Generated from code; `version` is the ETag |
 | GET | `/changelog.md` | API changelog (generated from `src/lib/changelog.ts`; content hash is the ETag) |
+| GET | `/policy.md` | Usage policy (shared budget, fair play, what is public, retention, no guarantees, contact). Generated from `src/lib/policy.ts` (retention periods are deliberately not stated as numbers, so they are not a promise); content hash is the ETag. Keep every claim in sync with the code |
 | GET | `/games` | List of available games (with `summary`, `rulesVersion`, `viewVersion`, `listsLegalActions`, `hasOptions`, `rulesUrl`) |
 | GET | `/games/:id/rules` | Game description: rules, how to read the view, JSON Schemas for view / action / game options (`optionsSchema`, `defaultGameOptions`), state examples (generated from the real engine), common play instructions. `version` is the ETag |
 | GET | `/games/:id/rules.md` | The same content as one Markdown page, ready to paste into a prompt |

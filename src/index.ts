@@ -4,6 +4,7 @@ import { cors } from "hono/cors";
 import { HTTPException } from "hono/http-exception";
 import { changelog } from "./lib/changelog";
 import { guide, renderGuide } from "./lib/guide";
+import { policy } from "./lib/policy";
 import { rateLimit } from "./lib/ratelimit";
 import { API_VERSION } from "./lib/version";
 import { routes } from "./routes/rooms";
@@ -55,6 +56,17 @@ app.get("/changelog.md", async (c) => {
   return c.body(g.body);
 });
 
+/** 利用上の約束事。内容のハッシュを ETag にする（DO も D1 も読まないのでレート制限はしない）。 */
+app.get("/policy.md", async (c) => {
+  const p = await policy();
+  const etag = `"${p.version}"`;
+  c.header("ETag", etag);
+  c.header("Cache-Control", "public, max-age=3600");
+  if (c.req.header("If-None-Match") === etag) return c.body(null, 304);
+  c.header("Content-Type", "text/markdown; charset=utf-8");
+  return c.body(p.body);
+});
+
 // ユーザーが最初に貼るのはルート URL なので、ここから迷わずガイドに辿り着けるようにする。
 // Markdown を求めるクライアントにはガイド本文をそのまま返す。
 app.get("/", async (c) => {
@@ -70,6 +82,7 @@ app.get("/", async (c) => {
     games: `${origin}/games`,
     openapi: `${origin}/openapi.json`,
     changelog: `${origin}/changelog.md`,
+    policy: `${origin}/policy.md`,
   });
 });
 // 書き込み系のレート制限（IP ごと）。ルートより先に登録する。period は wrangler.jsonc の ratelimits と合わせる

@@ -399,9 +399,12 @@ export class RoomStore {
       .map(decodeRow);
   }
 
-  /** 最後の行（この状態を作った出来事）から action を除いたもの。行が無ければ null。 */
+  /**
+   * 最後の行（この状態を作った出来事）から action を除いたもの。行が無ければ null。
+   * 状態を作るたびに呼ぶので、索引の無い turn ではなく rowid で引く（行はターン順に追記するだけなので最大の rowid が最後のターン）。
+   */
   lastEvent(): LastEvent | null {
-    const r = this.sql.exec("SELECT turn, player, action, at FROM actions ORDER BY turn DESC LIMIT 1").toArray()[0];
+    const r = this.sql.exec("SELECT turn, player, action, at FROM actions ORDER BY rowid DESC LIMIT 1").toArray()[0];
     if (!r) return null;
     const { action: _, ...rest } = decodeRow(r);
     return rest;

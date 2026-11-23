@@ -2,7 +2,7 @@ import type { GameDocs } from "../types";
 import { DISCARD_B, FIELD_LIMIT, MAX_PLAYERS, MIN_PLAYERS, PACK_SIZE, ROUND_B, ROUNDS, START } from "./constants";
 
 /**
- * GET /games/draftcards/rules で配る説明。エンジンはまだ無く、registry にも載せていない。
+ * GET /games/draftcards/rules で配る説明。エンジンは index.ts。
  * カードとリソースに意味を持たせないため、意味が漏れる語（体力・通貨・得点・戦い・魔法など）を使わないこと。
  * フィールド名・enum 値・GameError のメッセージも同じ。
  */
@@ -15,8 +15,7 @@ const NAMING = [
 ];
 
 /**
- * カードの読み方。プラットフォームに GameDefinition.catalog（カードの schema・一覧・読み方を /games/:id/rules で配る）を
- * 足したら、その docs に入れる予定。
+ * カードの読み方。GameDefinition.catalog の docs として、カードの schema・一覧と一緒に /games/:id/rules の catalog で配る。
  */
 export const catalogDocs = [
   "Each card is a JSON object. The catalog lists every card that can appear; a game uses a random part of it.",
@@ -30,7 +29,9 @@ export const catalogDocs = [
   "",
   "#### Effects",
   "Effects are applied one at a time. A resource never goes below 0 (each effect stops at 0) and has no upper limit. Reaching 0 has no other consequence.",
-  '- `{ "op": "add", "who", "res", "n" }`: `res` of every player in `who` goes up by `n`.',
+  '- `{ "op": "add", "who", "res", "n" }`: `res` of every player in `who` goes up by `n`. Two options appear only on `add`:',
+  `  - \`"per": "field"\`: \`n\` is multiplied by the number of cards in the **owner's** field. In \`now\`, they are counted when the card resolves, before it is placed in the field (so it never counts itself). In \`each\`, they are counted at the start of the round, before any card leaves (so it counts itself). With 0 cards the effect does nothing.`,
+  `  - \`"res": "least"\` (only with \`"who": "self"\`): the owner's smallest resource at that moment. If several are tied for smallest, each of them goes up by \`n\`.`,
   '- `{ "op": "sub", "who", "res", "n" }`: `res` of every player in `who` goes down by `n` (not below 0).',
   '- `{ "op": "move", "res", "n" }`: takes up to `n` of the chosen player\'s `res` (as much as they have, at most `n`) and gives it to the owner.',
   '- `{ "op": "remove" }`: the targeted card leaves its field. If it is no longer in a field when this applies, nothing happens.',
@@ -41,14 +42,14 @@ export const catalogDocs = [
   "- `neighbors`: both of the owner's neighbors; in a 2-player game the only other player, affected once.",
   "- `others`: every remaining player except the owner. `all`: every remaining player, the owner included.",
   "",
-  "`each` effects are only `add` and `sub`, and never use `chosen`.",
+  "`each` effects are only `add` and `sub`, and never use `chosen`. `move`, `sub` and `cost` never use `per` or `least`.",
 ].join("\n");
 
 export const docs: GameDocs = {
   summary:
     `A ${MIN_PLAYERS}-${MAX_PLAYERS} player card game where nothing has a name. Draft a hand of numbered cards from packs passed around the table, ` +
     `then play them over ${ROUNDS} rounds: some act once, some stay in your field and act every round, and some reach into your neighbors' fields. ` +
-    "The resources are just A, B and C.",
+    `The resources are just A, B and C. Best with 3 or ${MAX_PLAYERS} players.`,
   rules: [
     ...NAMING,
     "",
@@ -67,7 +68,7 @@ export const docs: GameDocs = {
     "",
     "### Rounds",
     `Everyone starts with A = ${START.A}, B = ${START.B} and C = ${START.C}, and an empty field. Then ${ROUNDS} rounds are played, each like this:`,
-    "1. **Field cards act.** The `each` effects of every card in every field apply, one card at a time, lowest `order` first. Each card's `times` goes down by 1; at 0 it leaves the field. (Nothing happens in round 1: the fields are still empty.)",
+    "1. **Field cards act.** The `each` effects of every card in every field apply, one card at a time, lowest `order` first. Each card's `times` goes down by 1. Cards whose `times` reached 0 leave the field after every field card has acted. (Nothing happens in round 1: the fields are still empty.)",
     `2. Every remaining player's B goes up by ${ROUND_B}.`,
     "3. **Everyone acts at the same time**, without seeing the others' choice. Send one of:",
     '   - `{ "type": "play", "card": 12 }`: play a card from your hand. If the card has `chooses: "player"`, add `"chosen": "p3"` (one of your neighbors). If it has `chooses: "card"`, add `"target": 31` (a card that is in one of your neighbors\' fields in the state you act on; cards played this round are not there yet).',
@@ -96,7 +97,8 @@ export const docs: GameDocs = {
     "",
     "### Notes",
     "- Every pick and every round is one simultaneous turn: all remaining players are in `currentPlayers`, and nothing is revealed until all of them have acted.",
-    `- Quick match and \`options.autoStart\` wait until the room is full, which is ${MAX_PLAYERS} players by default. For a smaller game pass \`options.seats\` (for example \`{"game":"draftcards","options":{"seats":2}}\`).`,
+    `- Quick match and \`options.autoStart\` wait until the room is full, which is ${MAX_PLAYERS} players by default. For a smaller game pass \`options.seats\` (for example \`{"game":"draftcards","options":{"seats":3}}\`).`,
+    "- The cards are balanced for 3 or 4 players. A 2-player game follows the same rules, but some cards are noticeably stronger or weaker there (your only neighbor is your only opponent).",
     '- `legal` lists every pick, every discard, and every play with every allowed `chosen` / `target`. Plays are listed whether or not you can pay the cost now (it is paid later). A card with `chooses: "card"` cannot be played when no neighbor has a card in their field; you can still discard it.',
     "- A card in the catalog never changes; only new cards are added (with new numbers) and old ones retired.",
   ].join("\n"),
@@ -126,8 +128,8 @@ export const docs: GameDocs = {
   examples: [
     { action: { type: "pick", card: 12 }, meaning: "Keep card #12 from the pack you hold; the rest of the pack passes to the next seat" },
     { action: { type: "play", card: 5 }, meaning: 'Play card #5 (a card with `chooses: "none"`)' },
-    { action: { type: "play", card: 6, chosen: "p2" }, meaning: 'Play card #6 (`chooses: "player"`), naming your neighbor p2' },
-    { action: { type: "play", card: 3, target: 2 }, meaning: 'Play card #3 (`chooses: "card"`) on card #2 in a neighbor\'s field' },
+    { action: { type: "play", card: 44, chosen: "p2" }, meaning: 'Play card #44 (`chooses: "player"`), naming your neighbor p2' },
+    { action: { type: "play", card: 53, target: 2 }, meaning: 'Play card #53 (`chooses: "card"`) on card #2 in a neighbor\'s field' },
     { action: { type: "discard", card: 10 }, meaning: `Give up card #10 for B +${DISCARD_B}` },
   ],
 };

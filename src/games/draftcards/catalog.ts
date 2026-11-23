@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { FIELD_LIMIT } from "./constants";
 
 /**
  * draftcards のカードの形（catalog の schema）。カードはデータで、エンジンはそれを解釈するだけ。
@@ -25,7 +26,22 @@ const whoEach = z
   .enum(["self", "neighbors", "others", "all"])
   .describe("Who is affected, seen from the card's owner (`chosen` is not allowed in `each`)");
 
-const add = z.strictObject({ op: z.literal("add"), who, res, n: amount }).describe("Increase `res` of `who` by `n`");
+/**
+ * add だけが持てる 2 つの拡張（doc/draftcards-set-design.md 4 節の M1・M2）。
+ * - per: "field": n に持ち主の場の札の枚数を掛ける（now は解決時・自分を置く前、each はラウンドの初めに数える）。0 枚なら何もしない
+ * - res: "least": 持ち主の一番少ないリソース（同点ならそのすべて）。who は self だけ（cardSchema の superRefine で確かめる）
+ * sub・move・cost には付けない（減らす量が膨らむ効果は 2 人戦の振れ幅を広げるため）。
+ */
+const addRes = z
+  .enum([...RESOURCES, "least"])
+  .describe("Which resource. `least`: the owner's smallest resource at that moment (every one tied for smallest); only with `who: self`");
+const per = z
+  .literal("field")
+  .optional()
+  .describe("If `field`, `n` is multiplied by the number of cards in the owner's field (0 cards: nothing happens)");
+const add = z
+  .strictObject({ op: z.literal("add"), who, res: addRes, n: amount, per })
+  .describe("Increase `res` of `who` by `n` (times the owner's field cards if `per` is `field`)");
 const sub = z
   .strictObject({ op: z.literal("sub"), who, res, n: amount })
   .describe("Decrease `res` of `who` by `n` (never below 0)");
@@ -79,6 +95,14 @@ export const cardSchema = z
     }
     if (c.now.length === 0 && c.stay === null) {
       ctx.addIssue({ code: "custom", message: "a card needs a `now` effect or `stay`" });
+    }
+    for (const e of [...c.now, ...(c.stay?.each ?? [])]) {
+      if (e.op === "add" && e.res === "least" && e.who !== "self") {
+        ctx.addIssue({ code: "custom", message: "`res: least` only with `who: self`" });
+      }
+      if (e.op === "add" && e.per === "field" && e.n * FIELD_LIMIT > 9) {
+        ctx.addIssue({ code: "custom", message: "`per: field` with `n` so large that a full field goes past 9" });
+      }
     }
   });
 export type Card = z.infer<typeof cardSchema>;

@@ -2,7 +2,7 @@ import { z } from "zod";
 import { FIELD_LIMIT, PACK_SIZE, ROUNDS } from "./constants";
 import { RESOURCES } from "./catalog";
 
-/** draftcards の action と view の形（/games/draftcards/rules で JSON Schema として配る）。エンジンはまだ無い。 */
+/** draftcards の action と view の形（/games/draftcards/rules で JSON Schema として配る）。 */
 
 const cardId = z.number().int().min(1);
 

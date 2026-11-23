@@ -20,6 +20,17 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.12.0",
+    date: "2026-11-24",
+    added: [
+      "New game `draftcards` (2-4 players, best with 3 or 4): draft numbered cards from packs passed around the table, then play them " +
+        "over 6 rounds; the smallest of your three resources A, B and C decides the ranking. Every pick and round is a simultaneous turn. " +
+        "Cards and resources have no names: name them in your client's own theme (see its rules).",
+      "`catalog` in `/games/{id}/rules`: the pieces a game is made of, as data (`docs`, a JSON Schema of one item, and every `items`), " +
+        "or null for games without one. `draftcards` lists its cards there; the Markdown rules list them too.",
+    ],
+  },
+  {
     version: "0.11.0",
     date: "2026-11-23",
     breaking: [

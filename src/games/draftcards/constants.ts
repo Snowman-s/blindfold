@@ -8,9 +8,9 @@ export const PACK_SIZE = 7;
 export const ROUNDS = 6;
 /** 場に置ける札の上限。超えたらいちばん古い札が去る。 */
 export const FIELD_LIMIT = 3;
-/** 初期値。C が 0 だと C が min を決めすぎた（claude_doc/draftcards-set-design.md 5 節）。 */
+/** 初期値。C が 0 だと C が min を決めすぎた。 */
 export const START = { A: 3, B: 2, C: 1 } as const;
 /** ラウンドの初めに全員の B が増える量。 */
 export const ROUND_B = 1;
-/** 札を捨てたときに B が増える量。2 だと B が余り、順位の min をほとんど決めなかった（claude_doc/draftcards-set-design.md 5 節）。 */
+/** 札を捨てたときに B が増える量。2 だと B が余り、順位の min をほとんど決めなかった。 */
 export const DISCARD_B = 1;

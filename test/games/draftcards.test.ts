@@ -20,7 +20,7 @@ describe("draftcards catalog", () => {
 
   it("cards that choose a player mainly help their owner", () => {
     // 選んだ人から減らす量が大きいと、多人数では 1 人を袋叩きにする道具になり、2 人戦では振れ幅が広がる。
-    // 選んだ人が失うのは合計 1 まで、持ち主が得るのは 2 以上（claude_doc/draftcards-set-design.md 3 節）
+    // 選んだ人が失うのは合計 1 まで、持ち主が得るのは 2 以上
     for (const c of cards.filter((c) => c.chooses === "player")) {
       const loss = c.now.reduce((s, e) => s + (e.op === "move" || (e.op === "sub" && e.who === "chosen") ? e.n : 0), 0);
       // per: field は場が 0 枚だと何も得ないので数えない
@@ -30,7 +30,7 @@ describe("draftcards catalog", () => {
     }
   });
 
-  // 以下はスケルトンの構造の規則（claude_doc/draftcards-set-design.md 6 節）。カードを足し引きしても崩さないためのもの。
+  // 以下はスケルトンの構造の規則。カードを足し引きしても崩さないためのもの。
   const effectsOf = (c: Card) => [...c.now, ...(c.stay?.each ?? [])];
 
   it("every resource is gained, paid and taken away by at least 3 cards", () => {
@@ -60,7 +60,7 @@ describe("draftcards catalog", () => {
 
   it("a full field can be built", () => {
     // 1 ラウンドに 1 枚なので、解決時（now）に場が上限の枚数になるには、最初に出す札が上限 + 1 ラウンド以上残る必要がある。
-    // そういう札が安いものも含めて十分ないと、上限と now の per: field が飾りになる（claude_doc/draftcards-set-design.md 7 節）
+    // そういう札が安いものも含めて十分ないと、上限と now の per: field が飾りになる
     const long = cards.filter((c) => (c.stay?.times ?? 0) >= FIELD_LIMIT + 1);
     expect(long.length).toBeGreaterThanOrEqual(6);
     // ラウンド 1 の B は START.B + ROUND_B なので、費用 2 までなら最初の手に出せる

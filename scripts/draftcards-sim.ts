@@ -12,8 +12,8 @@
 // - --draft-bot=rating --ratings=<file>: カードごとの評価が最大の札を取る。評価は <file>（ランダムなドラフトで回した --json の出力）の、
 //   その人数での heldWin。手札を見るドラフト bot との差が「手札の組み立て」の分
 // - --flat-field=X: per: "field" を、場の枚数の代わりに定数 X を掛けるものとして扱う。M1 の組み合わせの効果を消す比較のつもりだったが、
-//   プレイの bot が M1 の札を出す時期が変わって比較が崩れ、X が小数だとリソースが小数になって min と同点の起き方まで変わった
-//   （claude_doc/draftcards-set-design.md 7 節）。使うなら整数で、結果は割り引いて読む
+//   プレイの bot が M1 の札を出す時期が変わって比較が崩れ、X が小数だとリソースが小数になって min と同点の起き方まで変わった。
+//   使うなら整数で、結果は割り引いて読む
 // - 1 手読みなので、cancel・remove・order のタイミングは低く見積もられる。これらの札の数字だけで強弱を決めない
 import { readFileSync } from "node:fs";
 import { cards } from "../src/games/draftcards/cards";

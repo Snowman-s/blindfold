@@ -27,7 +27,7 @@ const whoEach = z
   .describe("Who is affected, seen from the card's owner (`chosen` is not allowed in `each`)");
 
 /**
- * add だけが持てる 2 つの拡張（doc/draftcards-set-design.md 4 節の M1・M2）。
+ * add だけが持てる 2 つの拡張（claude_doc/draftcards-set-design.md 4 節の M1・M2）。
  * - per: "field": n に持ち主の場の札の枚数を掛ける（now は解決時・自分を置く前、each はラウンドの初めに数える）。0 枚なら何もしない
  * - res: "least": 持ち主の一番少ないリソース（同点ならそのすべて）。who は self だけ（cardSchema の superRefine で確かめる）
  * sub・move・cost には付けない（減らす量が膨らむ効果は 2 人戦の振れ幅を広げるため）。

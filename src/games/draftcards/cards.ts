@@ -1,7 +1,7 @@
 import type { Card } from "./catalog";
 
 /**
- * draftcards のカード一覧（catalog）。doc/draftcards-set-design.md 3 節のスケルトンから作った。
+ * draftcards のカード一覧（catalog）。claude_doc/draftcards-set-design.md 3 節のスケルトンから作った。
  * id は役割ごとにまとめてある: 1〜20 場に残る札（S）、21〜40 一度きりの札（O）、41〜50 隣の人を選ぶ札（P）、
  * 51〜56 隣の場の札を選ぶ札（F）、57〜60 cancel の札（X）。コメントの S01 などはスケルトンのコード。
  * order の帯: X 1〜9、P・F 10〜49、S 50〜99、O 100〜149。

@@ -9,7 +9,7 @@ import { DISCARD_B, FIELD_LIMIT, MAX_PLAYERS, MIN_PLAYERS, PACK_SIZE, ROUND_B, R
 
 const NAMING = [
   "### Name everything before you play",
-  "This game deliberately gives its cards and resources no names: cards are only `#1`, `#2`, ..., resources are only `A`, `B` and `C`, and these rules say what they do, never what they are. Before building a client, we very strongly recommend choosing a theme of your own, giving every card in the catalog a meaningful name (and ideally an illustration) within that theme, and giving each resource a name, so that players can follow the game. Different clients will come up with different names; that is intended.",
+  "This game deliberately gives its cards and resources no names: cards are only `#1`, `#2`, ..., resources are only `A`, `B` and `C`, and these rules say what they do, never what they are. Before building a client, we very strongly recommend choosing a theme of your own (choose it freely: do not let what the cards do decide the theme for you), giving every card in the catalog a meaningful name (and ideally an illustration) within that theme, and giving each resource a name, so that players can follow the game. Different clients will come up with different names; that is intended.",
   "",
   "Generate the names once and keep them, keyed by card `id` and resource letter, and reuse them in every match. Card ids are permanent: a published card never changes under the same `id`, and a retired `id` is never reused, so your names stay valid across `rulesVersion` changes. New cards get new ids; name those when they appear. Store each card's JSON next to its name if you want to double-check this.",
 ];

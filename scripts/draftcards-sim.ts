@@ -1,5 +1,5 @@
 // draftcards のバランス用シミュレーター（bot どうしを速く大量に回す。解決の順番は src/games/draftcards/index.ts と同じにすること）。
-// 使い方: pnpm tsx scripts/draftcards-sim.ts [試合数=2000] [seed=sim] [人数=2,3,4] [--json] [--draft-bot[=alone|rating|all]] [--play=field] [--flat-field=X]
+// 使い方: pnpm tsx scripts/draftcards-sim.ts [試合数=2000] [seed=sim] [人数=2,3,4] [--json] [--draft-bot[=alone|rating|all|lane|lane-one]] [--lane-bonus=W] [--play=field] [--flat-field=X]
 //
 // - bot: 他の人の手を 1 手読みの bot で予想し、それと同時に解決したときの見込みが最大の手を選ぶ
 // - ドラフトは既定でランダム（カードの有無を腕前と独立にするため。カードごとの勝率はこのときだけ意味がある）
@@ -9,15 +9,24 @@
 // - --play=field: 場を組める手札（ラウンド 1〜上限、場と手札の場に残る札で上限に届き、手札に M1 の札がある）の人は、
 //   今払える場に残る札のうち一番長く残るものを出す（1 手読みの bot は場を続けて組む計画を立てないので、その代わり）
 // - --draft-bot=all: 全席を（手札を見る）ドラフト bot にする。組んだデッキどうしでの札の強さと、場がどこまで育つかを見る
+// - --draft-bot=lane: 全席を、方向を決めて取るドラフト bot にする。最初の LANE_FROM ピックは手札を見るドラフト bot と同じで、
+//   その後は手札で一番多い方向（同数ならそのすべて）を自分の方向とし、その方向の札の評価に W（--lane-bonus、既定 LANE_BONUS）を足す。
+//   パックから自分の方向の札が来なくなれば、手札の数が入れ替わって方向を変える。方向転換の損得とつなぎの効き目（lane の行。bot が実際に決めた方向で数える）はこれで見る
+// - --draft-bot=lane-one: 1 席（試合ごとに回す）だけ方向を決めて取る bot、ほかの席は手札を見るドラフト bot。方向を狙うこと自体が得かを見る
 // - --draft-bot=rating --ratings=<file>: カードごとの評価が最大の札を取る。評価は <file>（ランダムなドラフトで回した --json の出力）の、
 //   その人数での heldWin。手札を見るドラフト bot との差が「手札の組み立て」の分
 // - --flat-field=X: per: "field" を、場の枚数の代わりに定数 X を掛けるものとして扱う。M1 の組み合わせの効果を消す比較のつもりだったが、
 //   プレイの bot が M1 の札を出す時期が変わって比較が崩れ、X が小数だとリソースが小数になって min と同点の起き方まで変わった。
 //   使うなら整数で、結果は割り引いて読む
+// - 方向（scripts/draftcards-directions.ts）: 手札 7 枚のうち DIRECTION_MIN 枚以上がその方向の札なら、その方向に寄ったとみなす（2 つ以上に寄ることもある）。
+//   最初の EARLY_PICKS 枚で EARLY_MIN 枚以上なら、序盤にその方向へ寄っていた。寄っていた方向が最後に 1 つも残らず、別の方向に寄ったのが「方向を変えた」。
+//   ランダムなドラフトでは方向は偶然なので、方向の勝率は「その方向の札をまとめて持ったときの強さ」。方向を変えた勝率は --draft-bot=lane で見る。
+//   --draft-bot で 1 席だけ違う bot にしたときは、その席だけを数える
 // - 1 手読みなので、cancel・remove・order のタイミングは低く見積もられる。これらの札の数字だけで強弱を決めない
 import { readFileSync } from "node:fs";
 import { cards } from "../src/games/draftcards/cards";
 import type { Card, EachEffect, Effect } from "../src/games/draftcards/catalog";
+import { DIRECTIONS, type Direction, directionsOf, leaning } from "./draftcards-directions";
 import { DISCARD_B, FIELD_LIMIT, PACK_SIZE, ROUND_B, ROUNDS, START } from "../src/games/draftcards/constants";
 import { createRng, type Rng } from "../src/lib/rng";
 
@@ -315,7 +324,20 @@ function soloValue(n: number, seat: number, hand: readonly Card[], rng: Rng): nu
   return value(at(g.ps, seat).res);
 }
 /** パックから取る札の位置。「今の手札＋候補」の soloValue が最大のもの。 */
-function draftPick(n: number, seat: number, hand: readonly Card[], pack: readonly Card[], rng: Rng, alone: boolean): number {
+/** 方向を決めて取る bot が、方向を見始めるまでのピック数（それまでは手札を見るドラフト bot と同じ）。 */
+const LANE_FROM = 2;
+/** 自分の方向の札に足す評価の既定値（soloValue の単位）。 */
+const LANE_BONUS = 1;
+let laneBonus = LANE_BONUS;
+/** 手札で一番多い方向（同数ならそのすべて）。方向を見始める前や、どの方向の札も無いときは空。 */
+function lanesOf(hand: readonly Card[]): Direction[] {
+  if (hand.length < LANE_FROM) return [];
+  const count = (d: Direction) => hand.filter((c) => directionsOf(c.id).includes(d)).length;
+  const top = Math.max(...DIRECTIONS.map(count));
+  return top === 0 ? [] : DIRECTIONS.filter((d) => count(d) === top);
+}
+type PickMode = "hand" | "alone" | "lane";
+function draftPick(n: number, seat: number, hand: readonly Card[], pack: readonly Card[], rng: Rng, mode: PickMode): number {
   if (ratings) {
     const r = ratings.get(n);
     if (!r) throw new Error(`no ratings for ${n} players`);
@@ -325,10 +347,12 @@ function draftPick(n: number, seat: number, hand: readonly Card[], pack: readonl
     });
     return ri;
   }
+  const lanes = mode === "lane" ? lanesOf(hand) : [];
   let bi = 0;
   let bv = -Infinity;
   pack.forEach((c, k) => {
-    const v = soloValue(n, seat, alone ? [c] : [...hand, c], rng);
+    const bonus = directionsOf(c.id).some((d) => lanes.includes(d)) ? laneBonus : 0;
+    const v = soloValue(n, seat, mode === "alone" ? [c] : [...hand, c], rng) + bonus;
     if (v > bv) {
       bv = v;
       bi = k;
@@ -338,6 +362,12 @@ function draftPick(n: number, seat: number, hand: readonly Card[], pack: readonl
 }
 /** --draft-bot=rating のときの評価（人数 -> id -> heldWin）。 */
 let ratings: Map<number, Map<number, number>> | null = null;
+const byId = new Map(cards.map((c) => [c.id, c]));
+const cardById = (id: number): Card => {
+  const c = byId.get(id);
+  if (!c) throw new Error(`no card #${id}`);
+  return c;
+};
 const isM1 = (c: Card) => [...c.now, ...(c.stay?.each ?? [])].some((e) => e.op === "add" && e.per === "field");
 
 function shuffle<T>(xs: readonly T[], rng: Rng): T[] {
@@ -348,6 +378,22 @@ function shuffle<T>(xs: readonly T[], rng: Rng): T[] {
   }
   return a;
 }
+
+/** 手札がその方向に寄ったとみなす枚数（7 枚のうち）。 */
+const DIRECTION_MIN = 3;
+/** 序盤の寄りを見るピックの数と、そのうちの枚数。 */
+const EARLY_PICKS = 3;
+const EARLY_MIN = 2;
+type Tally = { n: number; w: number };
+/** 使わない札の枚数の区切り（2 以下・3・4・5 以上）。どの方向にも載らない札が 15 枚あるので、0〜1 はほとんど無い。 */
+const DEAD_BUCKETS = [0, 3, 4, 5] as const;
+const rate = (t: Tally, of: number) => ({ share: t.n / Math.max(1, of), win: t.w / Math.max(1, t.n) });
+/** 方向を決めて取る bot の、実際の方向の集計。se は勝率の標準誤差（同点の分け合いは無視した近似）。 */
+type LaneRate = { share: number; win: number; se: number };
+const laneRate = (t: Tally, of: number): LaneRate => {
+  const win = t.w / Math.max(1, t.n);
+  return { share: t.n / Math.max(1, of), win, se: Math.sqrt((win * (1 - win)) / Math.max(1, t.n)) };
+};
 
 export interface CardRow {
   id: number;
@@ -385,10 +431,22 @@ export interface Summary {
     m1Take: [number, number];
     m1Offered: [number, number];
   } | null;
+  /** 方向ごとの、寄った席の割合と勝率。none はどの方向にも寄らなかった席、multi は 2 つ以上に寄った席。 */
+  directions: Record<Direction | "none" | "multi", { share: number; win: number }>;
+  /** 序盤に寄っていた席のうち、同じ方向に寄ったまま（kept）・別の方向に変えた（switched）・どこにも寄らなくなった（dropped）。share は全席に対する割合。 */
+  pivot: Record<"kept" | "switched" | "dropped", { share: number; win: number }>;
+  /**
+   * --draft-bot=lane / lane-one のときだけ。方向を決めて取る bot（lane-one ではその席だけ）が、最初に決めた方向と最後の方向。
+   * kept: 重なる、switched: 重ならない（bridge: 両方の方向に載る札を持っていた / noBridge: 持っていなかった）。
+   * dead: 手札のうち最後の方向に載らない札の枚数（DEAD_BUCKETS の区切り）ごとの勝率。share は数えた席に対する割合
+   */
+  lane: { kept: LaneRate; switched: LaneRate; bridge: LaneRate; noBridge: LaneRate; dead: LaneRate[] } | null;
   rows: CardRow[];
 }
 export interface SimOptions {
-  draftBot?: boolean | "alone" | "rating" | "all";
+  draftBot?: boolean | "alone" | "rating" | "all" | "lane" | "lane-one";
+  /** --draft-bot=lane / lane-one で、自分の方向の札に足す評価。 */
+  laneBonus?: number;
   flatField?: number;
   /** "field": 場を組める手札の人は場を組む方針でプレイする。 */
   play?: "field";
@@ -397,6 +455,7 @@ export interface SimOptions {
 export function simulate(n: number, games: number, seed: string, opts: SimOptions = {}): Summary {
   const rng = createRng(`${seed}:${n}`);
   flatField = opts.flatField ?? null;
+  laneBonus = opts.laneBonus ?? LANE_BONUS;
   fieldPlan = opts.play === "field";
   const plan = { seats: 0, win: 0 };
   fieldAtM1.n = 0;
@@ -413,17 +472,37 @@ export function simulate(n: number, games: number, seed: string, opts: SimOption
   const sumFinal: Res = { A: 0, B: 0, C: 0 };
   let sumScore = 0;
   let topTieOnMin = 0;
+  const dir = new Map<string, Tally>();
+  const piv = { kept: { n: 0, w: 0 }, switched: { n: 0, w: 0 }, dropped: { n: 0, w: 0 } };
+  const ln = { kept: { n: 0, w: 0 }, switched: { n: 0, w: 0 }, bridge: { n: 0, w: 0 }, noBridge: { n: 0, w: 0 }, dead: DEAD_BUCKETS.map(() => ({ n: 0, w: 0 })) };
+  const laneMode = opts.draftBot === "lane" || opts.draftBot === "lane-one";
+  const tally = (t: Tally, w: number) => {
+    t.n++;
+    t.w += w;
+  };
 
   for (let gi = 0; gi < games; gi++) {
     const deck = shuffle(cards, rng);
     let packs = Array.from({ length: n }, (_, i) => deck.slice(i * PACK_SIZE, (i + 1) * PACK_SIZE));
     const g: Game = { n, round: 0, ps: Array.from({ length: n }, () => ({ res: { ...START }, hand: [], field: [] })) };
-    // --draft-bot=all は全席がドラフト bot（手札を見る）。勝率の比べる相手がいないので、draftBot の集計はしない
-    const allBots = opts.draftBot === "all";
+    // --draft-bot=all / lane は全席がドラフト bot。勝率の比べる相手がいないので、draftBot の集計はしない
+    const allBots = opts.draftBot === "all" || opts.draftBot === "lane";
     const botSeat = opts.draftBot && !allBots ? gi % n : -1;
+    // null はランダムに取る席
+    const modeOf = (i: number): PickMode | null =>
+      opts.draftBot === "lane" || (opts.draftBot === "lane-one" && i === botSeat)
+        ? "lane"
+        : allBots || opts.draftBot === "lane-one"
+          ? "hand"
+          : i === botSeat
+            ? opts.draftBot === "alone" ? "alone" : "hand"
+            : null;
+    // 方向を決めて取る席が、最初に方向を決めたときの方向（決める前は null）
+    const firstLane: (Direction[] | null)[] = g.ps.map(() => null);
     while (at(packs, 0).length > 0) {
       packs.forEach((pk, i) => {
-        const k = pk.length === 1 ? 0 : i === botSeat || allBots ? draftPick(n, i, at(g.ps, i).hand, pk, rng, opts.draftBot === "alone") : rng.int(pk.length);
+        const mode = modeOf(i);
+        const k = pk.length === 1 ? 0 : mode ? draftPick(n, i, at(g.ps, i).hand, pk, rng, mode) : rng.int(pk.length);
         if (i === botSeat && pk.length > 1 && pk.some(isM1)) {
           const b = at(g.ps, i).hand.filter((c) => c.stay).length >= 2 ? 1 : 0;
           db.m1Offered[b] = at(db.m1Offered, b) + 1;
@@ -431,6 +510,10 @@ export function simulate(n: number, games: number, seed: string, opts: SimOption
         }
         at(g.ps, i).hand.push(at(pk, k));
         pk.splice(k, 1);
+        if (mode === "lane" && !firstLane[i]) {
+          const l = lanesOf(at(g.ps, i).hand);
+          if (l.length > 0) firstLane[i] = l;
+        }
       });
       packs = packs.map((_, i) => at(packs, (i + n - 1) % n));
     }
@@ -472,6 +555,40 @@ export function simulate(n: number, games: number, seed: string, opts: SimOption
       plan.seats++;
       plan.win += at(credit, i);
     }
+    if (laneMode) {
+      g.ps.forEach((_, i) => {
+        const first = firstLane[i];
+        if (!first || (opts.draftBot === "lane-one" && i !== botSeat)) return;
+        const w = at(credit, i);
+        const ids = at(hands, i);
+        const last = lanesOf(ids.map((id) => cardById(id)));
+        if (last.some((d) => first.includes(d))) tally(ln.kept, w);
+        else {
+          tally(ln.switched, w);
+          const bridged = ids.some((id) => {
+            const ds = directionsOf(id);
+            return ds.some((d) => first.includes(d)) && ds.some((d) => last.includes(d));
+          });
+          tally(bridged ? ln.bridge : ln.noBridge, w);
+        }
+        const dead = ids.filter((id) => !directionsOf(id).some((d) => last.includes(d))).length;
+        tally(at(ln.dead, DEAD_BUCKETS.filter((b) => dead >= b).length - 1), w);
+      });
+    }
+    hands.forEach((h, i) => {
+      if (botSeat >= 0 && i !== botSeat) return;
+      const w = at(credit, i);
+      // 手札はピックの順に並んでいる（最後の 1 枚は自動で取った札）
+      const fin = leaning(h, DIRECTION_MIN);
+      const keys: string[] = fin.length === 0 ? ["none"] : fin.length > 1 ? [...fin, "multi"] : fin;
+      for (const k of keys) {
+        const t = dir.get(k) ?? { n: 0, w: 0 };
+        tally(t, w);
+        dir.set(k, t);
+      }
+      const early = leaning(h.slice(0, EARLY_PICKS), EARLY_MIN);
+      if (early.length > 0) tally(fin.length === 0 ? piv.dropped : fin.some((d) => early.includes(d)) ? piv.kept : piv.switched, w);
+    });
     hands.forEach((h, i) =>
       h.forEach((id) => {
         const x = held.get(id) ?? { n: 0, w: 0 };
@@ -484,6 +601,8 @@ export function simulate(n: number, games: number, seed: string, opts: SimOption
 
   const players = games * n;
   const turns = players * ROUNDS;
+  // 方向の集計で数えた席の数（1 席だけ違う bot にしたときは、その席だけ）
+  const counted = opts.draftBot && opts.draftBot !== "all" && opts.draftBot !== "lane" ? games : players;
   return {
     n,
     games,
@@ -502,7 +621,7 @@ export function simulate(n: number, games: number, seed: string, opts: SimOption
     },
     pushedOut: pushedOut / games,
     plan: fieldPlan ? { share: plan.seats / players, win: plan.win / Math.max(1, plan.seats) } : null,
-    draftBot: opts.draftBot && opts.draftBot !== "all"
+    draftBot: opts.draftBot && opts.draftBot !== "all" && opts.draftBot !== "lane"
       ? {
           win: db.win / games,
           stays: [at(db.stays, 0) / games, at(db.stays, 1) / games],
@@ -511,6 +630,19 @@ export function simulate(n: number, games: number, seed: string, opts: SimOption
           m1Offered: [at(db.m1Offered, 0) / games, at(db.m1Offered, 1) / games],
         }
       : null,
+    directions: Object.fromEntries(
+      [...DIRECTIONS, "none", "multi"].map((k) => [k, rate(dir.get(k) ?? { n: 0, w: 0 }, counted)]),
+    ) as Summary["directions"],
+    lane: laneMode
+      ? {
+          kept: laneRate(ln.kept, counted),
+          switched: laneRate(ln.switched, counted),
+          bridge: laneRate(ln.bridge, counted),
+          noBridge: laneRate(ln.noBridge, counted),
+          dead: ln.dead.map((t) => laneRate(t, counted)),
+        }
+      : null,
+    pivot: { kept: rate(piv.kept, counted), switched: rate(piv.switched, counted), dropped: rate(piv.dropped, counted) },
     rows: cards.map((c) => {
       const h = held.get(c.id) ?? { n: 0, w: 0 };
       return { id: c.id, role: roleOf(c), held: h.n, heldWin: h.w / Math.max(1, h.n), playRate: (played.get(c.id) ?? 0) / Math.max(1, h.n) };
@@ -526,6 +658,7 @@ if (isMain) {
   const seed = args[1] ?? "sim";
   const ns = (args[2] ?? "2,3,4").split(",").map(Number);
   const flat = process.argv.find((a) => a.startsWith("--flat-field="));
+  const laneArg = process.argv.find((a) => a.startsWith("--lane-bonus="));
   const ratingFile = process.argv.find((a) => a.startsWith("--ratings="))?.split("=")[1];
   if (ratingFile) {
     const parsed: unknown = JSON.parse(readFileSync(ratingFile, "utf8"));
@@ -541,7 +674,12 @@ if (isMain) {
         ? "rating"
         : process.argv.includes("--draft-bot=all")
           ? "all"
-          : process.argv.includes("--draft-bot"),
+          : process.argv.includes("--draft-bot=lane")
+            ? "lane"
+            : process.argv.includes("--draft-bot=lane-one")
+              ? "lane-one"
+              : process.argv.includes("--draft-bot"),
+    ...(laneArg ? { laneBonus: Number(laneArg.split("=")[1]) } : {}),
     ...(flat ? { flatField: Number(flat.split("=")[1]) } : {}),
     ...(process.argv.includes("--play=field") ? { play: "field" as const } : {}),
   };
@@ -570,6 +708,21 @@ if (isMain) {
           `              M1 taken when offered: ${pct(d.m1Take[0])} with 0-1 stays in hand (${d.m1Offered[0].toFixed(2)}/game), ${pct(d.m1Take[1])} with 2+ (${d.m1Offered[1].toFixed(2)}/game)`,
         );
         console.log("              (card rows below are biased by the draft bot's picks)");
+      }
+      const dl = (x: { share: number; win: number }) => `${pct(x.share)} ${pt(x.win - base)}`;
+      console.log(
+        `direction     ${[...DIRECTIONS, "none", "multi"].map((k) => `${k} ${dl(s.directions[k as keyof Summary["directions"]])}`).join("  ")}  (${DIRECTION_MIN}+ of ${PACK_SIZE}; share, pt)`,
+      );
+      console.log(
+        `pivot         kept ${dl(s.pivot.kept)}  switched ${dl(s.pivot.switched)}  dropped ${dl(s.pivot.dropped)}  (${EARLY_MIN}+ of first ${EARLY_PICKS} picks; share of counted seats, pt)`,
+      );
+      if (s.lane) {
+        const l = s.lane;
+        const lr = (x: LaneRate) => `${pct(x.share)} ${pt(x.win - base)}±${(x.se * 100).toFixed(1)}`;
+        console.log(
+          `lane          kept ${lr(l.kept)}  switched ${lr(l.switched)} (with bridge ${lr(l.bridge)}, without ${lr(l.noBridge)})  (bot's own lanes; share, pt±se)`,
+        );
+        console.log(`              dead picks ${l.dead.map((x, k) => `${["<=2", "3", "4", "5+"][k]}: ${lr(x)}`).join("  ")}`);
       }
       const byRole = roles.map((role) => {
         const rs = s.rows.filter((r) => r.role === role);

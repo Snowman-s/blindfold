@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import { DIRECTIONS, directionCards } from "../../scripts/draftcards-directions";
 import { type Card, cardSchema, RESOURCES } from "../../src/games/draftcards/catalog";
 import { cards } from "../../src/games/draftcards/cards";
 import { FIELD_LIMIT, MAX_PLAYERS, PACK_SIZE } from "../../src/games/draftcards/constants";
@@ -80,6 +81,12 @@ describe("draftcards catalog", () => {
       else if (c.chooses !== "none") expect(c.order, `#${c.id}`).toSatisfy((o: number) => o >= 10 && o < 50);
       else if (c.stay) expect(c.order, `#${c.id}`).toSatisfy((o: number) => o >= 50 && o < 100);
     }
+  });
+
+  it("the draft directions used by the simulator refer to cards in the catalog", () => {
+    // カードを廃止したときに、方向の表が消えた id を指したまま残らないように
+    const ids = new Set(cards.map((c) => c.id));
+    for (const d of DIRECTIONS) for (const id of directionCards[d]) expect(ids.has(id), `${d} #${id}`).toBe(true);
   });
 
   it("ids and orders are unique", () => {

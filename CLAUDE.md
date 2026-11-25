@@ -60,6 +60,7 @@ src/
     highcard/         # Card game with hidden information + simultaneous turns
     frontier/         # 2-4 player territory game on a generated graph (simultaneous orders, game options, no legalActions, onTimeout / onResign; map.ts = symmetric map generation)
     liarsdice/        # 2-6 player bluffing dice game (hidden dice, sequential turns, game options, no legalActions; minBids in the view, onTimeout / onResign drop the player and reroll)
+    draftcards/       # 2-4 player draft card game with no names (simultaneous picks and plays, catalog of cards as data; cards.ts = the cards, catalog.ts = card schema, constants.ts = numbers the docs are built from)
   lib/
     rng.ts            # Seeded PRNG (string seed → cyrb128 → sfc32; 128-bit state)
     auth.ts           # Issuing and verifying player tokens
@@ -79,6 +80,8 @@ src/
 bots/
   random-bot.ts       # Bot that picks a random legal move (runs in Node)
   bot-core.ts         # WS loop (shared by the CLI and tests)
+scripts/
+  draftcards-sim.ts   # Balance simulator for draftcards (bot vs bot, many games fast; resolves like the engine). Not deployed
 migrations/           # D1 migrations
 test/
 doc/openapi.json      # Snapshot of the OpenAPI spec
@@ -109,6 +112,7 @@ export interface GameDefinition<S, A, O = null> {    // O = game-specific option
   result(s: S): null | { winners: string[]; scores?: Record<string, number> };
   onTimeout?(s: S, pids: string[], rng: Rng): S; // Optional. If undefined, the timed-out players lose
   onResign?(s: S, pid: string, rng: Rng): S;   // Optional. If undefined, the resigning player loses (everyone else wins). Define it e.g. for 3+ players where only the resigner drops out
+  catalog?: { schema: z.ZodType; items: unknown[]; docs: string }; // Optional. The game's pieces as data (cards), served as `catalog` in /games/:id/rules (JSON Schema via outputJsonSchema) and listed in rules.md
   practiceAction?(s: S, pid: string, rng: Rng): A; // How the practice opponent plays. If undefined, a random legal move. Required when legalActions is missing. The returned move is validated like a human's (decideAction); if rejected, it times out
 }
 ```
@@ -128,7 +132,7 @@ export interface GameDefinition<S, A, O = null> {    // O = game-specific option
 | GET | `/changelog.md` | API changelog (generated from `src/lib/changelog.ts`; content hash is the ETag) |
 | GET | `/policy.md` | Usage policy (shared budget, fair play, what is public, retention, no guarantees, contact). Generated from `src/lib/policy.ts` (retention periods are deliberately not stated as numbers, so they are not a promise); content hash is the ETag. Keep every claim in sync with the code |
 | GET | `/games` | List of available games (with `summary`, `rulesVersion`, `viewVersion`, `listsLegalActions`, `hasOptions`, `rulesUrl`) |
-| GET | `/games/:id/rules` | Game description: rules, how to read the view, JSON Schemas for view / action / game options (`optionsSchema`, `defaultGameOptions`), state examples (generated from the real engine), common play instructions. `version` is the ETag |
+| GET | `/games/:id/rules` | Game description: rules, how to read the view, JSON Schemas for view / action / game options (`optionsSchema`, `defaultGameOptions`), the catalog of pieces (`catalog`, null for most games), state examples (generated from the real engine), common play instructions. `version` is the ETag |
 | GET | `/games/:id/rules.md` | The same content as one Markdown page, ready to paste into a prompt |
 | POST | `/rooms` | `{ game: string, options?: {...}, gameOptions?: {...} }` → `{ roomId, hostToken }`. Unknown options are 400. `gameOptions` are game-specific (validated by the game's `optionsSchema`; 400 for games without one). `options.seats` is the room's capacity (between the game's `minPlayers` and `maxPlayers`, default `maxPlayers`; validated in `GameRoom.init` with `checkSeats`; `roomSeats()` reads it; it is the D1 `rooms.max_players`). `options.practice: true` fills empty seats with server-side practice opponents at start, up to `seats` (or `minPlayers` if `seats` is omitted) (they play by `practiceAction`, random if undefined; not recorded in D1). `options.autoStart: true` starts automatically when full (`seats` players; not combinable with practice). `options.unlisted: true` hides it from the list and quickmatch |
 | GET | `/rooms` | List of public rooms (with `gameOptions`). `?status=` is `waiting` (default; has free seats, updated within 30 minutes) or `playing` (index last updated within "turn time + `PLAYING_LIST_GRACE_MS` (2 hours)"). Filter with `&game=&limit=`. Served from the D1 `rooms` index (best-effort; the DO is authoritative) |

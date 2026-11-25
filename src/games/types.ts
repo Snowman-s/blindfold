@@ -33,6 +33,19 @@ export interface GameDocs {
 }
 
 /**
+ * ゲームに出てくる部品の一覧（任意。カードゲームのカードなど）。/games/:id/rules の catalog で配る。
+ * 部品をデータとして持ち、エンジンがそれを解釈するゲームが使う（draftcards）。
+ */
+export interface GameCatalog {
+  /** 部品 1 つの形。JSON Schema にして配る（出力なので未知のフィールドは禁止しない）。 */
+  schema: z.ZodType;
+  /** 部品の一覧。schema を満たすこと。 */
+  items: unknown[];
+  /** Markdown。部品の読み方（英語）。 */
+  docs: string;
+}
+
+/**
  * すべてのゲームが実装する。副作用なしの純粋関数にすること。
  * O はゲーム固有のオプション（optionsSchema の出力）。オプションを持たないゲームは null。
  */
@@ -64,6 +77,8 @@ export interface GameDefinition<S, A, O = null> {
    */
   viewSchema: z.ZodType;
   docs: GameDocs;
+  /** 部品の一覧（任意）。定義すると /games/:id/rules の catalog として配る。 */
+  catalog?: GameCatalog;
   /**
    * ゲーム固有のオプション（任意）。ルーム作成時の gameOptions をこれで検証し（未知のキーは拒否したいので strictObject にする）、
    * 既定値を補った値を init に渡す。その値はルームの meta・/log・D1 の matches に記録され、「シード + オプション + ログ」で試合を再現する。

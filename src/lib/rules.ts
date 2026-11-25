@@ -48,6 +48,8 @@ export interface GameRules {
   defaultGameOptions: unknown;
   options: string | null;
   examples: { action: unknown; meaning: string }[];
+  /** 部品の一覧（GameDefinition.catalog）。無いゲームは null。 */
+  catalog: { docs: string; schema: unknown; items: unknown[] } | null;
   stateExamples: ExampleState[];
   endExample: EndMessage;
   common: string;
@@ -79,6 +81,9 @@ export function gameRules(game: AnyGame): Promise<GameRules> {
         defaultGameOptions: defaultGameOptions(game),
         options: game.docs.options ?? null,
         examples: game.docs.examples,
+        catalog: game.catalog
+          ? { docs: game.catalog.docs, schema: outputJsonSchema(game.catalog.schema), items: game.catalog.items }
+          : null,
         stateExamples: ex.states,
         endExample: ex.end,
         common: COMMON,
@@ -120,6 +125,19 @@ export function rulesMarkdown(r: GameRules): string {
     "Examples:",
     examples,
     "",
+    ...(r.catalog === null
+      ? []
+      : [
+          "## Catalog",
+          r.catalog.docs,
+          "",
+          "JSON Schema of one item:",
+          json(r.catalog.schema),
+          "",
+          `All ${r.catalog.items.length} items (also \`catalog.items\` in the JSON rules), one per line:`,
+          ["```json", ...r.catalog.items.map((x) => JSON.stringify(x)), "```"].join("\n"),
+          "",
+        ]),
     ...(r.optionsSchema === null
       ? []
       : [

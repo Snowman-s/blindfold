@@ -10,6 +10,7 @@ on:
       - "**.md"
       - "doc/**"
       - "bots/**"
+      - "scripts/**"
       - "test/**"
       - ".claude/**"
       - ".github/workflows/ci.yml"

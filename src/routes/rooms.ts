@@ -171,6 +171,14 @@ const GameRulesSchema = z
     defaultGameOptions: z.unknown().describe("gameOptions used when none are given (null if the game has no options)"),
     options: z.string().nullable().describe("Markdown: meaning of each game option. null if the game has no options"),
     examples: z.array(z.object({ action: z.unknown(), meaning: z.string() })),
+    catalog: z
+      .object({
+        docs: z.string().describe("Markdown: how to read an item"),
+        schema: z.unknown().describe("JSON Schema of one item. Does not forbid extra fields: new ones may be added"),
+        items: z.array(z.unknown()).describe("Every item that can appear in the game"),
+      })
+      .nullable()
+      .describe("The pieces the game is made of, as data (for example the cards of a card game), or null if the game has none"),
     stateExamples: z
       .array(z.object({ title: z.string(), message: z.unknown() }))
       .describe("Example state messages generated from the engine: start, after one action (each viewer), finished"),
